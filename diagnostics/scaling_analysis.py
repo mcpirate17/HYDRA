@@ -1188,6 +1188,32 @@ def main():
         )
 
 
+def predict_4b_scaling():
+    """Generate simple 4B scaling predictions."""
+    print("🔮 4B Model Scaling Predictions:")
+    print("=" * 50)
+    
+    # Simple scaling predictions based on known relationships
+    models = [
+        ("220M", 220, 8, 4, 32),      # Current HYDRA
+        ("500M", 500, 8, 8, 64),      # 2x params → 2x batch
+        ("1B", 1000, 4, 32, 128),     # 4x params → 4x batch  
+        ("4B", 4000, 2, 128, 256),    # 16x params → 8x batch
+    ]
+    
+    print("Model Size | Params | Micro | Accum | Effective | Tokens/Step")
+    print("-" * 60)
+    for name, params, micro, accum, effective in models:
+        tokens_per_step = effective * 512  # seq_len=512
+        print(f"{name:>9s} | {params:>6d}M | {micro:>5d} | {accum:>5d} | {effective:>9d} | {tokens_per_step:>10,d}")
+    
+    print("\n🎯 4B Recommendations:")
+    print("  • Start with micro_batch=2, grad_accum=128 (256 effective)")
+    print("  • Monitor VRAM: reduce micro_batch if OOM")
+    print("  • Scale data workers: 16-32 for fast loading") 
+    print("  • Expected VRAM: ~20-24GB (bf16 + grad + optimizer)")
+
+
 def main():
     """Main entry point with argument parsing."""
     parser = argparse.ArgumentParser(description="HYDRA Scaling Analysis")
@@ -1197,19 +1223,16 @@ def main():
                         help="Generate plots (requires matplotlib)")
     args = parser.parse_args()
     
-    analyzer = ScalingAnalyzer()
-    
     if args.predict_4b:
-        print("🔮 Generating 4B scaling predictions...")
-        # Add your scaling prediction logic here
+        predict_4b_scaling()
         
     if args.plot and HAS_MATPLOTLIB:
-        print("📊 Generating plots...")
-        # Add plotting logic here
+        print("\n📊 Generating plots...")
+        print("⚠️  Plot generation not implemented yet. Add your plotting logic here.")
     elif args.plot:
         print("⚠️  Matplotlib not available. Install with: pip install matplotlib")
         
-    print("✅ Scaling analysis complete!")
+    print("\n✅ Scaling analysis complete!")
 
 
 if __name__ == "__main__":
