@@ -1,0 +1,105 @@
+# Model Variant Configurations for HYDRA
+# Validated scales from 100M to 1.5B with 4B predictions
+
+defaults:
+  compression_factor: 4
+  capacity_ratio: 0.75
+  use_rope: true
+  use_qk_norm: true
+  use_convs: true
+  use_qk_mean: true
+  use_value_shift: true
+  conv_kernel_size: 3
+  max_seq_len: 8192
+  vocab_size: 32000
+
+variants:
+  100M:
+    dim: 768
+    n_mor_blocks: 8
+    recursions: 4
+    n_heads: 12
+    n_kv_heads: 3
+    effective_layers: 32
+    expected_params_m: 100
+    aux_loss_weight: 0.0100 # Base scale
+
+  250M:
+    dim: 1024
+    n_mor_blocks: 12
+    recursions: 4
+    n_heads: 16
+    n_kv_heads: 4
+    effective_layers: 48
+    expected_params_m: 250
+    aux_loss_weight: 0.0173
+
+  500M:
+    dim: 1536
+    n_mor_blocks: 16
+    recursions: 4
+    n_heads: 24
+    n_kv_heads: 4
+    effective_layers: 64
+    expected_params_m: 570
+    aux_loss_weight: 0.0283
+
+  750M:
+    dim: 1792
+    n_mor_blocks: 20
+    recursions: 4
+    n_heads: 28
+    n_kv_heads: 4
+    effective_layers: 80
+    expected_params_m: 927
+    aux_loss_weight: 0.0382
+
+  900M:
+    dim: 2048
+    n_mor_blocks: 20
+    recursions: 4
+    n_heads: 32
+    n_kv_heads: 4
+    effective_layers: 80
+    expected_params_m: 1195
+    aux_loss_weight: 0.0408
+
+  1B:
+    dim: 2048
+    n_mor_blocks: 24
+    recursions: 4
+    n_heads: 32
+    n_kv_heads: 4
+    effective_layers: 96
+    expected_params_m: 1420
+    aux_loss_weight: 0.0490
+
+  1.5B:
+    dim: 2560
+    n_mor_blocks: 24
+    recursions: 5
+    n_heads: 40
+    n_kv_heads: 8
+    effective_layers: 120
+    expected_params_m: 2182
+    aux_loss_weight: 0.0685
+
+  # Predicted configuration - not yet validated
+  4B:
+    dim: 4096
+    n_mor_blocks: 40
+    recursions: 4
+    n_heads: 64
+    n_kv_heads: 8
+    effective_layers: 160
+    expected_params_m: 4000
+    aux_loss_weight: 0.1155 # Theoretical: 0.01 * (160/32) * sqrt(4096/768)
+    status: predicted
+# Scaling formula for aux_loss_weight:
+# aux_loss_weight = 0.01 * (effective_layers / 32) * sqrt(dim / 768)
+# This ensures MoD capacity stays at 75% as model size increases
+
+# Compliance targets:
+# - MoD: mod_prob should be 0.70-0.90 (targeting 0.75 capacity)
+# - MoR: mor_depth should be ~1.0 (full utilization during early training)
+# - CCGQA: 4x compression, GQA, QK norm all enabled

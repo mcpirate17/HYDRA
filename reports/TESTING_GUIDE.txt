@@ -1,0 +1,449 @@
+"""
+CCGQA TESTING & DIAGNOSTICS INFRASTRUCTURE
+=========================================== 
+
+Quick Start Guide for Running Comprehensive Diagnostics
+"""
+
+# ============================================================================
+# SECTION 1: AVAILABLE DIAGNOSTIC MODULES
+# ============================================================================
+
+Location: e:\LLM\HYDRA\diagnostics\
+
+Available Modules:
+  1. ccgqa_diagnostics.py
+     - Core diagnostic engine
+     - Classes: CCGQADiagnostician
+     - Methods: benchmark_speed, benchmark_memory, analyze_gradient_flow,
+               analyze_learning, analyze_components, run_full_diagnostics
+
+  2. test_ccgqa_comprehensive.py
+     - Test suite runner
+     - Classes: CCGQATestSuite
+     - Tests: attention_layer, transformer_block, compression_variants
+     - Outputs: JSON reports, PNG graphs
+
+  3. ccgqa_optimization_integrator.py
+     - Optimization framework
+     - Classes: CCGQAOptimizer
+     - Methods: suggest_optimal_compression, suggest_optimal_kernel_size,
+               optimize_for_speed, optimize_for_quality, optimize_for_memory
+
+
+# ============================================================================
+# SECTION 2: RUNNING DIAGNOSTICS
+# ============================================================================
+
+COMMAND 1: Run Full Comprehensive Test Suite (Recommended)
+-----------------------------------------------------------
+cd e:\LLM\HYDRA
+python -m diagnostics.test_ccgqa_comprehensive
+
+Output:
+  - 3 main tests (attention, block, compression variants)
+  - 21 total benchmarks across different batch sizes and sequence lengths
+  - JSON reports saved to reports/
+  - PNG graphs saved to reports/
+  - Summary file: reports/CCGQA_DIAGNOSTICS_SUMMARY.txt
+  - Optimization guide: reports/CCGQA_OPTIMIZATION_GUIDE.txt
+
+Runtime: ~2-3 minutes on NVIDIA GPU
+Output Size: ~3-4 MB (graphs + JSON)
+
+
+COMMAND 2: Run Single Component Diagnostics
+---------------------------------------------
+python -c "
+from diagnostics.ccgqa_diagnostics import CCGQADiagnostician
+from hydra.model.ccgqa import CCGQAAttention
+
+attention = CCGQAAttention(
+    dim=768,
+    n_heads=12,
+    n_kv_heads=3,
+    compression_factor=4
+)
+
+diag = CCGQADiagnostician()
+report = diag.run_full_diagnostics(
+    attention,
+    batch_sizes=[1, 4, 8],
+    seq_lengths=[256, 512, 1024]
+)
+"
+
+COMMAND 3: Run Custom Speed Benchmark
+--------------------------------------
+python -c "
+from diagnostics.ccgqa_diagnostics import CCGQADiagnostician
+from hydra.model.ccgqa import CCGQABlock
+
+block = CCGQABlock(dim=768, compression_factor=4)
+diag = CCGQADiagnostician()
+speeds = diag.benchmark_speed(
+    block,
+    batch_sizes=[2, 8, 16],
+    seq_lengths=[256, 1024, 4096],
+    num_runs=5
+)
+"
+
+COMMAND 4: Run Optimization Analysis
+-------------------------------------
+python -c "
+from diagnostics.ccgqa_optimization_integrator import CCGQAOptimizer
+
+optimizer = CCGQAOptimizer()
+
+# Get suggestions for optimal compression
+cf, analysis = optimizer.suggest_optimal_compression(dim=768)
+print(f'Optimal compression: {cf}x')
+print(f'Analysis: {analysis}')
+
+# Generate Pareto frontier
+pareto = optimizer.generate_pareto_frontier(dim=768, n_points=20)
+for speed, quality, config in pareto[:5]:
+    print(f'Speed={speed:.2f}, Quality={quality:.2f}, CF={config.compression_factor}x')
+"
+
+
+# ============================================================================
+# SECTION 3: INTERPRETING RESULTS
+# ============================================================================
+
+Speed Benchmarks (Speed report):
+  - forward_time_ms: Time for forward pass
+  - backward_time_ms: Time for backward pass (gradient computation)
+  - total_time_ms: Combined forward + backward
+  - throughput_samples_per_sec: Batch size / total time
+  - flops_per_sec: Floating point operations per second (higher is better)
+
+  GOOD: Forward < 2ms, Backward < 3ms per (B=4, S=512)
+  BAD:  Backward > 5x Forward (indicates inefficient backprop)
+
+Memory Benchmarks (Memory report):
+  - peak_memory_mb: Maximum memory used during forward + backward
+  - activation_memory_mb: Memory for activations (not parameters)
+  - parameter_memory_mb: Memory for model weights
+  - memory_per_sample_mb: Peak memory divided by batch size
+
+  GOOD: < 30 MB per sample, linear scaling with sequence length
+  BAD:  Superlinear scaling or > 50 MB per sample
+
+Gradient Flow Analysis (Gradient report):
+  - mean_grad_norm: Average gradient norm (should be 10-100)
+  - max_grad_norm: Maximum gradient norm (should be < 100)
+  - vanishing_gradient_detected: Min norm < 1e-6 (problematic)
+  - exploding_gradient_detected: Max norm > 1e4 (problematic)
+
+  GOOD: Mean norm 10-100, no vanishing/exploding
+  BAD:  Mean > 1e4 or vanishing gradients
+
+Learning Results (Learning report):
+  - initial_loss: First step loss
+  - final_loss: Loss after 100 steps
+  - loss_improvement: Percentage decrease
+  - learning_capacity_score: 0-100 (higher is better)
+
+  GOOD: > 5% improvement, score > 70
+  BAD:  < 1% improvement, score < 50
+
+
+# ============================================================================
+# SECTION 4: GENERATED REPORTS
+# ============================================================================
+
+Files Generated After Running Tests:
+
+JSON Reports:
+  01_attention_layer_report.json
+  02_transformer_block_report.json
+  03_compression_factor_2x_report.json
+  03_compression_factor_4x_report.json
+  03_compression_factor_8x_report.json
+
+PNG Graphs:
+  01_attention_layer_speed_benchmarks.png
+  01_attention_layer_memory_profiling.png
+  01_attention_layer_analysis.png
+  [Similar for other tests]
+
+Summary Documents:
+  CCGQA_DIAGNOSTICS_SUMMARY.txt (Generated automatically)
+  CCGQA_OPTIMIZATION_GUIDE.txt (This file's parent)
+
+Reading JSON Reports:
+  import json
+  with open('reports/01_attention_layer_report.json') as f:
+      data = json.load(f)
+  
+  # Access results:
+  print(data['speed_results'])
+  print(data['memory_results'])
+  print(data['gradient_analysis'])
+  print(data['learning_results'])
+  print(data['component_analysis'])
+  print(data['optimization_recommendations'])
+
+
+# ============================================================================
+# SECTION 5: MODIFYING & EXTENDING DIAGNOSTICS
+# ============================================================================
+
+To Test Different Configurations:
+
+1. Edit test_ccgqa_comprehensive.py:
+   - Modify test_attention_layer() to change attention parameters
+   - Modify test_transformer_block() for block-level tests
+   - Add new test methods for specific scenarios
+
+2. Example: Test different kernel sizes:
+
+class CCGQATestSuite:
+    def test_kernel_variants(self):
+        kernels = [1, 3, 5, 7]
+        reports = {}
+        
+        for k in kernels:
+            attention = CCGQAAttention(
+                dim=768,
+                conv_kernel_size=k,
+                use_convs=True
+            )
+            
+            diag = CCGQADiagnostician()
+            report = diag.run_full_diagnostics(attention)
+            reports[f'kernel_{k}'] = report
+        
+        return reports
+
+3. Run custom test:
+   test_suite = CCGQATestSuite()
+   reports = test_suite.test_kernel_variants()
+   test_suite.generate_summary_report(reports)
+
+
+To Add New Benchmark Metrics:
+
+1. Extend CCGQADiagnostician class
+2. Add new method, e.g., benchmark_attention_patterns()
+3. Return results in dataclass format
+4. Update run_full_diagnostics() to call new method
+5. Add visualization in CCGQATestSuite
+
+
+To Add Custom Graphs:
+
+1. Extend CCGQATestSuite class
+2. Add method generate_custom_graphs()
+3. Use matplotlib for visualization
+4. Save to reports_dir
+
+Example:
+def generate_custom_graphs(self, report, name):
+    fig, ax = plt.subplots()
+    ax.plot(report.speed_results)
+    plt.savefig(f'reports/{name}_custom.png')
+    plt.close()
+
+
+# ============================================================================
+# SECTION 6: OPTIMIZATION.PY INTEGRATION
+# ============================================================================
+
+Using Techniques from optimization.py with CCGQA:
+
+1. Memory-Aware Tuning:
+   from hydra.optimization import _check_gpu_memory_available
+   
+   is_safe, available_mb = _check_gpu_memory_available(required_mb=500)
+   if available_mb < 1000:
+       compression_factor = 8  # More aggressive
+   else:
+       compression_factor = 4  # Balanced
+
+2. Component Scoring:
+   from hydra.optimization import score_component_instance
+   
+   score, metrics = score_component_instance(
+       component_class=CCGQAAttention,
+       dim=768,
+       device='cuda',
+       run_learning_benchmark=True
+   )
+   print(f"Component score: {score}")
+
+3. Constraint-Based Optimization:
+   from hydra.optimization import OptimizationConstraints
+   
+   constraints = OptimizationConstraints(
+       min_learning_score=70,
+       min_stability_score=50,
+       max_memory_mb=1024
+   )
+   # Use constraints to filter valid configs
+
+4. Multi-Scale Benchmarking:
+   from hydra.optimization import _run_multiscale_benchmark
+   
+   scaling_score, factor = _run_multiscale_benchmark(
+       component=attention,
+       dim=768,
+       device='cuda'
+   )
+
+
+# ============================================================================
+# SECTION 7: TROUBLESHOOTING DIAGNOSTICS
+# ============================================================================
+
+Issue: "RuntimeError: Expected tensor for argument #1 'indices'"
+  Cause: Passing float tensors to embedding layer
+  Solution: Use token IDs (long tensor) for model input, not embeddings
+
+Issue: "UnicodeEncodeError: 'charmap' codec can't encode"
+  Cause: Emoji characters in console output on Windows
+  Solution: Set console to UTF-8: chcp 65001 (already done)
+
+Issue: "CUDA out of memory"
+  Cause: Model too large for GPU
+  Solution:
+    - Reduce batch_sizes in test
+    - Reduce seq_lengths in test
+    - Increase compression_factor
+    - Run on CPU instead: device='cpu'
+
+Issue: Tests run very slowly
+  Cause: GPU under-utilized or CPU bottleneck
+  Solution:
+    - Check GPU utilization (nvidia-smi)
+    - Reduce warmup_runs parameter
+    - Reduce num_runs for benchmarks
+    - Use smaller models for faster iteration
+
+Issue: Gradient norms are extremely high/low
+  Cause: Unstable initialization or training dynamics
+  Solution:
+    - This is expected and indicates need for gradient clipping
+    - Documented in optimization recommendations
+    - Use recommendations in CCGQA_OPTIMIZATION_GUIDE.txt
+
+
+# ============================================================================
+# SECTION 8: PERFORMANCE BASELINE
+# ============================================================================
+
+Expected Performance Ranges (on NVIDIA CUDA GPU):
+
+Speed:
+  Attention Layer:  0.96-1.56ms (forward), 2-7ms (backward)
+  Block (+ MLP):   1.21-3.46ms (forward), 2.5-8.5ms (backward)
+  Throughput:       300-2500 samples/sec depending on batch/seq length
+  FLOPs:            0.03-2.5 TFLOPS
+
+Memory:
+  Attention:       7.6-39.1 MB (B=1-8, S=256-1024)
+  Block:           28-711 MB (B=1-8, S=256-1024)
+  Per-sample:      7.5-30 MB
+
+Learning:
+  Attention alone: 0.4-0.7% loss improvement (low capacity)
+  Full blocks:     15-17% loss improvement (good capacity)
+  Convergence:     Usually within 1-10 steps on MSE
+
+If your results differ significantly, check:
+  1. GPU type (V100 vs A100 vs H100 have different characteristics)
+  2. CUDA/cuDNN versions (significant impact on speed)
+  3. PyTorch version (flash attention available in newer versions)
+  4. Model configuration (different dim/heads than default)
+
+
+# ============================================================================
+# SECTION 9: NEXT STEPS
+# ============================================================================
+
+After running diagnostics:
+
+1. READ: CCGQA_OPTIMIZATION_GUIDE.txt (in reports/)
+   - Contains detailed analysis of all results
+   - Specific recommendations for your configuration
+   - Troubleshooting guide for common issues
+
+2. APPLY: Recommended fixes from optimization guide
+   - Gradient clipping (most important)
+   - Learning rate reduction
+   - Pre-output normalization
+   - Consider compression factor adjustment
+
+3. ITERATE: Re-run diagnostics after changes
+   - python -m diagnostics.test_ccgqa_comprehensive
+   - Compare new results vs baseline
+   - Validate improvements
+
+4. VALIDATE: Test on real data
+   - Use your actual training data
+   - Measure real metrics (perplexity, downstream task performance)
+   - Verify gradient stability in practice
+
+5. OPTIMIZE: Further tuning if needed
+   - Use optimization.py techniques
+   - Experiment with hyperparameter combinations
+   - Profile on your specific workload
+
+
+# ============================================================================
+# SECTION 10: COMMAND REFERENCE
+# ============================================================================
+
+Quick Commands:
+
+Run full test suite:
+  python -m diagnostics.test_ccgqa_comprehensive
+
+Run single diagnostic:
+  python -c "from diagnostics.ccgqa_diagnostics import CCGQADiagnostician; ..."
+
+View reports:
+  - Open PNG files in image viewer: reports/*.png
+  - Read JSON files with any text editor: reports/*.json
+  - Read guides: reports/CCGQA_OPTIMIZATION_GUIDE.txt
+
+List all reports:
+  ls reports/
+  dir reports\  (Windows)
+
+Clean up old reports:
+  rm -rf reports/*  (keep .json and .png, delete old logs)
+
+Export results to Excel (Python):
+  import pandas as pd
+  import json
+  with open('reports/01_attention_layer_report.json') as f:
+      data = json.load(f)
+  df = pd.DataFrame(data['speed_results'])
+  df.to_excel('attention_speed.xlsx')
+
+Generate custom visualization:
+  python -c "
+  import json, matplotlib.pyplot as plt
+  with open('reports/01_attention_layer_report.json') as f:
+      data = json.load(f)
+  speeds = data['speed_results']
+  # Plot custom graphs here
+  "
+
+
+# ============================================================================
+# END OF TESTING GUIDE
+# ============================================================================
+
+For questions or issues, refer to:
+  1. CCGQA_OPTIMIZATION_GUIDE.txt (detailed analysis)
+  2. ccgqa_diagnostics.py (source code with docstrings)
+  3. test_ccgqa_comprehensive.py (test suite implementation)
+  4. ccgqa.py (model implementation details)
+
+Generated: 2025-12-07
+Version: 1.0
+"""

@@ -1,0 +1,299 @@
+{
+  "data_points": [
+    {
+      "name": "100M",
+      "params_m": 100.463646,
+      "effective_layers": 32,
+      "dim": 768,
+      "aux_loss_weight": 0.01,
+      "final_mod_prob": 0.8079247772693634,
+      "final_mor_depth": 1.0,
+      "mod_converged": true,
+      "mor_not_collapsed": true,
+      "ms_per_step": 149.93348121643066,
+      "compliance_passed": true
+    },
+    {
+      "name": "250M",
+      "params_m": 216.324142,
+      "effective_layers": 48,
+      "dim": 1024,
+      "aux_loss_weight": 0.01732050807568877,
+      "final_mod_prob": 0.7867831647396087,
+      "final_mor_depth": 1.0,
+      "mod_converged": true,
+      "mor_not_collapsed": true,
+      "ms_per_step": 241.46658579508463,
+      "compliance_passed": true
+    },
+    {
+      "name": "500M",
+      "params_m": 569.585726,
+      "effective_layers": 64,
+      "dim": 1536,
+      "aux_loss_weight": 0.028284271247461905,
+      "final_mod_prob": 0.7586823914732251,
+      "final_mor_depth": 1.0,
+      "mod_converged": true,
+      "mor_not_collapsed": true,
+      "ms_per_step": 323.1759230295817,
+      "compliance_passed": true
+    },
+    {
+      "name": "750M",
+      "params_m": 926.78203,
+      "effective_layers": 80,
+      "dim": 1792,
+      "aux_loss_weight": 0.03818813079129867,
+      "final_mod_prob": 0.7786786754926046,
+      "final_mor_depth": 1.0,
+      "mod_converged": true,
+      "mor_not_collapsed": true,
+      "ms_per_step": 451.489782333374,
+      "compliance_passed": true
+    },
+    {
+      "name": "900M",
+      "params_m": 1194.795086,
+      "effective_layers": 80,
+      "dim": 2048,
+      "aux_loss_weight": 0.040824829046386304,
+      "final_mod_prob": 0.8474362459447649,
+      "final_mor_depth": 1.0,
+      "mod_converged": true,
+      "mor_not_collapsed": true,
+      "ms_per_step": 730.535093943278,
+      "compliance_passed": true
+    },
+    {
+      "name": "1B",
+      "params_m": 1420.419166,
+      "effective_layers": 96,
+      "dim": 2048,
+      "aux_loss_weight": 0.04898979485566356,
+      "final_mod_prob": 0.7975053814324465,
+      "final_mor_depth": 1.0,
+      "mod_converged": true,
+      "mor_not_collapsed": true,
+      "ms_per_step": 536.2664381663004,
+      "compliance_passed": true
+    },
+    {
+      "name": "1.5B",
+      "params_m": 2182.293598,
+      "effective_layers": 120,
+      "dim": 2560,
+      "aux_loss_weight": 0.06846531968814576,
+      "final_mod_prob": 0.982004926963286,
+      "final_mor_depth": 1.0,
+      "mod_converged": true,
+      "mor_not_collapsed": true,
+      "ms_per_step": 9873.530467351278,
+      "compliance_passed": true
+    }
+  ],
+  "fits": {
+    "aux_loss_weight": {
+      "best_fit": {
+        "fit_type": "polynomial_deg2",
+        "coefficients": [
+          -1.9772779207735535e-09,
+          3.1167168868264446e-05,
+          0.009245437806476233
+        ],
+        "r_squared": 0.9901065883982886,
+        "equation": "-0.000000x^2 + 0.000031x + 0.009245",
+        "prediction_4b": 0.10227766654715717
+      },
+      "all_fits": [
+        {
+          "fit_type": "polynomial_deg1",
+          "coefficients": [
+            2.6827317933462962e-05,
+            0.010675212154671676
+          ],
+          "r_squared": 0.9876890325426142,
+          "equation": "0.000027x + 0.010675",
+          "prediction_4b": 0.11798448388852353
+        },
+        {
+          "fit_type": "polynomial_deg2",
+          "coefficients": [
+            -1.9772779207735535e-09,
+            3.1167168868264446e-05,
+            0.009245437806476233
+          ],
+          "r_squared": 0.9901065883982886,
+          "equation": "-0.000000x^2 + 0.000031x + 0.009245",
+          "prediction_4b": 0.10227766654715717
+        },
+        {
+          "fit_type": "power_law",
+          "coefficients": [
+            0.000665771058979702,
+            0.5932900883217924
+          ],
+          "r_squared": 0.9835903147099261,
+          "equation": "0.000666 * x^0.5933",
+          "prediction_4b": 0.09128331490642232
+        },
+        {
+          "fit_type": "logarithmic",
+          "coefficients": [
+            0.01697912350004328,
+            -0.07366288910573945
+          ],
+          "r_squared": 0.8941590786618212,
+          "equation": "0.016979 * log(x) + -0.073663",
+          "prediction_4b": 0.06716704829940823
+        }
+      ]
+    },
+    "mod_prob": {
+      "best_fit": {
+        "fit_type": "polynomial_deg2",
+        "coefficients": [
+          8.542268473557955e-08,
+          -0.00010798716449509157,
+          0.8094040300622105
+        ],
+        "r_squared": 0.9012255726404069,
+        "equation": "0.000000x^2 + -0.000108x + 0.809404",
+        "prediction_4b": 1.744218327851117
+      },
+      "all_fits": [
+        {
+          "fit_type": "polynomial_deg1",
+          "coefficients": [
+            7.950378673038112e-05,
+            0.7476346843846267
+          ],
+          "r_squared": 0.5928448507100412,
+          "equation": "0.000080x + 0.747635",
+          "prediction_4b": 1.065649831306151
+        },
+        {
+          "fit_type": "polynomial_deg2",
+          "coefficients": [
+            8.542268473557955e-08,
+            -0.00010798716449509157,
+            0.8094040300622105
+          ],
+          "r_squared": 0.9012255726404069,
+          "equation": "0.000000x^2 + -0.000108x + 0.809404",
+          "prediction_4b": 1.744218327851117
+        },
+        {
+          "fit_type": "logarithmic",
+          "coefficients": [
+            0.03421983244384617,
+            0.6016802559491718
+          ],
+          "r_squared": 0.24822168396899835,
+          "equation": "0.034220 * log(x) + 0.601680",
+          "prediction_4b": 0.8855097988033253
+        }
+      ]
+    },
+    "mor_depth": {
+      "best_fit": {
+        "fit_type": "polynomial_deg1",
+        "coefficients": [
+          -3.0459830176061806e-20,
+          1.0000000000000002
+        ],
+        "r_squared": 0,
+        "equation": "-0.000000x + 1.000000",
+        "prediction_4b": 1.0
+      },
+      "all_fits": [
+        {
+          "fit_type": "polynomial_deg1",
+          "coefficients": [
+            -3.0459830176061806e-20,
+            1.0000000000000002
+          ],
+          "r_squared": 0,
+          "equation": "-0.000000x + 1.000000",
+          "prediction_4b": 1.0
+        },
+        {
+          "fit_type": "polynomial_deg2",
+          "coefficients": [
+            -1.1415445433158072e-22,
+            7.223962731049604e-20,
+            0.9999999999999998
+          ],
+          "r_squared": 0,
+          "equation": "-0.000000x^2 + 0.000000x + 1.000000",
+          "prediction_4b": 0.9999999999999982
+        },
+        {
+          "fit_type": "logarithmic",
+          "coefficients": [
+            5.036906369076807e-18,
+            0.9999999999999997
+          ],
+          "r_squared": 0,
+          "equation": "0.000000 * log(x) + 1.000000",
+          "prediction_4b": 0.9999999999999997
+        }
+      ]
+    },
+    "compute_time": {
+      "best_fit": {
+        "fit_type": "polynomial_deg2",
+        "coefficients": [
+          0.004293898197464333,
+          -5.608540863931602,
+          1259.2567723570198
+        ],
+        "r_squared": 0.951074552049415,
+        "equation": "0.004294x^2 + -5.608541x + 1259.256772",
+        "prediction_4b": 47527.46447605995
+      },
+      "all_fits": [
+        {
+          "fit_type": "polynomial_deg1",
+          "coefficients": [
+            3.8159704353791537,
+            -1845.671185415982
+          ],
+          "r_squared": 0.6055804209152873,
+          "equation": "3.815970x + -1845.671185",
+          "prediction_4b": 13418.210556100632
+        },
+        {
+          "fit_type": "polynomial_deg2",
+          "coefficients": [
+            0.004293898197464333,
+            -5.608540863931602,
+            1259.2567723570198
+          ],
+          "r_squared": 0.951074552049415,
+          "equation": "0.004294x^2 + -5.608541x + 1259.256772",
+          "prediction_4b": 47527.46447605995
+        },
+        {
+          "fit_type": "power_law",
+          "coefficients": [
+            1.1714150104469132,
+            0.9592978731809259
+          ],
+          "r_squared": 0.15862970159745504,
+          "equation": "1.171415 * x^0.9593",
+          "prediction_4b": 3343.1762545828196
+        }
+      ]
+    }
+  },
+  "predictions_4b": {
+    "theoretical_aux_weight": 0.11547005383792515,
+    "fitted_aux_weight": 0.10227766654715717,
+    "fitted_mod_prob": 1.744218327851117,
+    "fitted_mor_depth": 1.0,
+    "fitted_ms_per_step": 47527.46447605995,
+    "mod_compliance_likely": false,
+    "mor_compliance_likely": true
+  }
+}

@@ -1,0 +1,129 @@
+{
+  "timestamp": "2025-12-07 14:46:26",
+  "model_config": {
+    "dim": null,
+    "n_heads": null,
+    "n_kv_heads": null,
+    "compression_factor": null,
+    "use_convs": null,
+    "use_qk_mean": null,
+    "use_qk_norm": null,
+    "use_rope": null
+  },
+  "speed_results": [
+    {
+      "forward_time_ms": 9.052349999547005,
+      "backward_time_ms": 16.813759997603483,
+      "total_time_ms": 25.866109997150488,
+      "throughput_samples_per_sec": 38.66062581927332,
+      "batch_size": 1,
+      "seq_len": 128,
+      "flops": 107323392,
+      "flops_per_sec": 4149189499.767192
+    },
+    {
+      "forward_time_ms": 7.6667699962854385,
+      "backward_time_ms": 15.698989998782054,
+      "total_time_ms": 23.365759995067492,
+      "throughput_samples_per_sec": 42.797666337885,
+      "batch_size": 1,
+      "seq_len": 256,
+      "flops": 239812608,
+      "flops_per_sec": 10263419980.80201
+    },
+    {
+      "forward_time_ms": 7.4175900052068755,
+      "backward_time_ms": 15.736499996273778,
+      "total_time_ms": 23.154090001480654,
+      "throughput_samples_per_sec": 172.7556556852033,
+      "batch_size": 4,
+      "seq_len": 128,
+      "flops": 429293568,
+      "flops_per_sec": 18540722955.320103
+    },
+    {
+      "forward_time_ms": 8.346149997669272,
+      "backward_time_ms": 16.519829994649626,
+      "total_time_ms": 24.8659799923189,
+      "throughput_samples_per_sec": 160.862350940345,
+      "batch_size": 4,
+      "seq_len": 256,
+      "flops": 959250432,
+      "flops_per_sec": 38576819908.01539
+    }
+  ],
+  "memory_results": [
+    {
+      "peak_memory_mb": 473.9267578125,
+      "activation_memory_mb": 249.00127029418945,
+      "parameter_memory_mb": 224.92548751831055,
+      "allocated_memory_mb": 471.11572265625,
+      "reserved_memory_mb": 538.0,
+      "batch_size": 1,
+      "seq_len": 128,
+      "memory_per_sample_mb": 473.9267578125
+    },
+    {
+      "peak_memory_mb": 637.1474609375,
+      "activation_memory_mb": 412.22197341918945,
+      "parameter_memory_mb": 224.92548751831055,
+      "allocated_memory_mb": 471.86572265625,
+      "reserved_memory_mb": 684.0,
+      "batch_size": 1,
+      "seq_len": 256,
+      "memory_per_sample_mb": 637.1474609375
+    },
+    {
+      "peak_memory_mb": 797.31396484375,
+      "activation_memory_mb": 572.3884773254395,
+      "parameter_memory_mb": 224.92548751831055,
+      "allocated_memory_mb": 473.36572265625,
+      "reserved_memory_mb": 832.0,
+      "batch_size": 4,
+      "seq_len": 128,
+      "memory_per_sample_mb": 199.3284912109375
+    },
+    {
+      "peak_memory_mb": 1119.48974609375,
+      "activation_memory_mb": 894.5642585754395,
+      "parameter_memory_mb": 224.92548751831055,
+      "allocated_memory_mb": 476.36572265625,
+      "reserved_memory_mb": 1164.0,
+      "batch_size": 4,
+      "seq_len": 256,
+      "memory_per_sample_mb": 279.8724365234375
+    }
+  ],
+  "gradient_analysis": {
+    "mean_grad_norm": 112302.19953075591,
+    "max_grad_norm": 1350635.875,
+    "min_grad_norm": 16.603927612304688,
+    "grad_norm_q": 62078.73046875,
+    "grad_norm_k": 64035.55078125,
+    "grad_norm_v": 1350635.875,
+    "grad_norm_o": 1227664.25,
+    "vanishing_gradient_detected": false,
+    "exploding_gradient_detected": true
+  },
+  "learning_results": {
+    "initial_loss": 3.543079137802124,
+    "final_loss": 5.570010662078857,
+    "loss_improvement": -0.5720819207592635,
+    "convergence_steps": 2,
+    "gradient_flow_score": 0.6691944750536368,
+    "learning_capacity_score": -8.208192075926348
+  },
+  "component_analysis": {
+    "compression_effectiveness": {},
+    "qk_mean_impact": {},
+    "head_reshaping_efficiency": {},
+    "normalization_stats": {}
+  },
+  "optimization_recommendations": [
+    "\u26a0\ufe0f  Low compute throughput detected. Consider:\n   - Using Flash Attention for sequence attention\n   - Reducing kernel size for convolutions (from 3 to 1)\n   - Decreasing sequence length sampling for training",
+    "\u26a0\ufe0f  Backward pass is much slower than forward. Consider:\n   - Enabling gradient checkpointing in full model\n   - Using 16-bit precision (float16/bfloat16)\n   - Reducing attention computation with lower compression",
+    "\u26a0\ufe0f  High memory per sample. Consider:\n   - Increasing compression factor (current may be too low)\n   - Using mixed precision training (AMP)\n   - Reducing model width or using grouped query attention",
+    "\u26a0\ufe0f  Exploding gradients detected. Fix with:\n   - Reduce learning rate\n   - Enable gradient clipping\n   - Use layer normalization before attention\n   - Decrease compression factor (too aggressive compression)",
+    "\u26a0\ufe0f  Low learning capacity score. Suggestions:\n   - Reduce compression factor for better expressivity\n   - Increase number of attention heads\n   - Try different kernel sizes for convolutions\n   - Verify data preprocessing is correct"
+  ]
+}
