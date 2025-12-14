@@ -37,6 +37,7 @@ runs/
 wandb/
 tensorboard/
 outputs/
+reports/
 
 # Data directories
 data/
