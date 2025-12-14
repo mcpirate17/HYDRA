@@ -12,7 +12,7 @@ Paper references:
 - MoR: arXiv:2507.10524
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"  # Updated with optimizations
 
 from .model.ccgqa import (
     CCGQAAttention,
@@ -21,6 +21,24 @@ from .model.ccgqa import (
     CCGQAMoDBlockWrapper,
     CCGQAMoDMoRModel,
     create_ccgqa_mod_mor_model,
+)
+
+# Shared layers module (optimized, deduplicated)
+from .layers import (
+    RMSNorm,
+    SwiGLUMLP,
+    RotaryEmbedding,
+    get_activation,
+    FUSED_KERNELS_AVAILABLE,
+    FLASH_ATTN_AVAILABLE,
+    XFORMERS_AVAILABLE,
+)
+
+# Kernel control functions
+from .kernels import (
+    TRITON_AVAILABLE,
+    get_kernel_status,
+    set_use_triton_kernels,
 )
 
 # Optimization module (optional import - requires optuna)
@@ -37,12 +55,26 @@ except ImportError:
     _HAS_OPTIMIZATION = False
 
 __all__ = [
+    # Model components
     "CCGQAAttention",
     "CCGQABlock",
     "CCGQAMoRBlock",
     "CCGQAMoDBlockWrapper",
     "CCGQAMoDMoRModel",
     "create_ccgqa_mod_mor_model",
+    # Shared layers
+    "RMSNorm",
+    "SwiGLUMLP",
+    "RotaryEmbedding",
+    "get_activation",
+    # Feature flags
+    "FUSED_KERNELS_AVAILABLE",
+    "FLASH_ATTN_AVAILABLE",
+    "XFORMERS_AVAILABLE",
+    "TRITON_AVAILABLE",
+    # Kernel control
+    "get_kernel_status",
+    "set_use_triton_kernels",
 ]
 
 if _HAS_OPTIMIZATION:
