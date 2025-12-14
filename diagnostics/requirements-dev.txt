@@ -1,0 +1,22 @@
+# Optional diagnostic dependencies for HYDRA
+# Install with: pip install -r diagnostics/requirements-dev.txt
+
+# Memory profiling
+memory-profiler>=0.60.0
+
+# Plotting and analysis  
+matplotlib>=3.5.0
+scipy>=1.8.0
+
+# Enhanced testing
+pytest>=7.0.0
+pytest-benchmark>=3.4.0
+pytest-cov>=3.0.0
+
+# Performance profiling
+py-spy>=0.3.0      # CPU profiler: py-spy top -- python train_100m_optimized.py
+line_profiler>=3.5.0  # Line-by-line profiler
+
+# Optional: Advanced profiling
+# torch-tb-profiler>=0.4.0  # TensorBoard profiler plugin
+# nvitop>=0.10.0            # GPU monitoring: nvitop

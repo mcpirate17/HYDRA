@@ -1,5 +1,13 @@
 """
 Deep diagnosis of CCGQA+MoD+MoR - check gradient flow layer by layer.
+
+Industry-standard gradient analysis for debugging training instability.
+Use with memory profiler: mprof run python diagnostics/deep_diagnosis.py
+
+Optional: Install memory-profiler for detailed analysis:
+    pip install memory-profiler
+    mprof run python diagnostics/deep_diagnosis.py  
+    mprof plot
 """
 
 import torch
@@ -7,7 +15,8 @@ import torch.nn as nn
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).parent))
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hydra.model.ccgqa import create_ccgqa_mod_mor_model
 

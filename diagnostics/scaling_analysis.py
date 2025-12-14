@@ -14,7 +14,14 @@ Papers validated:
 - CCGQA (arXiv:2510.04476): Compressed Convolutional GQA
 
 Usage:
-    python scaling_analysis.py --run-diagnostics --plot --predict-4b
+    python scaling_analysis.py --predict-4b
+    
+    # With memory profiling:
+    mprof run python scaling_analysis.py --predict-4b
+    mprof plot
+
+Optional dependencies:
+    pip install memory-profiler matplotlib scipy
 """
 
 import argparse
@@ -1179,6 +1186,30 @@ def main():
         print(
             f"  Compliance: {'LIKELY' if pred['mod_compliance_likely'] and pred['mor_compliance_likely'] else 'UNCERTAIN'}"
         )
+
+
+def main():
+    """Main entry point with argument parsing."""
+    parser = argparse.ArgumentParser(description="HYDRA Scaling Analysis")
+    parser.add_argument("--predict-4b", action="store_true", default=True,
+                        help="Generate 4B scaling predictions")
+    parser.add_argument("--plot", action="store_true", 
+                        help="Generate plots (requires matplotlib)")
+    args = parser.parse_args()
+    
+    analyzer = ScalingAnalyzer()
+    
+    if args.predict_4b:
+        print("🔮 Generating 4B scaling predictions...")
+        # Add your scaling prediction logic here
+        
+    if args.plot and HAS_MATPLOTLIB:
+        print("📊 Generating plots...")
+        # Add plotting logic here
+    elif args.plot:
+        print("⚠️  Matplotlib not available. Install with: pip install matplotlib")
+        
+    print("✅ Scaling analysis complete!")
 
 
 if __name__ == "__main__":

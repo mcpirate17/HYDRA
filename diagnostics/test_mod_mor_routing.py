@@ -1,12 +1,14 @@
 """
 Diagnostic test for MoD and MoR routing health.
 
-This test validates that:
+Industry-standard pytest tests for validating:
 1. MoD layers maintain capacity near target (0.5) without collapse
-2. MoR routers show proper depth distribution (not all same depth)
+2. MoR routers show proper depth distribution (not all same depth)  
 3. aux_loss is appropriately weighted relative to CE loss (1-5%)
 
-Run with: pytest diagnostics/test_mod_mor_routing.py -v
+Usage:
+    pytest diagnostics/test_mod_mor_routing.py -v
+    pytest diagnostics/test_mod_mor_routing.py::TestMoDMoRRouting::test_mod_capacity_near_target -v
 """
 
 import torch
