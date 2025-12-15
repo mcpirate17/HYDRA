@@ -100,8 +100,10 @@ class TrainingConfig:
     
     # MoR Curriculum: Delay adaptive routing to let base model learn first
     # MoD stays ON the whole time; only MoR adaptive depth is delayed
+    # SOFT TRANSITION: During rampup, outputs are blended (alpha * adaptive + (1-alpha) * fixed)
+    # This prevents catastrophic loss spike when routing suddenly enables
     mor_enable_pct: float = 0.30  # Enable MoR adaptive routing after this % of training (0.25-0.35 recommended)
-    mor_rampup_steps: int = 1000  # Ramp up MoR over this many steps after enabling
+    mor_rampup_steps: int = 5000  # INCREASED: Ramp up MoR over 5000 steps with soft blending
     mor_already_enabled: bool = False  # Set True when resuming AFTER mor_enable_pct (restart flag)
     
     # Auxiliary loss scales (for routing regularization)

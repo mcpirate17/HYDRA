@@ -1094,8 +1094,9 @@ class CCGQAMoRBlock(nn.Module):
         # Before this step, use fixed-depth (all tokens through all recursions)
         # This allows the base model to learn before adding routing complexity
         # Set via set_mor_enable_step() from training loop
+        # SOFT TRANSITION: During rampup, outputs are blended to prevent loss spike
         self._mor_enable_step = 0  # 0 = always enabled (legacy behavior)
-        self._mor_rampup_steps = 1000  # Ramp up routing over this many steps after enable
+        self._mor_rampup_steps = 5000  # INCREASED: Longer rampup with soft blending
         
         # Per-layer depth distribution weight
         # Must be strong enough to overcome sigmoid saturation (grad ≈ 0.045 at prob=0.047)
@@ -1410,10 +1411,21 @@ class CCGQAMoRBlock(nn.Module):
         self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         if self.adaptive and self.is_mor_adaptive_enabled():
-            # CONSISTENT FORWARD: Always use fast routing for train/eval consistency
-            # The model learns router-weighted depths, so eval must use the same logic
-            output, _ = self.forward_fast_routing(x)
-            return output
+            # SOFT TRANSITION: Blend fixed and adaptive outputs during rampup
+            # This prevents catastrophic loss spike when routing suddenly enables
+            rampup_scale = self.get_mor_rampup_scale()
+            
+            if rampup_scale >= 1.0:
+                # Full adaptive mode - no blending needed
+                output, _ = self.forward_fast_routing(x)
+                return output
+            else:
+                # RAMPUP PHASE: Blend outputs to smooth transition
+                # output = alpha * adaptive + (1-alpha) * fixed
+                adaptive_output, _ = self.forward_fast_routing(x)
+                fixed_output = self.forward_fixed(x)
+                output = rampup_scale * adaptive_output + (1.0 - rampup_scale) * fixed_output
+                return output
         return self.forward_fixed(x)
 
     def forward_with_losses(
@@ -1426,18 +1438,30 @@ class CCGQAMoRBlock(nn.Module):
         - aux_loss: MoD's load balancing loss (if using MoD on MLP)
 
         MoR Curriculum: Before _mor_enable_step, uses fixed-depth mode.
-        After enable, ramps up routing over _mor_rampup_steps.
+        After enable, ramps up routing over _mor_rampup_steps with SOFT BLENDING.
+        
+        SOFT TRANSITION FIX: During rampup, blend fixed and adaptive outputs
+        to prevent catastrophic loss spike when routing suddenly enables.
         """
         device = x.device
         
         if self.adaptive and self.is_mor_adaptive_enabled():
-            # Use fast routing (single router call, compiles well)
-            output, ponder_loss = self.forward_fast_routing(x)
-            
-            # Scale ponder_loss by rampup factor during transition
+            # Get rampup scale for soft transition
             rampup_scale = self.get_mor_rampup_scale()
+            
+            # Use fast routing (single router call, compiles well)
+            adaptive_output, ponder_loss = self.forward_fast_routing(x)
+            
+            # SOFT TRANSITION: Blend outputs during rampup
             if rampup_scale < 1.0:
+                # Rampup phase - blend adaptive and fixed outputs
+                fixed_output = self.forward_fixed(x)
+                output = rampup_scale * adaptive_output + (1.0 - rampup_scale) * fixed_output
+                # Scale ponder_loss too (router is still learning)
                 ponder_loss = ponder_loss * rampup_scale
+            else:
+                # Full adaptive mode - no blending
+                output = adaptive_output
             
             # Update cached loss with scaled value (for get_ponder_loss() consistency)
             if self.training:
@@ -1963,8 +1987,8 @@ class CCGQAMoDMoRModel(nn.Module):
             if hasattr(layer, 'set_mor_enable_step'):
                 layer.set_mor_enable_step(enable_step, rampup_steps)
             # MoR blocks wrapped in MoD
-            if hasattr(layer, 'block') and hasattr(layer.block, 'set_mor_enable_step'):
-                layer.block.set_mor_enable_step(enable_step, rampup_steps)
+            if hasattr(layer, 'set_mor_enable_step'):
+                layer.set_mor_enable_step(enable_step, rampup_steps)
     
     def is_mor_adaptive_enabled(self) -> bool:
         """Check if MoR adaptive routing is currently enabled."""
