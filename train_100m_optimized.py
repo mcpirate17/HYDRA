@@ -116,8 +116,11 @@ class TrainingConfig:
     n_kv_heads: int = 3
     
     # Model config - MOD+MOR (CCGQAMoDMoRModel)  
-    # 220.2M params: dim=1280, 8 blocks × 3 recursions = 24 effective layers
-    # Same param count, same effective depth, but with MoD/MoR routing
+    # Model size configurations:
+    #   100M: dim=1280, 8 blocks × 3 recursions = ~220M params
+    #   500M: dim=2048, 10 blocks × 3 recursions = ~605M params
+    # Note: these are defaults, can be overridden by model_size argument
+    model_size: str = "100M"  # Model size preset: "100M" or "500M"
     mod_mor_dim: int = 1280
     n_mor_blocks: int = 8
     mor_recursions: int = 3
@@ -276,9 +279,12 @@ class TrainingConfig:
             print(f"                  ~215M params")
         elif self.architecture == "mod_mor":
             effective_layers = self.n_mor_blocks * self.mor_recursions
+            # Estimate param count based on model_size preset
+            est_params = {"100M": 220, "500M": 520}.get(self.model_size, 220)
             print(f"  Architecture:   MOD+MOR (CCGQAMoDMoRModel)")
             print(f"                  dim={self.mod_mor_dim}, {self.n_mor_blocks} MoR blocks × {self.mor_recursions} recursions = {effective_layers} effective layers")
-            print(f"                  ~220M params (matched to vanilla)")
+            print(f"                  ~{est_params}M params ({self.model_size} preset)")
+            print(f"                  Hybrid attention: MQA → CCQA → MLA pattern")
             print(f"                  MoD capacity: {self.mod_capacity:.0%} (~{(1-self.mod_capacity)*100:.0f}% compute savings)")
             # MoR Curriculum info
             mor_enable_step = int(self.max_steps * self.mor_enable_pct)
@@ -628,7 +634,7 @@ class Trainer:
         '_checkpoint_history', '_checkpoint_losses', '_early_stop_counter',
         '_current_seq_len', '_use_mod_mor', '_start_step', '_mor_enable_step',
         '_diagnostics_file', '_diagnostics_data', '_last_ce_loss', '_last_aux_loss', '_last_ponder_loss',
-        '_adaptive_lr'
+        '_adaptive_lr', '_batch_filter', '_checkpoint_seq_len', '_checkpoint_config', '_checkpoint_lr'
     )
     
     def __init__(self, config: TrainingConfig):
@@ -670,11 +676,48 @@ class Trainer:
         # Set dtype
         self.dtype = getattr(torch, config.dtype) if config.dtype != "float32" else torch.float32
         
+        # Peek at checkpoint to get architecture params for model creation (if resuming)
+        # This ensures model is created with MATCHING architecture before loading weights
+        self._checkpoint_seq_len = None
+        self._checkpoint_config = {}
+        self._checkpoint_lr = None  # Will be set if resuming
+        if config.resume_from:
+            self._checkpoint_config = self._peek_checkpoint_config(config.resume_from)
+            self._checkpoint_seq_len = self._checkpoint_config.get('max_seq_len', config.max_seq_len)
+            
+            # Override architecture from checkpoint (critical - model structure must match)
+            if 'architecture' in self._checkpoint_config:
+                ckpt_arch = self._checkpoint_config['architecture']
+                if ckpt_arch != config.architecture:
+                    print(f"Overriding architecture: {config.architecture} -> {ckpt_arch} (from checkpoint)")
+                    config.architecture = ckpt_arch
+            
+            # Override architecture params from checkpoint to ensure match
+            if 'mod_mor_dim' in self._checkpoint_config:
+                config.mod_mor_dim = self._checkpoint_config['mod_mor_dim']
+            if 'n_mor_blocks' in self._checkpoint_config:
+                config.n_mor_blocks = self._checkpoint_config['n_mor_blocks']
+            if 'mor_recursions' in self._checkpoint_config:
+                config.mor_recursions = self._checkpoint_config['mor_recursions']
+            if 'mod_mor_n_heads' in self._checkpoint_config:
+                config.mod_mor_n_heads = self._checkpoint_config['mod_mor_n_heads']
+            if 'mod_mor_n_kv_heads' in self._checkpoint_config:
+                config.mod_mor_n_kv_heads = self._checkpoint_config['mod_mor_n_kv_heads']
+            
+            # Get learning rate from checkpoint optimizer state (for warm restart)
+            if 'optimizer' in torch.load(config.resume_from, weights_only=False, map_location='cpu'):
+                ckpt_full = torch.load(config.resume_from, weights_only=False, map_location='cpu')
+                if 'optimizer' in ckpt_full and 'param_groups' in ckpt_full['optimizer']:
+                    last_lr = ckpt_full['optimizer']['param_groups'][0].get('lr', config.max_lr)
+                    print(f"Checkpoint final LR: {last_lr:.6f}")
+                    # Store for potential use in LR warmup
+                    self._checkpoint_lr = last_lr
+        
         self._setup_model()
         self._setup_optimizer()
         self._setup_data()
         
-        # Load checkpoint if resuming
+        # Load checkpoint if resuming (after model is compiled)
         if config.resume_from:
             self._load_checkpoint(config.resume_from)
         
@@ -708,9 +751,75 @@ class Trainer:
             print(f"Batch Filter: ENABLED (threshold={config.batch_filter_threshold}x, max_skip={config.batch_filter_max_skip:.0%})")
         print(f"{'='*70}\n")
     
+    def _peek_checkpoint_config(self, checkpoint_path: str) -> dict:
+        """Peek at checkpoint to get config for model creation.
+        
+        Returns dict with architecture params needed to recreate the model
+        with matching shapes before loading the full checkpoint.
+        """
+        checkpoint = torch.load(checkpoint_path, weights_only=False, map_location='cpu')
+        ckpt_config = checkpoint.get('config', {})
+        
+        result = {}
+        
+        # Get seq_len from RoPE cache shape (most reliable)
+        for key, tensor in checkpoint['model'].items():
+            if 'cos_cached' in key:
+                result['max_seq_len'] = tensor.shape[2]  # Shape is [1, 1, seq_len, head_dim/2]
+                print(f"Checkpoint RoPE cache seq_len: {result['max_seq_len']}")
+                break
+        
+        # Get architecture params from checkpoint config
+        # These MUST match for weight loading to work
+        arch_keys = [
+            'architecture',  # Critical: vanilla vs mod_mor
+            'mod_mor_dim', 'n_mor_blocks', 'mor_recursions', 
+            'mod_mor_n_heads', 'mod_mor_n_kv_heads', 'mod_capacity',
+            'vocab_size', 'mor_adaptive'
+        ]
+        for key in arch_keys:
+            if key in ckpt_config:
+                result[key] = ckpt_config[key]
+        
+        if result:
+            print(f"Checkpoint architecture: dim={result.get('mod_mor_dim')}, "
+                  f"blocks={result.get('n_mor_blocks')}, "
+                  f"recursions={result.get('mor_recursions')}, "
+                  f"heads={result.get('mod_mor_n_heads')}")
+        
+        return result
+    
+    def _peek_checkpoint_seq_len(self, checkpoint_path: str) -> int:
+        """Peek at checkpoint to get seq_len from RoPE cache shape.
+        
+        This allows us to create/compile the model with matching shapes
+        before loading the full checkpoint.
+        """
+        checkpoint = torch.load(checkpoint_path, weights_only=False, map_location='cpu')
+        
+        # Find first cos_cached buffer to get seq_len
+        for key, tensor in checkpoint['model'].items():
+            if 'cos_cached' in key:
+                seq_len = tensor.shape[2]  # Shape is [1, 1, seq_len, head_dim/2]
+                print(f"Checkpoint RoPE cache seq_len: {seq_len}")
+                return seq_len
+        
+        # Fallback to config's max_seq_len if no RoPE found
+        return self.config.max_seq_len
+    
     def _setup_model(self) -> None:
         """Initialize and optionally compile the model."""
         config = self.config
+        
+        # Calculate max seq_len needed across all training phases
+        # This ensures RoPE cache is big enough and won't need runtime resizing
+        max_needed_seq_len = config.max_seq_len
+        for _, seq_len in config.seq_steps:
+            max_needed_seq_len = max(max_needed_seq_len, seq_len)
+        
+        # If resuming, we create with max needed (checkpoint's RoPE will be expanded on load)
+        model_seq_len = max_needed_seq_len
+        print(f"Creating model with max_seq_len={model_seq_len} (covers all training phases)")
         
         if config.architecture == "vanilla":
             # HybridTransformer: MQA + CCQA + MLA, no routing
@@ -720,7 +829,7 @@ class Trainer:
                 n_macro_blocks=config.n_macro_blocks,
                 n_heads=config.n_heads,
                 n_kv_heads=config.n_kv_heads,
-                max_seq_len=config.max_seq_len,
+                max_seq_len=model_seq_len,
                 enable_mod=False,  # No MoD for vanilla
             )
             self.model = HybridTransformer(model_config).to(self.device)
@@ -737,8 +846,8 @@ class Trainer:
                 n_heads=config.mod_mor_n_heads,  # 20 (1280/64)
                 n_kv_heads=config.mod_mor_n_kv_heads,  # 5 (1280/256)
                 compression_factor=4,
-                mlp_ratio=3.5,
-                max_seq_len=config.max_seq_len,
+                mlp_ratio=3.6,  # 3.6 * 1280 * 2 = 9216 hidden dim
+                max_seq_len=model_seq_len,
                 mod_capacity=config.mod_capacity,
                 adaptive=config.mor_adaptive,  # Use config instead of hardcoded True
                 tie_weights=True,
@@ -858,7 +967,7 @@ class Trainer:
         
         checkpoint = torch.load(checkpoint_path, weights_only=False, map_location=self.device)
         
-        # Load model state
+        # Load model state (model was created with matching seq_len from peek)
         model = self.model
         if hasattr(model, "_orig_mod"):
             model = model._orig_mod
@@ -916,7 +1025,7 @@ class Trainer:
         return config.max_seq_len  # Final phase uses max_seq_len
     
     def _recreate_dataloader(self, seq_len: int) -> None:
-        """Recreate dataloader with new sequence length."""
+        """Recreate dataloader with new sequence length and resize RoPE cache."""
         config = self.config
         if hasattr(self, 'train_loader') and self.train_loader:
             self.train_loader.close()
@@ -924,6 +1033,13 @@ class Trainer:
         print(f"\n{'='*70}")
         print(f"SEQUENCE LENGTH TRANSITION: {self._current_seq_len} -> {seq_len}")
         print(f"{'='*70}")
+        
+        # Resize RoPE cache in model to support new sequence length
+        model = self.model
+        if hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        if hasattr(model, "resize_rope_cache"):
+            model.resize_rope_cache(seq_len)
         
         self.train_loader = create_universal_loader(
             dataset=config.dataset_name,
@@ -1757,6 +1873,8 @@ def main(
     batch_filter_threshold: float = 2.5,
     batch_size: Optional[int] = None,
     grad_accum_steps: Optional[int] = None,
+    dataset_name: str = "fineweb_edu",
+    model_size: str = "100M",
 ):
     """Main training entry point.
     
@@ -1778,7 +1896,35 @@ def main(
         batch_filter_threshold: Skip batch if loss > threshold * running_avg
         batch_size: Micro batch size per GPU (None = use mode default)
         grad_accum_steps: Gradient accumulation steps (None = use mode default)
+        model_size: Model size preset ("100M" or "500M")
     """
+    
+    # Model size configurations
+    MODEL_SIZE_CONFIGS = {
+        "100M": {
+            "mod_mor_dim": 1280,
+            "n_mor_blocks": 8,
+            "mor_recursions": 3,
+            "mod_mor_n_heads": 20,  # 1280/64
+            "mod_mor_n_kv_heads": 5,  # 1280/256
+            "default_batch_size": 32,  # Can fit ~32 on 32GB GPU
+            "default_grad_accum": 4,
+        },
+        "500M": {
+            "mod_mor_dim": 2048,
+            "n_mor_blocks": 10,
+            "mor_recursions": 3,
+            "mod_mor_n_heads": 32,  # 2048/64
+            "mod_mor_n_kv_heads": 8,  # 2048/256
+            "default_batch_size": 16,  # Smaller batch for 500M
+            "default_grad_accum": 8,  # Higher accum to maintain effective batch
+        },
+    }
+    
+    size_config = MODEL_SIZE_CONFIGS.get(model_size, MODEL_SIZE_CONFIGS["100M"])
+    print(f"\n🔧 MODEL SIZE: {model_size}")
+    print(f"   dim={size_config['mod_mor_dim']}, blocks={size_config['n_mor_blocks']}, "
+          f"heads={size_config['mod_mor_n_heads']}")
     
     # Configuration for 100M variant testing with WSD scheduler
     config = TrainingConfig(
@@ -1808,7 +1954,17 @@ def main(
         batch_filter=batch_filter,
         batch_filter_threshold=batch_filter_threshold,
         
-        # Model - 100M variant
+        # Model size preset
+        model_size=model_size,
+        
+        # MoD+MoR model dimensions (from size config)
+        mod_mor_dim=size_config["mod_mor_dim"],
+        n_mor_blocks=size_config["n_mor_blocks"],
+        mor_recursions=size_config["mor_recursions"],
+        mod_mor_n_heads=size_config["mod_mor_n_heads"],
+        mod_mor_n_kv_heads=size_config["mod_mor_n_kv_heads"],
+        
+        # Vanilla model config (for fallback)
         dim=768,
         n_macro_blocks=3,
         n_heads=12,
@@ -1816,10 +1972,9 @@ def main(
         max_seq_len=512,  # Shorter for faster iteration
         
         # Training - batch size is critical for scaling!
-        # Default: 8 micro × 4 accum = 32 effective (good for 220M on single GPU)
-        # Scale up for larger models: 500M→64, 1B→128, 4B→256-512
-        batch_size=batch_size if batch_size is not None else 8,
-        grad_accum_steps=grad_accum_steps if grad_accum_steps is not None else 4,
+        # Default batch sizes depend on model size to fit in GPU memory
+        batch_size=batch_size if batch_size is not None else size_config["default_batch_size"],
+        grad_accum_steps=grad_accum_steps if grad_accum_steps is not None else size_config["default_grad_accum"],
         max_steps=5000,
         
         # WSD Schedule: Warmup 3% -> Stable 67% -> Decay 30%
@@ -1828,11 +1983,11 @@ def main(
         warmup_steps=150,           # 3% warmup
         decay_start_step=3500,      # Start decay at 70% (after 67% stable)
         decay_steps=1500,           # 30% linear decay
-        max_lr=5e-4,
-        min_lr=1.5e-4,              # Higher floor (30% of max) prevents stagnation
+        max_lr=5e-4 if model_size == "100M" else 3e-4,  # Lower LR for larger models
+        min_lr=1.5e-4 if model_size == "100M" else 1e-4,
         
         # Dataset
-        dataset_name="finefineweb",
+        dataset_name=dataset_name,
         
         # Optimization
         use_compile=True,
@@ -1927,6 +2082,12 @@ if __name__ == "__main__":
                         help="Enable batch filtering: skip batches with loss spikes from bad data")
     parser.add_argument("--batch_filter_threshold", type=float, default=2.5,
                         help="Skip batch if loss > threshold * running_avg (default 2.5)")
+    # Dataset argument
+    parser.add_argument("--dataset", type=str, default="fineweb_edu",
+                        help="Dataset name (default: fineweb_edu, alternatives: finefineweb, synthetic_mix)")
+    # Model size argument
+    parser.add_argument("--model_size", type=str, default="100M", choices=["100M", "500M"],
+                        help="Model size preset: 100M (~220M params) or 500M (~605M params)")
     args = parser.parse_args()
     
     main(
@@ -1948,4 +2109,6 @@ if __name__ == "__main__":
         batch_filter_threshold=args.batch_filter_threshold,
         batch_size=args.batch_size,
         grad_accum_steps=args.grad_accum,
+        dataset_name=args.dataset,
+        model_size=args.model_size,
     )

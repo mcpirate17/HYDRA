@@ -38,17 +38,6 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 
-# Import torch.compiler.disable to prevent torch.compile from tracing through Triton kernels
-# This avoids double-autotuning conflicts on newer GPUs (Blackwell)
-try:
-    from torch.compiler import disable as compiler_disable
-except ImportError:
-    try:
-        from torch._dynamo import disable as compiler_disable
-    except ImportError:
-        def compiler_disable(fn):
-            return fn
-
 
 # =============================================================================
 # Triton Import and Feature Detection
@@ -69,9 +58,7 @@ except ImportError:
 USE_TRITON_KERNELS = TRITON_AVAILABLE and os.environ.get("HYDRA_DISABLE_TRITON", "0") != "1"
 
 # Per-kernel switches (for debugging)
-# NOTE: RoPE kernel disabled by default on Blackwell (sm_120) due to memory access pattern issues
-# Other kernels (SwiGLU, RMSNorm, QKNorm) work fine
-USE_FUSED_ROPE = False  # Disabled until Triton fixes Blackwell support
+USE_FUSED_ROPE = USE_TRITON_KERNELS
 USE_FUSED_QK_NORM = USE_TRITON_KERNELS
 USE_FUSED_SWIGLU = USE_TRITON_KERNELS
 USE_FUSED_RMS_NORM = USE_TRITON_KERNELS
@@ -109,13 +96,12 @@ def get_kernel_status() -> dict:
 # =============================================================================
 
 if TRITON_AVAILABLE:
-    # Blackwell-safe autotuning configs (shared memory limit: 101KB)
-    # Reduced from 256 max to 64 max to fit within Blackwell's SM constraints
     @triton.autotune(
         configs=[
-            triton.Config({"BLOCK_SIZE": 16}, num_warps=2, num_stages=1),
-            triton.Config({"BLOCK_SIZE": 32}, num_warps=2, num_stages=1),
-            triton.Config({"BLOCK_SIZE": 64}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_SIZE": 32}, num_warps=2),
+            triton.Config({"BLOCK_SIZE": 64}, num_warps=4),
+            triton.Config({"BLOCK_SIZE": 128}, num_warps=4),
+            triton.Config({"BLOCK_SIZE": 256}, num_warps=8),
         ],
         key=["half_head_dim"],
     )
@@ -195,7 +181,6 @@ def fused_rope(
     return _rope_pytorch(x, cos, sin)
 
 
-@compiler_disable
 def _fused_rope_triton(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """Triton implementation of RoPE."""
     B, H, S, D = x.shape
@@ -248,11 +233,11 @@ def _rope_pytorch(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torc
 # =============================================================================
 
 if TRITON_AVAILABLE:
-    # Blackwell-safe autotuning configs
     @triton.autotune(
         configs=[
-            triton.Config({"BLOCK_SIZE": 32}, num_warps=2, num_stages=1),
-            triton.Config({"BLOCK_SIZE": 64}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_SIZE": 64}, num_warps=2),
+            triton.Config({"BLOCK_SIZE": 128}, num_warps=4),
+            triton.Config({"BLOCK_SIZE": 256}, num_warps=8),
         ],
         key=["head_dim"],
     )
@@ -328,7 +313,6 @@ def fused_qk_norm(
     return _qk_norm_pytorch(q, k, scale, temperature)
 
 
-@compiler_disable
 def _fused_qk_norm_triton(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -382,11 +366,11 @@ def _qk_norm_pytorch(
 # =============================================================================
 
 if TRITON_AVAILABLE:
-    # Blackwell-safe autotuning configs
     @triton.autotune(
         configs=[
-            triton.Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=1),
-            triton.Config({"BLOCK_SIZE": 512}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_SIZE": 512}, num_warps=4),
+            triton.Config({"BLOCK_SIZE": 1024}, num_warps=4),
+            triton.Config({"BLOCK_SIZE": 2048}, num_warps=8),
         ],
         key=["n_elements"],
     )
@@ -431,7 +415,6 @@ def fused_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return _swiglu_pytorch(gate, up)
 
 
-@compiler_disable
 def _fused_swiglu_triton(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """Triton implementation of SwiGLU."""
     orig_shape = gate.shape
@@ -457,12 +440,12 @@ def _swiglu_pytorch(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 # =============================================================================
 
 if TRITON_AVAILABLE:
-    # Blackwell-safe autotuning configs
     @triton.autotune(
         configs=[
-            triton.Config({"BLOCK_SIZE": 64}, num_warps=2, num_stages=1),
-            triton.Config({"BLOCK_SIZE": 128}, num_warps=4, num_stages=1),
-            triton.Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_SIZE": 128}, num_warps=2),
+            triton.Config({"BLOCK_SIZE": 256}, num_warps=4),
+            triton.Config({"BLOCK_SIZE": 512}, num_warps=4),
+            triton.Config({"BLOCK_SIZE": 1024}, num_warps=8),
         ],
         key=["dim"],
     )
@@ -528,7 +511,6 @@ def fused_rms_norm(
     return _rms_norm_pytorch(x, weight, eps)
 
 
-@compiler_disable
 def _fused_rms_norm_triton(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Triton implementation of RMSNorm."""
     orig_shape = x.shape

@@ -68,6 +68,13 @@ except ImportError:
     HAS_TRANSFORMERS = False
     logger.warning("transformers not available. Install with: pip install transformers")
 
+try:
+    from huggingface_hub import snapshot_download
+    HAS_HF_HUB = True
+except ImportError:
+    HAS_HF_HUB = False
+    logger.warning("huggingface_hub not available. Install with: pip install huggingface_hub")
+
 
 # ============================================
 # TOKENIZER CACHE (prevent memory leaks)
@@ -98,14 +105,274 @@ def get_tokenizer(name: str = "gpt2"):
 # ============================================
 # DATASET CONFIGURATIONS
 # ============================================
+
+# FineFineWeb domains for local download (actual folder names from HF)
+FINEFINEWEB_DOMAINS = [
+    # High-volume general domains
+    "news", "economics", "entertainment", "sports", "politics", "finance",
+    "health", "hobby", "travel", "food", "fashion", "beauty", "pet",
+    # Knowledge/Academic domains
+    "law", "history", "geography", "literature", "philosophy", "psychology",
+    "sociology", "journalism_and_media_communication",
+    # Science domains
+    "biology", "physics", "chemistry", "mathematics", "astronomy",
+    "environmental_science", "atmospheric_science", "ocean_science",
+    "materials_science", "statistics", "systems_science",
+    # Technology/Engineering domains
+    "computer_science_and_technology", "electronic_science", "mechanical_engineering",
+    "civil_engineering", "automotive", "aerospace", "transportation_engineering",
+    "communication_engineering", "optical_engineering", "instrument_science",
+    # Creative/Cultural domains
+    "game", "movie", "music_and_dance", "drama_and_film", "artistic", "painting",
+    "photo", "design", "landscape_architecture", "urban_planning",
+    # Medical/Health domains
+    "medical", "agronomy", "nuclear_science",
+    # Other specialized domains
+    "celebrity", "topicality", "relationship", "library",
+    "public_administration", "mining_engineering", "hydraulic_engineering",
+    "petroleum_and_natural_gas_engineering", "textile_science", "weapons_science",
+    "christianity", "gamble",
+]
+
+# Default cache directory for FineFineWeb local download
+FINEFINEWEB_CACHE_DIR = "/mnt/nvme0/hf_finefineweb"
+
+
+def download_finefineweb_subset(
+    cache_dir: str = FINEFINEWEB_CACHE_DIR,
+    domains: Optional[List[str]] = None,
+    max_files_per_domain: int = 10,
+) -> str:
+    """
+    Download FineFineWeb subset to local disk for fast streaming.
+    
+    This avoids 502 errors from HuggingFace API by downloading files
+    directly without tree enumeration.
+    
+    Args:
+        cache_dir: Local directory to cache the dataset
+        domains: List of domains to download (default: all 38 domains)
+        max_files_per_domain: Max files per domain (e.g., 10 = first 10 files)
+    
+    Returns:
+        Path to local directory containing downloaded files
+    """
+    if not HAS_HF_HUB:
+        raise ImportError("huggingface_hub required. Install with: pip install huggingface_hub")
+    
+    from huggingface_hub import hf_hub_download
+    
+    if domains is None:
+        domains = FINEFINEWEB_DOMAINS
+    
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    
+    logger.info(f"Downloading FineFineWeb subset to {cache_dir}")
+    logger.info(f"Domains: {len(domains)}, max files per domain: {max_files_per_domain}")
+    
+    # Download each file directly (no tree enumeration)
+    downloaded = 0
+    failed = 0
+    for domain in domains:
+        domain_dir = cache_path / domain
+        domain_dir.mkdir(exist_ok=True)
+        
+        for i in range(max_files_per_domain):
+            # Files use 6-digit numbering: domain_000000.jsonl
+            filename = f"{domain}/{domain}_{i:06d}.jsonl"
+            local_path = cache_path / filename
+            
+            if local_path.exists():
+                downloaded += 1
+                continue
+            
+            try:
+                hf_hub_download(
+                    repo_id="m-a-p/FineFineWeb",
+                    filename=filename,
+                    repo_type="dataset",
+                    local_dir=cache_dir,
+                )
+                downloaded += 1
+                if downloaded % 50 == 0:
+                    logger.info(f"Downloaded {downloaded} files...")
+            except Exception as e:
+                # Some domains may not have all file indices
+                failed += 1
+                if failed <= 5:
+                    logger.debug(f"File not found (expected for some domains): {filename}")
+    
+    logger.info(f"Downloaded {downloaded} files ({failed} not found) to {cache_dir}")
+    return str(cache_path)
+
+
+
+def load_finefineweb_local(
+    cache_dir: str = FINEFINEWEB_CACHE_DIR,
+    domains: Optional[List[str]] = None,
+    streaming: bool = True,
+    auto_download: bool = True,
+    max_files_per_domain: int = 10,
+):
+    """
+    Load FineFineWeb from local cache with optional auto-download.
+    
+    This is the preferred method for reliable, fast data loading.
+    First call downloads the subset, subsequent calls stream from disk.
+    
+    Args:
+        cache_dir: Local cache directory
+        domains: List of domains to load
+        streaming: If True, stream from disk (memory efficient)
+        auto_download: If True and cache missing, download first
+        max_files_per_domain: Max files per domain for download
+    
+    Returns:
+        HuggingFace dataset (streaming or in-memory)
+    """
+    if domains is None:
+        domains = FINEFINEWEB_DOMAINS
+    
+    # Check if cache exists
+    cache_path = Path(cache_dir)
+    if not cache_path.exists() or not any(cache_path.iterdir()):
+        if auto_download:
+            logger.info("Cache not found, downloading FineFineWeb subset...")
+            download_finefineweb_subset(cache_dir, domains, max_files_per_domain)
+        else:
+            raise FileNotFoundError(f"Cache not found at {cache_dir}. Set auto_download=True")
+    
+    # Collect all JSONL files from cached domains
+    files = []
+    for d in domains:
+        domain_files = glob.glob(os.path.join(cache_dir, d, f"{d}_*.jsonl"))
+        files.extend(sorted(domain_files))
+    
+    if not files:
+        raise FileNotFoundError(f"No JSONL files found in {cache_dir}")
+    
+    logger.info(f"Loading {len(files)} files from local cache")
+    
+    ds = load_dataset(
+        "json",
+        data_files=files,
+        split="train",
+        streaming=streaming,
+    )
+    
+    return ds
+
+
+def load_finefineweb_hybrid(
+    cache_dir: str = FINEFINEWEB_CACHE_DIR,
+    domains: Optional[List[str]] = None,
+    local_weight: float = 0.7,
+    streaming: bool = True,
+):
+    """
+    Hybrid loader: interleave local cache + remote HuggingFace streaming.
+    
+    Start immediately with local files (fast, reliable), while also 
+    streaming from HuggingFace to get more domain diversity.
+    
+    Args:
+        cache_dir: Local cache directory
+        domains: List of domains to load locally
+        local_weight: Probability of sampling from local vs remote (0.7 = 70% local)
+        streaming: Must be True for this mode
+    
+    Returns:
+        Interleaved HuggingFace streaming dataset
+    """
+    from datasets import interleave_datasets
+    
+    if domains is None:
+        domains = FINEFINEWEB_DOMAINS
+    
+    datasets_to_interleave = []
+    weights = []
+    
+    # 1. Load local files (fast, reliable)
+    cache_path = Path(cache_dir)
+    local_files = []
+    if cache_path.exists():
+        for d in domains:
+            domain_files = glob.glob(os.path.join(cache_dir, d, f"{d}_*.jsonl"))
+            local_files.extend(sorted(domain_files))
+    
+    if local_files:
+        logger.info(f"Hybrid: loading {len(local_files)} local files (weight={local_weight})")
+        local_ds = load_dataset(
+            "json",
+            data_files=local_files,
+            split="train",
+            streaming=True,
+        )
+        datasets_to_interleave.append(local_ds)
+        weights.append(local_weight)
+    
+    # 2. Stream from HuggingFace (more diversity, may have occasional errors)
+    # Use FineWeb-Edu (smaller, better API support) instead of FineFineWeb
+    try:
+        logger.info(f"Hybrid: connecting to remote FineWeb-Edu (weight={1-local_weight})")
+        remote_ds = load_dataset(
+            "HuggingFaceFW/fineweb-edu",
+            name="sample-10BT",  # 10B token sample, manageable size
+            split="train",
+            streaming=True,
+        )
+        datasets_to_interleave.append(remote_ds)
+        weights.append(1 - local_weight)
+        logger.info("Remote FineWeb-Edu connected successfully")
+    except Exception as e:
+        logger.warning(f"Remote streaming failed: {e}. Using local only.")
+        # Fall back to local only
+        if not local_files:
+            raise FileNotFoundError("No local cache and remote failed")
+    
+    if len(datasets_to_interleave) == 1:
+        return datasets_to_interleave[0]
+    
+    # Interleave with weighted sampling
+    return interleave_datasets(
+        datasets_to_interleave,
+        probabilities=weights,
+        stopping_strategy="all_exhausted",
+    )
+
+
 DATASET_CONFIGS = {
-    # General web text
+    # FineFineWeb - hybrid mode: bootstrap with local, then stream from web
     "finefineweb": {
         "path": "m-a-p/FineFineWeb",
         "name": None,
         "text_column": "text",
-        "format": "jsonl",  # FineFineWeb uses JSONL format (66K+ files)
-        "description": "Fine-grained curated web corpus (~4.9B samples, 4.4T tokens)",
+        "format": "jsonl",
+        "use_hybrid": True,
+        "local_weight": 0.1,  # 10% local (bootstrap), 90% remote (main source)
+        "cache_dir": FINEFINEWEB_CACHE_DIR,
+        "domains": FINEFINEWEB_DOMAINS,
+        "max_files_per_domain": 10,
+        "description": "Hybrid: 10% local bootstrap + 90% remote streaming",
+    },
+    # Local-only mode (no remote streaming, 100% reliable)
+    "finefineweb-local": {
+        "path": "m-a-p/FineFineWeb",
+        "name": None,
+        "text_column": "text",
+        "format": "jsonl",
+        "use_local_cache": True,
+        "cache_dir": FINEFINEWEB_CACHE_DIR,
+        "domains": FINEFINEWEB_DOMAINS,
+        "max_files_per_domain": 10,
+        "description": "Local cache only (67 domains × 10 files, ~113GB)",
+    },
+    # Local pre-tokenized datasets
+    "pleias_synth": {
+        "local": True,
+        "path": "/mnt/nvme0/LLM/training_pleias_synth/processed",
+        "description": "PleIAs SYNTH synthetic reasoning (~1.5B tokens, pre-tokenized)",
     },
     "fineweb": {
         "path": "HuggingFaceFW/fineweb",
@@ -362,17 +629,47 @@ class HFStreamingDataLoader:
                     load_kwargs["fragment_scan_options"] = PARQUET_FRAGMENT_SCAN_OPTIONS
                     logger.info("Using optimized PyArrow prefetch (128MiB chunks)")
 
-                if config.get("name"):
+                # Use local cache for FineFineWeb (download once, stream locally)
+                # This avoids 502 errors and is much faster than remote streaming
+                if config.get("use_hybrid"):
+                    # Hybrid mode: local cache + remote streaming interleaved
+                    cache_dir = config.get("cache_dir", FINEFINEWEB_CACHE_DIR)
+                    domains = config.get("domains", FINEFINEWEB_DOMAINS)
+                    local_weight = config.get("local_weight", 0.7)
+                    
+                    self.dataset = load_finefineweb_hybrid(
+                        cache_dir=cache_dir,
+                        domains=domains,
+                        local_weight=local_weight,
+                        streaming=True,
+                    )
+                    logger.info(f"Hybrid mode: {local_weight*100:.0f}% local, {(1-local_weight)*100:.0f}% remote")
+                elif config.get("use_local_cache"):
+                    # Local-only mode: 100% from disk cache
+                    cache_dir = config.get("cache_dir", FINEFINEWEB_CACHE_DIR)
+                    domains = config.get("domains", FINEFINEWEB_DOMAINS)
+                    max_files = config.get("max_files_per_domain", 10)
+                    
+                    self.dataset = load_finefineweb_local(
+                        cache_dir=cache_dir,
+                        domains=domains,
+                        streaming=True,
+                        auto_download=True,
+                        max_files_per_domain=max_files,
+                    )
+                    logger.info(f"Loaded from local cache: {cache_dir}")
+                elif config.get("name"):
                     self.dataset = load_dataset(
                         config["path"], config["name"], **load_kwargs
                     )
                 else:
                     self.dataset = load_dataset(config["path"], **load_kwargs)
 
-                # Shuffle with buffer
-                self.dataset = self.dataset.shuffle(
-                    seed=42, buffer_size=self.buffer_size
-                )
+                # JSONL streaming: small shuffle buffer (huge buffers stall on init)
+                if self.buffer_size and self.buffer_size > 0:
+                    self.dataset = self.dataset.shuffle(
+                        seed=42, buffer_size=min(self.buffer_size, 2048)
+                    )
 
                 # Get formatter if needed
                 if config.get("formatter"):
@@ -384,16 +681,8 @@ class HFStreamingDataLoader:
                 self.batched_dataset = self.dataset.batch(batch_size=32)
                 self.iterator = iter(self.batched_dataset)
 
-                # Test first batch
-                test_batch = next(self.iterator)
-                if self.formatter:
-                    test_text = self.formatter({k: v[0] for k, v in test_batch.items()})
-                else:
-                    test_text = test_batch.get(self.text_column, [""])[0]
-                logger.info(f"Dataset loaded! Sample preview: {test_text[:100]}...")
-
-                # Reset iterator
-                self.iterator = iter(self.batched_dataset)
+                # Skip test batch probe - it stalls on large streaming datasets
+                logger.info(f"Dataset {self.dataset_name} initialized (streaming mode)")
                 return
 
             except Exception as e:
@@ -1090,6 +1379,11 @@ def create_universal_loader(
         if not data_dir:
             raise ValueError("data_dir required for local_jsonl dataset")
         return LocalJSONLDataLoader(data_dir=data_dir, **common_kwargs)
+
+    # Check if it's a configured local dataset (pre-tokenized .pt files)
+    elif dataset in DATASET_CONFIGS and DATASET_CONFIGS[dataset].get("local"):
+        config = DATASET_CONFIGS[dataset]
+        return LocalDataLoader(data_dir=config["path"], **common_kwargs)
 
     elif dataset in ["synthetic_mix", "mix"]:
         # Use interleaved loader with multiple datasets

@@ -23,7 +23,7 @@ from .model.ccgqa import (
     create_ccgqa_mod_mor_model,
 )
 
-# Shared layers module (optimized, deduplicated)
+# Shared layers module (deduplicated components)
 from .layers import (
     RMSNorm,
     SwiGLUMLP,
@@ -34,9 +34,8 @@ from .layers import (
     XFORMERS_AVAILABLE,
 )
 
-# Kernel control functions
+# Kernel utilities
 from .kernels import (
-    TRITON_AVAILABLE,
     get_kernel_status,
     set_use_triton_kernels,
 )
@@ -55,7 +54,7 @@ except ImportError:
     _HAS_OPTIMIZATION = False
 
 __all__ = [
-    # Model components
+    # Models
     "CCGQAAttention",
     "CCGQABlock",
     "CCGQAMoRBlock",
@@ -71,7 +70,6 @@ __all__ = [
     "FUSED_KERNELS_AVAILABLE",
     "FLASH_ATTN_AVAILABLE",
     "XFORMERS_AVAILABLE",
-    "TRITON_AVAILABLE",
     # Kernel control
     "get_kernel_status",
     "set_use_triton_kernels",
@@ -86,3 +84,4 @@ if _HAS_OPTIMIZATION:
             "optimize_all_components",
         ]
     )
+

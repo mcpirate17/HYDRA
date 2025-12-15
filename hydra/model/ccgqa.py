@@ -36,6 +36,12 @@ import torch.nn.functional as F
 # =============================================================================
 from hydra.routing.mixture_of_depths import MoDRouter
 
+# =============================================================================
+# HYBRID ATTENTION: Import MQA, MLA for hybrid pattern
+# Pattern: MQA → MQA → CCQA → CCQA → CCQA → MLA → MQA → MLA
+# =============================================================================
+from hydra.model.hybrid_attention import AttentionType, MQAAttention, MLAAttention
+
 # Validate MoDRouter import at module load time
 assert hasattr(MoDRouter, 'forward'), "MoDRouter must have forward method"
 assert hasattr(MoDRouter, 'get_aux_loss'), "MoDRouter must have get_aux_loss method"
@@ -954,6 +960,7 @@ class CCGQAMoRBlock(nn.Module):
         ponder_loss_weight: float = 0.01,
         layer_idx: int = 0,
         total_layers: int = 1,
+        attention_type: AttentionType = AttentionType.CCQA,  # Hybrid attention type
         **attention_kwargs,
     ):
         super().__init__()
@@ -963,6 +970,7 @@ class CCGQAMoRBlock(nn.Module):
         self.layer_idx = layer_idx
         self.total_layers = total_layers
         self.dim = dim
+        self.attention_type = attention_type
 
         # =====================================================================
         # OPTION A ARCHITECTURE: Separate attention (dense) from MLP (recursive)
@@ -976,15 +984,39 @@ class CCGQAMoRBlock(nn.Module):
         mod_mlp_warmup = attention_kwargs.pop("mod_mlp_warmup", 100)
         self.use_mod_mlp = mod_mlp_capacity is not None and mod_mlp_capacity > 0
         
-        # ATTENTION: Runs ONCE on full sequence (dense)
-        self.attention = CCGQAAttention(
-            dim=dim,
-            n_heads=n_heads,
-            n_kv_heads=n_kv_heads,
-            compression_factor=compression_factor,
-            max_seq_len=max_seq_len,
-            **attention_kwargs,
-        )
+        # =====================================================================
+        # HYBRID ATTENTION: MQA → CCQA → MLA pattern
+        # - MQA: Cheap local extraction (first layers, skip paths)
+        # - CCQA: Compressed global mixer (middle layers)
+        # - MLA: Latent-space summarizer (late layers)
+        # =====================================================================
+        if attention_type == AttentionType.MQA:
+            self.attention = MQAAttention(
+                dim=dim,
+                n_heads=n_heads,
+                max_seq_len=max_seq_len,
+                use_rope=attention_kwargs.get("use_rope", True),
+            )
+            self.residual_scale = 1.0  # Full residual for MQA
+        elif attention_type == AttentionType.MLA:
+            self.attention = MLAAttention(
+                dim=dim,
+                n_heads=n_heads,
+                max_seq_len=max_seq_len,
+                use_rope=attention_kwargs.get("use_rope", True),
+                latent_ratio=attention_kwargs.get("latent_ratio", 0.5),
+            )
+            self.residual_scale = 0.5  # Reduced for stability
+        else:  # CCQA (default)
+            self.attention = CCGQAAttention(
+                dim=dim,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                compression_factor=compression_factor,
+                max_seq_len=max_seq_len,
+                **attention_kwargs,
+            )
+            self.residual_scale = 0.5  # Reduced for MoR stability
         self.norm1 = RMSNorm(dim)  # Pre-attention norm
         
         # MLP: Can run multiple times with adaptive halting (recursive)
@@ -1113,7 +1145,8 @@ class CCGQAMoRBlock(nn.Module):
         OPTION A: Attention is dense (full sequence), MLP is recursive.
         """
         # ATTENTION: Runs ONCE on full sequence (dense)
-        h = x + self.attention(self.norm1(x))
+        # Use residual_scale: 1.0 for MQA, 0.5 for CCQA/MLA
+        h = x + self.residual_scale * self.attention(self.norm1(x))
         
         # MLP RECURSIONS: Run max_recursions times
         for i in range(self.max_recursions):
@@ -1151,8 +1184,9 @@ class CCGQAMoRBlock(nn.Module):
         
         # =====================================================================
         # STEP 1: ATTENTION (ONCE, DENSE)
+        # Use residual_scale: 1.0 for MQA, 0.5 for CCQA/MLA
         # =====================================================================
-        h = x + self.attention(self.norm1(x))  # [B, L, D]
+        h = x + self.residual_scale * self.attention(self.norm1(x))  # [B, L, D]
         
         # =====================================================================
         # STEP 2: ROUTER - Predict per-token MLP recursion depth
@@ -1629,6 +1663,64 @@ class CCGQAMoDMoRModel(nn.Module):
         # Token embedding
         self.tok_emb = nn.Embedding(vocab_size, dim)
 
+        # =====================================================================
+        # HYBRID ATTENTION PATTERN: MQA → MQA → CCQA → ... → MLA → MQA → MLA
+        # Scale 8-layer pattern to n_mor_blocks
+        # - First 2 blocks: MQA (cheap local extraction)
+        # - Middle blocks: CCQA (compressed global mixer)
+        # - Late blocks: MLA + MQA interleaved (latent summarizer)
+        # =====================================================================
+        def get_attention_pattern(n_blocks: int) -> list:
+            """Generate hybrid attention pattern for n blocks."""
+            if n_blocks <= 2:
+                return [AttentionType.MQA] * n_blocks
+            
+            # Base 8-layer pattern: MQA MQA CCQA CCQA CCQA MLA MQA MLA
+            base_pattern = [
+                AttentionType.MQA,   # 0: cheap local
+                AttentionType.MQA,   # 1: cheap local
+                AttentionType.CCQA,  # 2: compressed global
+                AttentionType.CCQA,  # 3: compressed global
+                AttentionType.CCQA,  # 4: compressed global
+                AttentionType.MLA,   # 5: latent summarizer
+                AttentionType.MQA,   # 6: local refinement
+                AttentionType.MLA,   # 7: final summarizer
+            ]
+            
+            if n_blocks == 8:
+                return base_pattern
+            elif n_blocks < 8:
+                # Truncate from middle (keep MQA at start, MLA at end)
+                if n_blocks == 4:
+                    return [AttentionType.MQA, AttentionType.CCQA, AttentionType.MQA, AttentionType.MLA]
+                elif n_blocks == 6:
+                    return [AttentionType.MQA, AttentionType.MQA, AttentionType.CCQA, 
+                            AttentionType.CCQA, AttentionType.MQA, AttentionType.MLA]
+                else:
+                    # General case: proportional scaling
+                    indices = [int(i * 8 / n_blocks) for i in range(n_blocks)]
+                    return [base_pattern[min(i, 7)] for i in indices]
+            else:
+                # Extend pattern for larger models (n_blocks > 8)
+                # Extra blocks go to CCQA (middle) for more global capacity
+                # Pattern: MQA MQA [CCQA...] MLA MQA MLA
+                n_mqa_start = 2
+                n_mla_end = 2  # MLA at -2 and -1
+                n_mqa_refine = 1  # MQA at -3
+                n_ccqa = n_blocks - n_mqa_start - n_mla_end - n_mqa_refine
+                
+                pattern = (
+                    [AttentionType.MQA] * n_mqa_start +
+                    [AttentionType.CCQA] * n_ccqa +
+                    [AttentionType.MLA] +      # -3: first latent
+                    [AttentionType.MQA] +      # -2: local refinement
+                    [AttentionType.MLA]        # -1: final summarizer
+                )
+                return pattern
+        
+        attention_pattern = get_attention_pattern(n_mor_blocks)
+        self._attention_pattern = attention_pattern  # Store for introspection
+
         # MoR blocks - MoD applies to MLP sublayer only (attention is always dense)
         # MoD is applied to middle blocks (first and last process all tokens)
         self.layers = nn.ModuleList()
@@ -1647,6 +1739,7 @@ class CCGQAMoDMoRModel(nn.Module):
                 adaptive=adaptive,
                 layer_idx=i,
                 total_layers=n_mor_blocks,
+                attention_type=attention_pattern[i],  # HYBRID ATTENTION
                 # MoD on MLP only for middle blocks
                 mod_mlp_capacity=mod_capacity if use_mod_mlp else None,
                 mod_mlp_aux_weight=self.aux_loss_weight if use_mod_mlp else 0.0,
@@ -1693,6 +1786,34 @@ class CCGQAMoDMoRModel(nn.Module):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
             elif isinstance(module, nn.Conv1d):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def resize_rope_cache(self, new_max_seq_len: int) -> None:
+        """Resize RoPE cache in all attention modules.
+        
+        This is needed when resuming from a checkpoint that was saved
+        with a different max_seq_len than the current training config.
+        Call this after load_state_dict() when using stepped sequence schedules.
+        
+        Args:
+            new_max_seq_len: The new maximum sequence length to support.
+        """
+        resized_count = 0
+        for layer in self.layers:
+            if hasattr(layer, "attention"):
+                attn = layer.attention
+                if hasattr(attn, "_init_rope") and hasattr(attn, "cos_cached"):
+                    current_len = attn.cos_cached.shape[2]
+                    if current_len < new_max_seq_len:
+                        attn._init_rope(new_max_seq_len)
+                        # Move buffers to same device as model
+                        device = next(attn.parameters()).device
+                        attn.cos_cached = attn.cos_cached.to(device)
+                        attn.sin_cached = attn.sin_cached.to(device)
+                        resized_count += 1
+        
+        if resized_count > 0:
+            print(f"  Resized RoPE cache to {new_max_seq_len} in {resized_count} attention modules")
+        self.max_seq_len = new_max_seq_len
 
     def forward(
         self, x: torch.Tensor, return_losses: bool = False
