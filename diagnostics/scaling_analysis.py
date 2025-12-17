@@ -1108,12 +1108,20 @@ def main():
         "--predict-4b", action="store_true", help="Include 4B predictions"
     )
     parser.add_argument(
+        "--predict-only", action="store_true", help="Only show 4B predictions without running full analysis"
+    )
+    parser.add_argument(
         "--skip-large",
         action="store_true",
         help="Skip variants > 1B for faster testing",
     )
 
     args = parser.parse_args()
+    
+    # Quick predict-only mode
+    if args.predict_only:
+        predict_4b_scaling()
+        return
 
     print("=" * 70)
     print("SCALING ANALYSIS: CCGQA + MoD + MoR")
@@ -1212,27 +1220,6 @@ def predict_4b_scaling():
     print("  • Monitor VRAM: reduce micro_batch if OOM")
     print("  • Scale data workers: 16-32 for fast loading") 
     print("  • Expected VRAM: ~20-24GB (bf16 + grad + optimizer)")
-
-
-def main():
-    """Main entry point with argument parsing."""
-    parser = argparse.ArgumentParser(description="HYDRA Scaling Analysis")
-    parser.add_argument("--predict-4b", action="store_true", default=True,
-                        help="Generate 4B scaling predictions")
-    parser.add_argument("--plot", action="store_true", 
-                        help="Generate plots (requires matplotlib)")
-    args = parser.parse_args()
-    
-    if args.predict_4b:
-        predict_4b_scaling()
-        
-    if args.plot and HAS_MATPLOTLIB:
-        print("\n📊 Generating plots...")
-        print("⚠️  Plot generation not implemented yet. Add your plotting logic here.")
-    elif args.plot:
-        print("⚠️  Matplotlib not available. Install with: pip install matplotlib")
-        
-    print("\n✅ Scaling analysis complete!")
 
 
 if __name__ == "__main__":

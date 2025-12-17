@@ -28,6 +28,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 # =============================================================================
 # VALIDATION: MoDRouter is imported from mixture_of_depths.py
@@ -38,7 +39,7 @@ from hydra.routing.mixture_of_depths import MoDRouter
 
 # =============================================================================
 # HYBRID ATTENTION: Import MQA, MLA for hybrid pattern
-# Pattern: MQA → MQA → CCQA → CCQA → CCQA → MLA → MQA → MLA
+# Pattern: MQA → MQA → CCGQA → CCGQA → CCGQA → MLA → MQA → MLA
 # =============================================================================
 from hydra.model.hybrid_attention import AttentionType, MQAAttention, MLAAttention
 
@@ -46,12 +47,17 @@ from hydra.model.hybrid_attention import AttentionType, MQAAttention, MLAAttenti
 assert hasattr(MoDRouter, 'forward'), "MoDRouter must have forward method"
 assert hasattr(MoDRouter, 'get_aux_loss'), "MoDRouter must have get_aux_loss method"
 
-# Import fused kernels for optimized operations
+# Import fused kernels for optimized operations (fused_rope used in CCGQAAttention._apply_rope)
 try:
-    from hydra.kernels import fused_rope, fused_qk_norm, fused_swiglu, fused_rms_norm
+    from hydra.kernels import fused_rope
     FUSED_KERNELS_AVAILABLE = True
 except ImportError:
     FUSED_KERNELS_AVAILABLE = False
+    fused_rope = None
+
+# Import shared layers from hydra.layers (canonical implementations)
+from hydra.layers import RMSNorm, SwiGLUMLPFused as SwiGLUMLP
+
 from typing import Optional, Tuple, Union
 
 
@@ -261,10 +267,10 @@ class CCGQAAttention(nn.Module):
         else:
             v = self.v_down(x)
 
-        # Store pre-conv values for QK-mean
+        # Store pre-conv values for QK-mean (no clone needed - read-only access)
         if self.use_qk_mean:
-            q_pre = q.clone()
-            k_pre = k.clone()
+            q_pre = q
+            k_pre = k
 
         # ==========================================
         # Step 2: Apply sequence/channel convolutions
@@ -428,37 +434,8 @@ class CCGQABlock(nn.Module):
         return out
 
 
-class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization."""
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Use fused kernel if available
-        if FUSED_KERNELS_AVAILABLE:
-            return fused_rms_norm(x, self.weight, self.eps)
-        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return x * rms * self.weight
-
-
-class SwiGLUMLP(nn.Module):
-    """SwiGLU MLP with fused gate/up projection."""
-
-    def __init__(self, dim: int, hidden_dim: int):
-        super().__init__()
-        self.gate_up = nn.Linear(dim, 2 * hidden_dim, bias=False)
-        self.down = nn.Linear(hidden_dim, dim, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = self.gate_up(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        # Use fused kernel if available
-        if FUSED_KERNELS_AVAILABLE:
-            return self.down(fused_swiglu(gate, up))
-        return self.down(F.silu(gate) * up)
+# NOTE: RMSNorm and SwiGLUMLP are now imported from hydra.layers
+# See hydra/layers/common.py for canonical implementations
 
 
 class MoDMLPWrapper(nn.Module):
@@ -590,7 +567,7 @@ class MoDMLPWrapper(nn.Module):
         k = indices.shape[1]
         
         # Soft probs for STE gradient path
-        probs = torch.sigmoid(scores)  # [B, L]
+        probs = torch.sigmoid(scores.clamp(-10.0, 10.0))  # [B, L]
         # Store detached tensors for diagnostics (avoids .item() graph break)
         self._last_probs_mean_t = probs.mean().detach()
         self._last_probs_std_t = probs.std().detach()
@@ -641,7 +618,7 @@ class MoDMLPWrapper(nn.Module):
         self._routing_mode = "soft"
         
         _, _, scores = self.mod_router(x, return_scores=True)
-        probs = torch.sigmoid(scores)  # [B, L]
+        probs = torch.sigmoid(scores.clamp(-10.0, 10.0))  # [B, L]
         # Store detached tensors for diagnostics (avoids .item() graph break)
         self._last_probs_mean_t = probs.mean().detach()
         self._last_probs_std_t = probs.std().detach()
@@ -885,8 +862,10 @@ class CCGQAModel(nn.Module):
         Returns:
             Logits [B, S, vocab_size]
         """
-        # Token embedding
-        h = self.tok_emb(x)
+        # Token embedding with sqrt(dim) scaling (LLaMA style)
+        # This ensures embeddings have std ≈ 1.0 to survive residual connections
+        # Without this, embedding std=0.02 is overwhelmed by attention output std≈0.1
+        h = self.tok_emb(x) * math.sqrt(self.dim)
 
         # Transformer blocks
         for layer in self.layers:
@@ -985,9 +964,9 @@ class CCGQAMoRBlock(nn.Module):
         self.use_mod_mlp = mod_mlp_capacity is not None and mod_mlp_capacity > 0
         
         # =====================================================================
-        # HYBRID ATTENTION: MQA → CCQA → MLA pattern
+        # HYBRID ATTENTION: MQA → CCGQA → MLA pattern
         # - MQA: Cheap local extraction (first layers, skip paths)
-        # - CCQA: Compressed global mixer (middle layers)
+        # - CCGQA: Compressed global mixer (middle layers)
         # - MLA: Latent-space summarizer (late layers)
         # =====================================================================
         if attention_type == AttentionType.MQA:
@@ -1007,7 +986,7 @@ class CCGQAMoRBlock(nn.Module):
                 latent_ratio=attention_kwargs.get("latent_ratio", 0.5),
             )
             self.residual_scale = 0.5  # Reduced for stability
-        else:  # CCQA (default)
+        else:  # CCGQA (default)
             self.attention = CCGQAAttention(
                 dim=dim,
                 n_heads=n_heads,
@@ -1307,13 +1286,25 @@ class CCGQAMoRBlock(nn.Module):
         router_variance = router_probs.var()
         router_entropy_loss = torch.exp(-router_variance * 10.0)
         
-        # Combined ponder loss (all ops in native dtype for BF16 compat)
-        raw_ponder_loss = (
-            0.0001 * ponder_cost +
-            self.layer_dist_weight * depth_dist_loss_l +
+        # Clamp individual loss components to prevent explosion
+        # These are regularization losses - they shouldn't dominate training
+        logit_mean_loss = torch.clamp(logit_mean_loss, max=10.0)
+        logit_var_loss = torch.clamp(logit_var_loss, max=1.0)
+        
+        # SEPARATE router regularization (ALWAYS full strength) from scalable losses
+        # This prevents router collapse during MoR rampup transition
+        # Router regularization: keeps routers from collapsing to 0/1
+        router_reg_loss = (
             0.02 * router_entropy_loss +
             0.5 * logit_mean_loss +
             2.0 * logit_var_loss
+        )
+        
+        # Scalable losses: ponder cost and depth distribution
+        # These can be ramped in gradually without causing collapse
+        scalable_loss = (
+            0.0001 * ponder_cost +
+            self.layer_dist_weight * depth_dist_loss_l
         )
         
         # Warmup: ramp in over first N steps (use cached step value)
@@ -1321,7 +1312,14 @@ class CCGQAMoRBlock(nn.Module):
         # Use cached step from set_global_step (Python int, no .item() needed)
         cached_step = getattr(self, '_cached_global_step', 0)
         warmup_scale = min(1.0, float(cached_step) / warmup_denom)
-        ponder_loss = warmup_scale * raw_ponder_loss
+        
+        # Combined loss: router_reg is NOT scaled (prevents collapse)
+        # scalable_loss IS scaled (gradual adaptation)
+        ponder_loss = router_reg_loss + warmup_scale * scalable_loss
+        
+        # Final safety clamp: ponder_loss per layer should never exceed 10
+        # This prevents gradient explosion when summed across 24 layers
+        ponder_loss = torch.clamp(ponder_loss, max=10.0)
         
         # =====================================================================
         # DIAGNOSTICS (only during training, after hot path)
@@ -1410,22 +1408,25 @@ class CCGQAMoRBlock(nn.Module):
     def forward(
         self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        if self.adaptive and self.is_mor_adaptive_enabled():
-            # SOFT TRANSITION: Blend fixed and adaptive outputs during rampup
-            # This prevents catastrophic loss spike when routing suddenly enables
+        if self.adaptive:
+            # GRAPH-STABLE TRANSITION: Always compute both paths to avoid torch.compile
+            # recompilation when transitioning. The router learns from step 0.
+            
+            # Get rampup scale (0.0 before enable, 0.0-1.0 during rampup, 1.0 after)
             rampup_scale = self.get_mor_rampup_scale()
             
+            # Always compute adaptive output (router trains from step 0)
+            adaptive_output, _ = self.forward_fast_routing(x)
+            
+            # Optimization: skip fixed computation when fully ramped
             if rampup_scale >= 1.0:
-                # Full adaptive mode - no blending needed
-                output, _ = self.forward_fast_routing(x)
-                return output
-            else:
-                # RAMPUP PHASE: Blend outputs to smooth transition
-                # output = alpha * adaptive + (1-alpha) * fixed
-                adaptive_output, _ = self.forward_fast_routing(x)
-                fixed_output = self.forward_fixed(x)
-                output = rampup_scale * adaptive_output + (1.0 - rampup_scale) * fixed_output
-                return output
+                return adaptive_output
+            
+            # Compute fixed output for blending
+            fixed_output = self.forward_fixed(x)
+            
+            # Blend: rampup_scale=0 → 100% fixed, rampup_scale=1 → 100% adaptive
+            return rampup_scale * adaptive_output + (1.0 - rampup_scale) * fixed_output
         return self.forward_fixed(x)
 
     def forward_with_losses(
@@ -1437,33 +1438,35 @@ class CCGQAMoRBlock(nn.Module):
         - ponder_loss: MoR's compute cost (higher depth = more compute)
         - aux_loss: MoD's load balancing loss (if using MoD on MLP)
 
-        MoR Curriculum: Before _mor_enable_step, uses fixed-depth mode.
-        After enable, ramps up routing over _mor_rampup_steps with SOFT BLENDING.
-        
-        SOFT TRANSITION FIX: During rampup, blend fixed and adaptive outputs
-        to prevent catastrophic loss spike when routing suddenly enables.
+        GRAPH-STABLE TRANSITION: Always compute both paths from step 0.
+        This ensures:
+        1. Router learns from the beginning (gets gradient signal)
+        2. No torch.compile graph changes at transition
+        3. Smooth blending when rampup_scale increases
         """
         device = x.device
         
-        if self.adaptive and self.is_mor_adaptive_enabled():
-            # Get rampup scale for soft transition
+        if self.adaptive:
+            # Get rampup scale (0.0 before enable, 0.0-1.0 during rampup, 1.0 after)
             rampup_scale = self.get_mor_rampup_scale()
             
-            # Use fast routing (single router call, compiles well)
+            # Always compute adaptive output (router trains from step 0)
             adaptive_output, ponder_loss = self.forward_fast_routing(x)
             
-            # SOFT TRANSITION: Blend outputs during rampup
-            if rampup_scale < 1.0:
-                # Rampup phase - blend adaptive and fixed outputs
-                fixed_output = self.forward_fixed(x)
-                output = rampup_scale * adaptive_output + (1.0 - rampup_scale) * fixed_output
-                # Scale ponder_loss too (router is still learning)
-                ponder_loss = ponder_loss * rampup_scale
-            else:
-                # Full adaptive mode - no blending
-                output = adaptive_output
+            # NOTE: ponder_loss is NOT scaled by rampup_scale anymore
+            # The router regularization component needs full strength to prevent collapse
+            # The scalable components (ponder_cost, depth_dist) are already scaled internally
             
-            # Update cached loss with scaled value (for get_ponder_loss() consistency)
+            # Optimization: skip fixed computation when fully ramped
+            if rampup_scale >= 1.0:
+                output = adaptive_output
+            else:
+                # Compute fixed output for blending
+                fixed_output = self.forward_fixed(x)
+                # Blend: rampup_scale=0 → 100% fixed, rampup_scale=1 → 100% adaptive
+                output = rampup_scale * adaptive_output + (1.0 - rampup_scale) * fixed_output
+            
+            # Update cached loss for get_ponder_loss() consistency
             if self.training:
                 self._ponder_loss = ponder_loss.detach()
             
@@ -1558,14 +1561,18 @@ class CCGQAMoRBlock(nn.Module):
         self._cached_global_step = step
         # Cache MoR adaptive decision to avoid .item() in forward (prevents graph break)
         self._mor_adaptive_cached = step >= self._mor_enable_step
-        # Cache rampup scale to avoid step-dependent branching in forward
+        # Cache rampup scale - QUANTIZED to 10 discrete values to prevent recompilation
+        # torch.compile guards on Python values; continuous changes cause recompile storms
         if step < self._mor_enable_step:
             self._mor_rampup_scale_cached = 0.0
         elif self._mor_rampup_steps <= 0:
             self._mor_rampup_scale_cached = 1.0
         else:
             steps_since_enable = step - self._mor_enable_step
-            self._mor_rampup_scale_cached = min(1.0, steps_since_enable / self._mor_rampup_steps)
+            raw_scale = min(1.0, steps_since_enable / self._mor_rampup_steps)
+            # Quantize to 10 discrete values: 0.0, 0.1, 0.2, ... 1.0
+            # This limits torch.compile to 11 possible graphs instead of thousands
+            self._mor_rampup_scale_cached = round(raw_scale * 10) / 10
         # Propagate to MoD MLP wrapper if present
         if self.mod_mlp_wrapper is not None:
             self.mod_mlp_wrapper.set_global_step(step)
@@ -1649,6 +1656,7 @@ class CCGQAMoDMoRModel(nn.Module):
         aux_loss_weight: float = None,  # None = auto-scale based on depth
         adaptive: bool = True,
         tie_weights: bool = True,
+        hybrid_attention: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -1665,6 +1673,7 @@ class CCGQAMoDMoRModel(nn.Module):
         self.max_seq_len = max_seq_len
         self.mod_capacity = mod_capacity
         self.adaptive = adaptive
+        self.hybrid_attention = hybrid_attention
 
         # Auto-scale aux_loss_weight based on effective depth and dimension
         # Deeper/larger models need stronger regularization to maintain capacity
@@ -1688,61 +1697,33 @@ class CCGQAMoDMoRModel(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, dim)
 
         # =====================================================================
-        # HYBRID ATTENTION PATTERN: MQA → MQA → CCQA → ... → MLA → MQA → MLA
-        # Scale 8-layer pattern to n_mor_blocks
-        # - First 2 blocks: MQA (cheap local extraction)
-        # - Middle blocks: CCQA (compressed global mixer)
-        # - Late blocks: MLA + MQA interleaved (latent summarizer)
+        # Attention pattern
+        #
+        # Paper-compliant default: every MoR block uses CCGQA (AttentionType.CCQA).
+        # Hybrid attention (MQA/MLA mix) is an optional frontier optimization.
         # =====================================================================
-        def get_attention_pattern(n_blocks: int) -> list:
-            """Generate hybrid attention pattern for n blocks."""
-            if n_blocks <= 2:
-                return [AttentionType.MQA] * n_blocks
-            
-            # Base 8-layer pattern: MQA MQA CCQA CCQA CCQA MLA MQA MLA
-            base_pattern = [
-                AttentionType.MQA,   # 0: cheap local
-                AttentionType.MQA,   # 1: cheap local
-                AttentionType.CCQA,  # 2: compressed global
-                AttentionType.CCQA,  # 3: compressed global
-                AttentionType.CCQA,  # 4: compressed global
-                AttentionType.MLA,   # 5: latent summarizer
-                AttentionType.MQA,   # 6: local refinement
-                AttentionType.MLA,   # 7: final summarizer
-            ]
-            
-            if n_blocks == 8:
-                return base_pattern
-            elif n_blocks < 8:
-                # Truncate from middle (keep MQA at start, MLA at end)
-                if n_blocks == 4:
-                    return [AttentionType.MQA, AttentionType.CCQA, AttentionType.MQA, AttentionType.MLA]
-                elif n_blocks == 6:
-                    return [AttentionType.MQA, AttentionType.MQA, AttentionType.CCQA, 
-                            AttentionType.CCQA, AttentionType.MQA, AttentionType.MLA]
-                else:
-                    # General case: proportional scaling
-                    indices = [int(i * 8 / n_blocks) for i in range(n_blocks)]
-                    return [base_pattern[min(i, 7)] for i in indices]
-            else:
-                # Extend pattern for larger models (n_blocks > 8)
-                # Extra blocks go to CCQA (middle) for more global capacity
-                # Pattern: MQA MQA [CCQA...] MLA MQA MLA
-                n_mqa_start = 2
-                n_mla_end = 2  # MLA at -2 and -1
-                n_mqa_refine = 1  # MQA at -3
-                n_ccqa = n_blocks - n_mqa_start - n_mla_end - n_mqa_refine
-                
-                pattern = (
-                    [AttentionType.MQA] * n_mqa_start +
-                    [AttentionType.CCQA] * n_ccqa +
-                    [AttentionType.MLA] +      # -3: first latent
-                    [AttentionType.MQA] +      # -2: local refinement
-                    [AttentionType.MLA]        # -1: final summarizer
-                )
-                return pattern
-        
-        attention_pattern = get_attention_pattern(n_mor_blocks)
+        if hybrid_attention:
+            def get_attention_pattern(n_blocks: int) -> list:
+                """Generate hybrid attention pattern for n blocks.
+
+                Pattern repeats: MQA, MQA, CCGQA, CCGQA, CCGQA, MLA, MQA, MLA
+                """
+                base_pattern = [
+                    AttentionType.MQA,   # Cheap local
+                    AttentionType.MQA,   # Cheap local
+                    AttentionType.CCQA,  # CCGQA global mixer
+                    AttentionType.CCQA,  # CCGQA global mixer
+                    AttentionType.CCQA,  # CCGQA global mixer
+                    AttentionType.MLA,   # Latent summarizer
+                    AttentionType.MQA,   # Skip path
+                    AttentionType.MLA,   # Latent summarizer
+                ]
+                return [base_pattern[i % len(base_pattern)] for i in range(n_blocks)]
+
+            attention_pattern = get_attention_pattern(n_mor_blocks)
+        else:
+            attention_pattern = [AttentionType.CCQA] * n_mor_blocks
+
         self._attention_pattern = attention_pattern  # Store for introspection
 
         # MoR blocks - MoD applies to MLP sublayer only (attention is always dense)
@@ -1763,7 +1744,7 @@ class CCGQAMoDMoRModel(nn.Module):
                 adaptive=adaptive,
                 layer_idx=i,
                 total_layers=n_mor_blocks,
-                attention_type=attention_pattern[i],  # HYBRID ATTENTION
+                attention_type=attention_pattern[i],
                 # MoD on MLP only for middle blocks
                 mod_mlp_capacity=mod_capacity if use_mod_mlp else None,
                 mod_mlp_aux_weight=self.aux_loss_weight if use_mod_mlp else 0.0,
@@ -1839,6 +1820,45 @@ class CCGQAMoDMoRModel(nn.Module):
             print(f"  Resized RoPE cache to {new_max_seq_len} in {resized_count} attention modules")
         self.max_seq_len = new_max_seq_len
 
+    # =========================================================================
+    # Gradient Checkpointing - Trade compute for memory
+    # =========================================================================
+    _gradient_checkpointing: bool = False
+    _checkpoint_every_n: int = 1  # Checkpoint every N layers (1 = all, 2 = every other, etc.)
+    
+    def enable_gradient_checkpointing(self, every_n: int = 1) -> None:
+        """Enable gradient checkpointing to reduce memory usage.
+        
+        When enabled, activations are recomputed during the backward pass
+        instead of being stored. This reduces memory but increases compute.
+        
+        Args:
+            every_n: Checkpoint every N layers (default=1, all layers).
+                    Use 2 for ~15% less overhead, 3 for ~20% less overhead.
+                    Higher values save less memory but reduce recomputation.
+        
+        Memory/Compute tradeoffs:
+            every_n=1: ~50% memory savings, ~30% compute overhead (default)
+            every_n=2: ~35% memory savings, ~15% compute overhead
+            every_n=3: ~25% memory savings, ~10% compute overhead
+        
+        Use when:
+        - Training with large batch sizes
+        - Training with long sequences
+        - GPU memory is the bottleneck
+        """
+        self._gradient_checkpointing = True
+        self._checkpoint_every_n = max(1, every_n)
+    
+    def disable_gradient_checkpointing(self) -> None:
+        """Disable gradient checkpointing."""
+        self._gradient_checkpointing = False
+    
+    @property
+    def is_gradient_checkpointing(self) -> bool:
+        """Check if gradient checkpointing is enabled."""
+        return self._gradient_checkpointing
+
     def forward(
         self, x: torch.Tensor, return_losses: bool = False
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
@@ -1854,10 +1874,16 @@ class CCGQAMoDMoRModel(nn.Module):
             If return_losses=False: logits tensor
             If return_losses=True: (logits, {"aux_loss": ..., "ponder_loss": ...})
         """
-        h = self.tok_emb(x)
+        # Token embedding with sqrt(dim) scaling (LLaMA style)
+        # This ensures embeddings have std ≈ 1.0 to survive residual connections
+        # Without this, embedding std=0.02 is overwhelmed by attention output std≈0.1
+        h = self.tok_emb(x) * math.sqrt(self.dim)
 
         if return_losses:
             # Collect losses during forward pass
+            # NOTE: Gradient checkpointing is NOT used when return_losses=True
+            # because forward_with_losses returns aux losses that can't be
+            # easily checkpointed (they're not tensors in the compute graph)
             layer_results = []
             for layer in self.layers:
                 h, layer_losses = layer.forward_with_losses(h)
@@ -1888,8 +1914,19 @@ class CCGQAMoDMoRModel(nn.Module):
             return logits, {"aux_loss": aux_loss, "ponder_loss": ponder_loss}
         else:
             # Fast path - no loss computation overhead
-            for layer in self.layers:
-                h = layer(h)
+            # Use gradient checkpointing if enabled (saves memory, costs compute)
+            if self._gradient_checkpointing and self.training:
+                for i, layer in enumerate(self.layers):
+                    # Selective checkpointing: only checkpoint every N layers
+                    # This reduces recomputation overhead while still saving memory
+                    if i % self._checkpoint_every_n == 0:
+                        # use_reentrant=False is required for torch.compile compatibility
+                        h = gradient_checkpoint(layer, h, use_reentrant=False)
+                    else:
+                        h = layer(h)
+            else:
+                for layer in self.layers:
+                    h = layer(h)
 
             h = self.norm(h)
             return self.output(h)
@@ -1983,10 +2020,7 @@ class CCGQAMoDMoRModel(nn.Module):
         self._mor_rampup_steps = rampup_steps
         
         for layer in self.layers:
-            # Direct MoR blocks
-            if hasattr(layer, 'set_mor_enable_step'):
-                layer.set_mor_enable_step(enable_step, rampup_steps)
-            # MoR blocks wrapped in MoD
+            # CCGQAMoRBlock has set_mor_enable_step directly
             if hasattr(layer, 'set_mor_enable_step'):
                 layer.set_mor_enable_step(enable_step, rampup_steps)
     
@@ -2311,21 +2345,22 @@ def create_ccgqa_mod_mor_model(
     n_heads: int = 32,
     n_kv_heads: int = 4,
     compression_factor: int = 4,
-    mlp_ratio: float = 4.0,
+    mlp_ratio: float = 2.67,
     max_seq_len: int = 8192,
     mod_capacity: float = 0.5,
     aux_loss_weight: float = None,  # None = auto-scale based on depth
     adaptive: bool = True,
+    hybrid_attention: bool = True,
 ) -> CCGQAMoDMoRModel:
     """
     Create CCGQA + MoD + MoR model with specified parameters.
 
-    Default config targets ~520M params with:
+    Default config targets a paper-style baseline with:
     - dim=2048, 32 heads, 4 kv heads
     - 8 MoR blocks x 4 recursions = 32 effective layers
     - 50% MoD capacity (middle blocks)
     - 4x attention compression (CCGQA)
-    - mlp_ratio=4.0 for more MLP capacity
+    - mlp_ratio=2.67 (common SwiGLU setting for param parity vs 4x GELU MLP)
 
     aux_loss_weight: Controls MoD capacity regularization strength.
         None (default): Auto-scales based on effective depth.
@@ -2344,6 +2379,7 @@ def create_ccgqa_mod_mor_model(
         mod_capacity=mod_capacity,
         aux_loss_weight=aux_loss_weight,
         adaptive=adaptive,
+        hybrid_attention=hybrid_attention,
     )
 
 

@@ -14,11 +14,7 @@ import math
 # Test Fixtures
 # =============================================================================
 
-@pytest.fixture
-def device():
-    """Get available device."""
-    return "cuda" if torch.cuda.is_available() else "cpu"
-
+# Note: device() fixture is provided by conftest.py
 
 @pytest.fixture
 def test_config():

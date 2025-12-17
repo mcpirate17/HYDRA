@@ -32,6 +32,8 @@ Usage:
     mask, indices = router(x)  # Get which tokens to process
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -67,7 +69,14 @@ class MoDRouter(nn.Module):
         self.jitter_noise = jitter_noise
 
         # Simple linear router (cheap)
-        self.router = nn.Linear(dim, 1, bias=False)
+        self.router = nn.Linear(dim, 1, bias=True)
+
+        # Initialize so sigmoid(scores) starts near the target capacity.
+        # This makes early diagnostics stable and reduces router collapse.
+        with torch.no_grad():
+            nn.init.zeros_(self.router.weight)
+            cap = float(min(max(self.capacity_ratio, 1e-4), 1.0 - 1e-4))
+            self.router.bias.fill_(math.log(cap / (1.0 - cap)))
 
         # Track load for auxiliary loss
         self.register_buffer("_aux_loss", torch.tensor(0.0))
@@ -110,7 +119,7 @@ class MoDRouter(nn.Module):
         # Compute auxiliary loss for load balancing
         if self.training and self.aux_loss_weight > 0:
             # Encourage uniform selection across positions
-            probs = torch.sigmoid(scores)
+            probs = torch.sigmoid(scores.clamp(-10.0, 10.0))
             mean_prob = probs.mean()
             target_prob = self.capacity_ratio
             self._aux_loss = self.aux_loss_weight * (mean_prob - target_prob).pow(2)

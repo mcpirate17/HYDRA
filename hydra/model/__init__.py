@@ -4,7 +4,7 @@ HYDRA Model Module
 Contains the core transformer architectures:
 - CCGQAModel: Base CCGQA model
 - CCGQAMoDMoRModel: Full efficiency stack (CCGQA + MoD + MoR)
-- Hybrid attention variants (MQA, MLA, CCQA)
+- Hybrid attention variants (MQA, MLA)
 """
 
 from .ccgqa import (
@@ -25,7 +25,6 @@ from .hybrid_attention import (
     AttentionType,
     MQAAttention,
     MLAAttention,
-    CCQAAttention,
     HybridAttentionBlock,
 )
 
@@ -45,7 +44,6 @@ __all__ = [
     # Hybrid attention
     "AttentionType",
     "MQAAttention",
-    "MLAAttention", 
-    "CCQAAttention",
+    "MLAAttention",
     "HybridAttentionBlock",
 ]

@@ -36,86 +36,19 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, List, Union, Dict, Any
+from typing import Optional, List, Dict
 from dataclasses import dataclass
 from enum import Enum
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 # Import MoD routing
 from hydra.routing.mixture_of_depths import MixtureOfDepthsBlock
 
+# Import shared layers from hydra.layers (canonical implementations)
+# These handle fused kernel usage internally
+from hydra.layers import RMSNorm, SwiGLUMLPFused as SwiGLUMLP, RotaryEmbedding
 
-# =============================================================================
-# Normalization Layers
-# =============================================================================
-
-# Import fused kernels for optimized operations
-try:
-    from hydra.kernels import fused_rope, fused_qk_norm, fused_swiglu, fused_rms_norm
-    FUSED_KERNELS_AVAILABLE = True
-except ImportError:
-    FUSED_KERNELS_AVAILABLE = False
-
-
-class RMSNorm(nn.Module):
-    """
-    Root Mean Square Layer Normalization.
-    
-    Uses native torch operations that work efficiently with torch.compile
-    and mixed precision training. Weights are kept in float32 for stability,
-    and the forward pass handles mixed dtypes correctly.
-    """
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Use fused kernel if available
-        if FUSED_KERNELS_AVAILABLE:
-            return fused_rms_norm(x, self.weight, self.eps)
-        # Fallback: Cast weight to input dtype for fused operations
-        dtype = x.dtype
-        x = x.float()
-        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x * rms).to(dtype) * self.weight.to(dtype)
-
-
-# =============================================================================
-# Rotary Position Embeddings (Shared)
-# =============================================================================
-
-
-class RotaryEmbedding(nn.Module):
-    """Rotary Position Embeddings for attention."""
-
-    def __init__(self, head_dim: int, max_seq_len: int = 8192, theta: float = 10000.0):
-        super().__init__()
-        self.head_dim = head_dim
-        self.max_seq_len = max_seq_len
-
-        freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        t = torch.arange(max_seq_len, dtype=torch.float32)
-        freqs = torch.outer(t, freqs)
-
-        self.register_buffer("cos_cached", freqs.cos().unsqueeze(0).unsqueeze(0))
-        self.register_buffer("sin_cached", freqs.sin().unsqueeze(0).unsqueeze(0))
-
-    def forward(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """Apply RoPE to input tensor [B, n_heads, S, head_dim]."""
-        cos = self.cos_cached[:, :, :seq_len, :]
-        sin = self.sin_cached[:, :, :seq_len, :]
-
-        # Use fused kernel if available
-        if FUSED_KERNELS_AVAILABLE:
-            return fused_rope(x, cos, sin)
-        
-        # Fallback
-        x1, x2 = x[..., ::2], x[..., 1::2]
-        rotated = torch.stack(
-            [x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1
-        ).flatten(-2)
-        return rotated
+# NOTE: CCGQAAttention is imported lazily in HybridAttentionBlock to avoid circular imports
 
 
 # =============================================================================
@@ -141,6 +74,7 @@ class MQAAttention(nn.Module):
     Features:
     - Single KV head shared across all Q heads
     - Full precision (no compression)
+    - QK L2 normalization for gradient stability (default enabled)
     - Pre-norm RMSNorm + RMSNorm before o_proj
     - Residual scaling α=1.0 (full residual)
 
@@ -153,6 +87,7 @@ class MQAAttention(nn.Module):
         n_heads: int = 12,
         max_seq_len: int = 8192,
         use_rope: bool = True,
+        use_qk_norm: bool = True,  # QK-norm for gradient stability
         norm_eps: float = 1e-6,
     ):
         super().__init__()
@@ -162,6 +97,7 @@ class MQAAttention(nn.Module):
         self.head_dim = dim // n_heads
         self.scale = self.head_dim**-0.5
         self.residual_scale = 1.0  # Full residual for MQA
+        self.use_qk_norm = use_qk_norm
 
         assert dim % n_heads == 0, f"dim {dim} must be divisible by n_heads {n_heads}"
 
@@ -178,6 +114,11 @@ class MQAAttention(nn.Module):
         self.use_rope = use_rope
         if use_rope:
             self.rope = RotaryEmbedding(self.head_dim, max_seq_len)
+        
+        # QK-norm: L2 normalize Q and K for gradient stability
+        if use_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
 
     def forward(
         self,
@@ -196,6 +137,13 @@ class MQAAttention(nn.Module):
         if self.use_rope:
             q = self.rope(q, S)
             k = self.rope(k, S)
+        
+        # Apply QK-norm for gradient stability (BEFORE expand)
+        if self.use_qk_norm:
+            # q: [B, n_heads, S, head_dim] -> normalize last dim
+            # k: [B, 1, S, head_dim] -> normalize last dim
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         # Expand K, V for all heads
         k = k.expand(-1, self.n_heads, -1, -1)
@@ -218,220 +166,6 @@ class MQAAttention(nn.Module):
         out = self.pre_out_norm(out)
         out = self.o_proj(out)
 
-        return out
-
-
-# =============================================================================
-# CCQA: Compressed Convolutional Query Attention
-# =============================================================================
-
-
-class CCQAAttention(nn.Module):
-    """
-    Compressed Convolutional Query Attention (CCQA) - Global mixer.
-
-    Features:
-    - Down-project to compressed latent space
-    - Sequence + channel convolutions with QK coupling
-    - QK L2 normalization with learnable temperature
-    - Pre-norm RMSNorm + RMSNorm before o_proj
-    - Post-mix RMSNorm after QK-mean coupling (gradient stability)
-    - Residual scaling α=0.5 (for MoR stability)
-    - QK modulation gain=0.25 (clamped for variance control)
-
-    Use for: Middle layers, slow path in MoD routing.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        n_heads: int = 12,
-        n_kv_heads: int = 3,
-        compression_factor: int = 4,
-        max_seq_len: int = 8192,
-        use_rope: bool = True,
-        use_qk_norm: bool = True,
-        use_convs: bool = True,
-        use_qk_mean: bool = True,
-        conv_kernel_size: int = 3,
-        qk_modulation_gain: float = 0.25,  # Clamped low for gradient stability
-        norm_eps: float = 1e-6,
-    ):
-        super().__init__()
-
-        self.dim = dim
-        self.n_heads = n_heads
-        self.n_kv_heads = n_kv_heads
-        self.n_groups = n_heads // n_kv_heads
-        self.compression_factor = compression_factor
-        self.use_rope = use_rope
-        self.use_qk_norm = use_qk_norm
-        self.use_convs = use_convs
-        self.use_qk_mean = use_qk_mean
-        self.qk_modulation_gain = qk_modulation_gain
-        self.residual_scale = 0.5  # Reduced for MoR stability
-
-        # Compressed dimensions
-        self.latent_dim = dim // compression_factor
-        self.head_dim = self.latent_dim // n_heads
-        self.kv_dim = n_kv_heads * self.head_dim
-        self.scale = self.head_dim**-0.5
-
-        assert self.latent_dim % n_heads == 0
-        assert self.head_dim >= 2, "head_dim too small, reduce compression"
-
-        # Down-projections
-        self.q_down = nn.Linear(dim, self.latent_dim, bias=False)
-        self.k_down = nn.Linear(dim, self.kv_dim, bias=False)
-        self.v_down = nn.Linear(dim, self.kv_dim, bias=False)
-
-        # Normalize compressed latent projection (stability)
-        self.latent_norm = RMSNorm(self.latent_dim, eps=norm_eps)
-        self.kv_latent_norm = RMSNorm(self.kv_dim, eps=norm_eps)
-
-        # Convolutions for Q and K
-        if use_convs:
-            self.q_conv = nn.Conv1d(
-                self.latent_dim,
-                self.latent_dim,
-                kernel_size=conv_kernel_size,
-                padding=conv_kernel_size - 1,
-                groups=n_heads,
-                bias=False,
-            )
-            self.k_conv = nn.Conv1d(
-                self.kv_dim,
-                self.kv_dim,
-                kernel_size=conv_kernel_size,
-                padding=conv_kernel_size - 1,
-                groups=n_kv_heads,
-                bias=False,
-            )
-            # Normalize conv output (key for gradient stability)
-            self.conv_norm = RMSNorm(self.latent_dim, eps=norm_eps)
-            self.k_conv_norm = RMSNorm(self.kv_dim, eps=norm_eps)
-
-        # Post-mix normalization (after QK-mean coupling)
-        self.post_mix_q_norm = RMSNorm(self.latent_dim, eps=norm_eps)
-        self.post_mix_k_norm = RMSNorm(self.kv_dim, eps=norm_eps)
-
-        # Learnable temperature
-        self.key_temperature = nn.Parameter(torch.ones(1))
-
-        # RoPE
-        if use_rope:
-            self.rope = RotaryEmbedding(self.head_dim, max_seq_len)
-
-        # Pre-output normalization (critical for stability)
-        self.pre_out_norm = RMSNorm(self.latent_dim, eps=norm_eps)
-        self.o_proj = nn.Linear(self.latent_dim, dim, bias=False)
-
-    def _apply_causal_conv(self, x: torch.Tensor, conv: nn.Conv1d) -> torch.Tensor:
-        """Apply causal convolution."""
-        x = x.transpose(1, 2)
-        x = conv(x)
-        x = x[..., : x.size(-1) - (conv.kernel_size[0] - 1)]
-        return x.transpose(1, 2)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Forward pass for CCQA."""
-        B, S, D = x.shape
-
-        # Down-project to compressed latent
-        q = self.q_down(x)
-        k = self.k_down(x)
-        v = self.v_down(x)
-
-        # Normalize compressed projections
-        q = self.latent_norm(q)
-        k = self.kv_latent_norm(k)
-        v = self.kv_latent_norm(v)
-
-        # Store pre-conv for QK-mean
-        if self.use_qk_mean:
-            q_pre = q.clone()
-            k_pre = k.clone()
-
-        # Apply convolutions
-        if self.use_convs:
-            q = self._apply_causal_conv(q, self.q_conv)
-            k = self._apply_causal_conv(k, self.k_conv)
-            # Normalize conv output
-            q = self.conv_norm(q)
-            k = self.k_conv_norm(k)
-
-        # QK-mean coupling with constrained gain
-        if self.use_qk_mean and self.n_groups == 1:
-            qk_mean = self.qk_modulation_gain * (q_pre + k_pre)
-            q = q + qk_mean
-            k = k + qk_mean
-        elif self.use_qk_mean:
-            # Simplified for GQA
-            q_mean = q_pre.view(B, S, self.n_heads, self.head_dim).mean(dim=2)
-            k_mean = k_pre.view(B, S, self.n_kv_heads, self.head_dim).mean(dim=2)
-
-            q = q + self.qk_modulation_gain * k_mean.unsqueeze(2).expand(
-                -1, -1, self.n_heads, -1
-            ).reshape(B, S, self.latent_dim)
-            k = k + self.qk_modulation_gain * q_mean.unsqueeze(2).expand(
-                -1, -1, self.n_kv_heads, -1
-            ).reshape(B, S, self.kv_dim)
-
-        # Post-mix normalization (critical for gradient stability after QK coupling)
-        q = self.post_mix_q_norm(q)
-        k = self.post_mix_k_norm(k)
-
-        # Reshape to heads
-        q = q.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)
-
-        # QK normalization
-        if self.use_qk_norm:
-            q = F.normalize(q, p=2, dim=-1) * math.sqrt(self.head_dim)
-            k = (
-                F.normalize(k, p=2, dim=-1)
-                * math.sqrt(self.head_dim)
-                * self.key_temperature
-            )
-
-        # Apply RoPE
-        if self.use_rope:
-            q = self.rope(q, S)
-            k = self.rope(k, S)
-
-        # Expand K, V for GQA
-        k = (
-            k.unsqueeze(2)
-            .expand(-1, -1, self.n_groups, -1, -1)
-            .reshape(B, self.n_heads, S, self.head_dim)
-        )
-        v = (
-            v.unsqueeze(2)
-            .expand(-1, -1, self.n_groups, -1, -1)
-            .reshape(B, self.n_heads, S, self.head_dim)
-        )
-
-        # Attention
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=mask,
-            is_causal=True if mask is None else False,
-            scale=self.scale,
-        )
-
-        # Reshape and project
-        out = out.transpose(1, 2).contiguous().view(B, S, self.latent_dim)
-
-        # Pre-output normalization (critical)
-        out = self.pre_out_norm(out)
-        out = self.o_proj(out)
 
         return out
 
@@ -542,26 +276,8 @@ class MLAAttention(nn.Module):
         return out
 
 
-# =============================================================================
-# SwiGLU MLP
-# =============================================================================
-
-
-class SwiGLUMLP(nn.Module):
-    """SwiGLU MLP with fused gate/up projection."""
-
-    def __init__(self, dim: int, hidden_dim: int):
-        super().__init__()
-        self.gate_up = nn.Linear(dim, 2 * hidden_dim, bias=False)
-        self.down = nn.Linear(hidden_dim, dim, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = self.gate_up(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        # Use fused kernel if available
-        if FUSED_KERNELS_AVAILABLE:
-            return self.down(fused_swiglu(gate, up))
-        return self.down(F.silu(gate) * up)
+# NOTE: SwiGLUMLP is now imported from hydra.layers
+# See hydra/layers/common.py for canonical implementation
 
 
 # =============================================================================
@@ -607,13 +323,14 @@ class HybridAttentionBlock(nn.Module):
             )
             self.residual_scale = 1.0
         elif attention_type == AttentionType.CCQA:
-            self.attention = CCQAAttention(
+            # Lazy import to avoid circular dependency
+            from hydra.model.ccgqa import CCGQAAttention
+            self.attention = CCGQAAttention(
                 dim=dim,
                 n_heads=n_heads,
                 n_kv_heads=n_kv_heads,
                 compression_factor=compression_factor,
                 max_seq_len=max_seq_len,
-                norm_eps=norm_eps,
                 **attention_kwargs,
             )
             self.residual_scale = 0.5
@@ -767,6 +484,10 @@ class HybridTransformer(nn.Module):
         super().__init__()
         self.config = config
 
+        # Gradient checkpointing (trade compute for memory)
+        self._gradient_checkpointing: bool = False
+        self._checkpoint_every_n: int = 1
+
         # Token embedding
         self.tok_emb = nn.Embedding(config.vocab_size, config.dim)
 
@@ -837,16 +558,48 @@ class HybridTransformer(nn.Module):
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass."""
-        # Token embedding
-        h = self.tok_emb(x)
-
-        # Process through macro-blocks
-        for macro_block in self.macro_blocks:
-            h = macro_block(h, mask=mask)
-
-        # Final norm and output
-        h = self.final_norm(h)
+        h = self.forward_hidden(x, mask=mask)
         return self.output(h)
+
+    def forward_hidden(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return post-norm hidden states (pre-logits).
+
+        Used for memory-efficient loss functions (e.g., chunked CE) that avoid
+        materializing the full logits tensor.
+        """
+        # Token embedding with sqrt(dim) scaling (LLaMA style)
+        h = self.tok_emb(x) * math.sqrt(self.config.dim)
+
+        if self._gradient_checkpointing and self.training:
+            for i, macro_block in enumerate(self.macro_blocks):
+                if i % self._checkpoint_every_n == 0:
+                    # use_reentrant=False is required for torch.compile compatibility
+                    if mask is None:
+                        h = gradient_checkpoint(macro_block, h, use_reentrant=False)
+                    else:
+                        h = gradient_checkpoint(macro_block, h, mask, use_reentrant=False)
+                else:
+                    h = macro_block(h, mask=mask)
+        else:
+            for macro_block in self.macro_blocks:
+                h = macro_block(h, mask=mask)
+
+        return self.final_norm(h)
+
+    def enable_gradient_checkpointing(self, every_n: int = 1) -> None:
+        self._gradient_checkpointing = True
+        self._checkpoint_every_n = max(1, int(every_n))
+
+    def disable_gradient_checkpointing(self) -> None:
+        self._gradient_checkpointing = False
+
+    @property
+    def is_gradient_checkpointing(self) -> bool:
+        return self._gradient_checkpointing
     
     def get_aux_loss(self) -> torch.Tensor:
         """Get auxiliary loss from MoD routing (load balancing)."""

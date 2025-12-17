@@ -10,6 +10,11 @@ from .fused_ops import (
     fused_qk_norm,
     fused_swiglu,
     fused_rms_norm,
+    # Chunked cross-entropy (major memory optimization)
+    chunked_cross_entropy,
+    fused_chunked_cross_entropy,
+    USE_CHUNKED_CROSS_ENTROPY,
+    CROSS_ENTROPY_CHUNK_SIZE,
     # Feature flags
     TRITON_AVAILABLE,
     USE_TRITON_KERNELS,
@@ -30,6 +35,12 @@ __all__ = [
     "fused_qk_norm", 
     "fused_swiglu",
     "fused_rms_norm",
+    # Chunked cross-entropy
+    "chunked_cross_entropy",
+    "fused_chunked_cross_entropy",
+    "USE_CHUNKED_CROSS_ENTROPY",
+    "CROSS_ENTROPY_CHUNK_SIZE",
+    # Feature flags
     "TRITON_AVAILABLE",
     "USE_TRITON_KERNELS",
     "USE_FUSED_ROPE",

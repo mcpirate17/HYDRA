@@ -13,6 +13,7 @@ from .common import (
     # Core layers
     RMSNorm,
     SwiGLUMLP,
+    SwiGLUMLPFused,
     RotaryEmbedding,
     get_activation,
     # Attention
@@ -38,6 +39,7 @@ __all__ = [
     # Core layers
     "RMSNorm",
     "SwiGLUMLP",
+    "SwiGLUMLPFused",
     "RotaryEmbedding",
     "get_activation",
     # Attention

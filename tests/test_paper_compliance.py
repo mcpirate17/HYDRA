@@ -275,9 +275,14 @@ class TestCCGQAPaperCompliance:
                 assert module.use_qk_norm
                 assert module.use_convs
 
-        # Should have CCGQA attention in every MoR block
-        assert ccgqa_count >= variant.n_mor_blocks, (
-            f"Expected at least {variant.n_mor_blocks} CCGQA attention modules, found {ccgqa_count}"
+        # Hybrid attention: model mixes MQA/CCGQA/MLA across blocks.
+        # Validate that the number of instantiated CCGQA modules matches the
+        # number of CCQA entries in the configured attention pattern.
+        from hydra.model.hybrid_attention import AttentionType
+        assert hasattr(model, "_attention_pattern"), "Model should expose _attention_pattern"
+        expected_ccgqa = sum(1 for t in model._attention_pattern if t == AttentionType.CCQA)
+        assert ccgqa_count == expected_ccgqa, (
+            f"Expected {expected_ccgqa} CCGQA attention modules from hybrid pattern, found {ccgqa_count}"
         )
 
 

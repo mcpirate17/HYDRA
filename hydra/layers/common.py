@@ -86,6 +86,11 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Prefer PyTorch's native RMSNorm when available (fast + stable).
+        # This is generally safer than custom fused kernels.
+        if hasattr(F, "rms_norm"):
+            return F.rms_norm(x, [x.shape[-1]], weight=self.weight, eps=self.eps)
+
         # Use fused kernel if available (already wrapped with @compiler.disable in fused_ops.py)
         if FUSED_KERNELS_AVAILABLE and fused_rms_norm is not None:
             return fused_rms_norm(x, self.weight, self.eps)
@@ -102,8 +107,8 @@ class RMSNorm(nn.Module):
 # SwiGLU MLP: Gated Linear Unit with Swish activation
 # =============================================================================
 
-class SwiGLUMLP(nn.Module):
-    """SwiGLU MLP block.
+class SwiGLUMLPUnfused(nn.Module):
+    """SwiGLU MLP block (unfused projection variant).
     
     SwiGLU = Swish(x * W1) * (x * W2) then project down
     More expressive than standard MLP with similar param count.
@@ -121,13 +126,44 @@ class SwiGLUMLP(nn.Module):
         self.w3 = nn.Linear(hidden_dim, dim, bias=bias)  # Down projection
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Use fused kernel if available
+        gate = self.w1(x)
+        up = self.w2(x)
+
+        # Use fused kernel if available (elementwise SiLU(gate) * up)
         if FUSED_KERNELS_AVAILABLE and fused_swiglu is not None:
-            return fused_swiglu(x, self.w1.weight, self.w2.weight, self.w3.weight,
-                               self.w1.bias, self.w2.bias, self.w3.bias)
-        
-        # PyTorch implementation
-        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+            return self.w3(fused_swiglu(gate, up))
+
+        return self.w3(F.silu(gate) * up)
+
+
+class SwiGLUMLPFused(nn.Module):
+    """SwiGLU MLP with fused gate/up projection.
+    
+    Uses a single linear layer for gate+up projection (more memory efficient)
+    then chunks the output. This is the variant used in ccgqa.py.
+    
+    Args:
+        dim: Input/output dimension
+        hidden_dim: Hidden dimension per branch (total projection is 2*hidden_dim)
+    """
+
+    def __init__(self, dim: int, hidden_dim: int):
+        super().__init__()
+        self.gate_up = nn.Linear(dim, 2 * hidden_dim, bias=False)
+        self.down = nn.Linear(hidden_dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up = self.gate_up(x)
+        gate, up = gate_up.chunk(2, dim=-1)
+        # Use fused kernel if available (for gate*up part)
+        if FUSED_KERNELS_AVAILABLE and fused_swiglu is not None:
+            return self.down(fused_swiglu(gate, up))
+        return self.down(F.silu(gate) * up)
+
+
+# Public default: use the fused-projection SwiGLU MLP (gate_up + down).
+# This matches the implementation expected by tests and used throughout the repo.
+SwiGLUMLP = SwiGLUMLPFused
 
 
 # =============================================================================
@@ -184,9 +220,9 @@ class RotaryEmbedding(nn.Module):
     def extend_cache(self, seq_len: int):
         """Extend cache if needed for longer sequences."""
         if seq_len > self.max_seq_len:
-            self._init_cache(seq_len)
-            # Move to same device as existing buffers
+            # Preserve current device before rebuilding buffers.
             device = self.cos_cached.device
+            self._init_cache(seq_len)
             self.cos_cached = self.cos_cached.to(device)
             self.sin_cached = self.sin_cached.to(device)
 
@@ -202,6 +238,11 @@ class RotaryEmbedding(nn.Module):
         """
         if seq_len is None:
             seq_len = x.shape[2]
+
+        # Ensure caches are on the correct device (tests may call this module without .to(device)).
+        if self.cos_cached.device != x.device:
+            self.cos_cached = self.cos_cached.to(x.device)
+            self.sin_cached = self.sin_cached.to(x.device)
         
         # Extend cache if needed
         if seq_len > self.max_seq_len:
@@ -355,6 +396,11 @@ class GradientCheckpointMixin:
     @property
     def gradient_checkpointing_enabled(self) -> bool:
         return getattr(self, '_gradient_checkpointing_enabled', False)
+
+    @property
+    def is_gradient_checkpointing(self) -> bool:
+        # Backwards-compatible alias
+        return self.gradient_checkpointing_enabled
 
 
 def checkpoint_sequential(

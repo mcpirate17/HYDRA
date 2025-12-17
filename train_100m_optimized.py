@@ -58,6 +58,14 @@ import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
 # ============================================
+# CUDA/cuDNN Optimizations
+# ============================================
+torch.backends.cudnn.benchmark = True  # Auto-tune convolutions for GPU
+torch.backends.cuda.matmul.allow_tf32 = True  # TF32 for faster matmuls on Ampere+
+torch.backends.cudnn.allow_tf32 = True  # TF32 for cuDNN ops
+torch.set_float32_matmul_precision('high')  # Use TF32 for matmuls (faster on Ampere+)
+
+# ============================================
 # Fix torch.compile recompilation storm for step counters
 # Dynamo treats module integer attributes as static; this allows them to vary
 # ============================================
@@ -68,6 +76,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from hydra.model.hybrid_attention import HybridTransformer, HybridTransformerConfig
 from hydra.model.ccgqa import CCGQAMoDMoRModel
+from hydra.kernels import chunked_cross_entropy, fused_chunked_cross_entropy
 from universal_data_loader import create_universal_loader
 from data_filter import BatchFilter, FilterConfig
 import torch._inductor.config as inductor_config
@@ -94,7 +103,7 @@ class TrainingConfig:
     # ============================================
     # vanilla: HybridTransformer (MQA+CCQA+MLA, no routing)
     # mod_mor: CCGQAMoDMoRModel (CCGQA + MoD + MoR, full HYDRA)
-    architecture: str = "vanilla"  # "vanilla" or "mod_mor"
+    architecture: str = "mod_mor"  # "mod_mor" = full HYDRA with MoD+MoR routing
     mod_capacity: float = 0.5  # MoD: fraction of tokens to process (0.5 = 50% compute savings, 1.0 = MoD OFF)
     mor_adaptive: bool = True  # MoR adaptive routing (False = fixed-depth only, no routing)
     
@@ -144,16 +153,16 @@ class TrainingConfig:
     # Training hyperparameters (fixed regardless of mode)
     batch_size: int = 8
     grad_accum_steps: int = 2  # Effective batch = 16
-    max_lr: float = 5e-4
-    min_lr: float = 1.5e-4  # 30% of max_lr
+    max_lr: float = 3e-4  # Reduced from 5e-4 for stability with MoD/MoR
+    min_lr: float = 9e-5  # 30% of max_lr
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     
     # WSD Scheduler (Warmup-Stable-Decay)
-    lr_schedule: str = "wsd"  # "cosine", "wsd", or "wsd_adaptive"
+    lr_schedule: str = "wsd_adaptive"  # "cosine", "wsd", or "wsd_adaptive" (recommended)
     
     # Adaptive LR settings (for wsd_adaptive schedule)
-    adaptive_lr: bool = False  # Enable loss-triggered cooldown
+    adaptive_lr: bool = True  # Enable loss-triggered cooldown (recommended)
     adaptive_patience: int = 3  # Number of 100-step checks before triggering cooldown
     adaptive_threshold: float = 0.05  # Relative loss increase threshold (5%)
     adaptive_cooldown_factor: float = 0.15  # Decay phase = this fraction of remaining steps
@@ -176,7 +185,24 @@ class TrainingConfig:
     # Optimization
     use_compile: bool = True
     compile_mode: str = "max-autotune-no-cudagraphs"  # "default", "reduce-overhead", "max-autotune" (max-autotune has CUDA graph issues with grad accum)
+    # Triton kernel suite (SAFE DEFAULT): enables vetted fused kernels (e.g., SwiGLU/QK-norm)
+    # while keeping known-problematic kernels (fused RoPE / fused RMSNorm) opt-in only.
+    use_triton_kernels: bool = True
     dtype: str = "bfloat16"
+    
+    # Memory optimization: Chunked cross-entropy avoids materializing full logits.
+    # This is correctness-tested in this repo and is safe to enable; it may trade some throughput
+    # for lower peak memory.
+    use_chunked_ce: bool = True
+    chunked_ce_size: int = 4096  # Tokens per chunk (lower = less memory, more overhead)
+    # Debug/stability controls
+    halt_on_spike: bool = False  # Stop training immediately after the first detected gradient spike
+    
+    # Memory optimization: Gradient checkpointing - trade compute for memory
+    # Recomputes activations during backward pass instead of storing them
+    # Reduces memory ~40-60% but increases compute ~30%
+    gradient_checkpointing: bool = True  # Enabled by default for memory efficiency
+    checkpoint_every_n: int = 2  # Checkpoint every N layers (2 = less overhead, still good memory savings)
     
     # Logging
     log_interval: int = 50
@@ -206,6 +232,8 @@ class TrainingConfig:
             self.decay_steps = 1500  # 30% decay
             self.seq_steps = ()  # No sequence stepping in testing
             self.save_interval = 500  # Frequent saves for testing
+            # Keep testing runs short-context by default for iteration speed.
+            self.max_seq_len = 512
             # Tokens: 5000 * 16 * 2048 = 163.8M
             
         elif self.mode == "production":
@@ -245,7 +273,8 @@ class TrainingConfig:
             # Token calc: 90K * 8 * 4 * 512 = 1.47B tokens (exactly 1/3 Chinchilla)
         else:
             raise ValueError(f"Unknown mode: {self.mode}. Use 'testing', 'production', or 'chinchilla_third'")
-        
+
+    def print_summary(self) -> None:
         print(f"\n{'='*60}")
         print(f"TRAINING MODE: {self.mode.upper()}")
         print(f"{'='*60}")
@@ -273,7 +302,7 @@ class TrainingConfig:
             total_tokens = self.max_steps * self.batch_size * self.grad_accum_steps * self.max_seq_len
             print(f"  Sequence len:   {self.max_seq_len} (fixed)")
             print(f"  Total tokens:   {total_tokens/1e6:.1f}M")
-        
+
         # Architecture info
         if self.architecture == "vanilla":
             print(f"  Architecture:   VANILLA (HybridTransformer)")
@@ -281,20 +310,21 @@ class TrainingConfig:
             print(f"                  ~215M params")
         elif self.architecture == "mod_mor":
             effective_layers = self.n_mor_blocks * self.mor_recursions
-            # Estimate param count based on model_size preset
             est_params = {"100M": 220, "500M": 520}.get(self.model_size, 220)
             print(f"  Architecture:   MOD+MOR (CCGQAMoDMoRModel)")
             print(f"                  dim={self.mod_mor_dim}, {self.n_mor_blocks} MoR blocks × {self.mor_recursions} recursions = {effective_layers} effective layers")
             print(f"                  ~{est_params}M params ({self.model_size} preset)")
             print(f"                  Hybrid attention: MQA → CCQA → MLA pattern")
             print(f"                  MoD capacity: {self.mod_capacity:.0%} (~{(1-self.mod_capacity)*100:.0f}% compute savings)")
-            # MoR Curriculum info
             mor_enable_step = int(self.max_steps * self.mor_enable_pct)
+            remaining_steps = self.max_steps - mor_enable_step
+            actual_rampup = min(min(self.mor_rampup_steps, 2 * mor_enable_step), remaining_steps)
+            actual_rampup = max(actual_rampup, min(100, int(self.max_steps * 0.1)))
             if self.mor_already_enabled:
                 print(f"  MoR Curriculum: RESTART MODE (adaptive from step 0)")
             elif self.mor_enable_pct > 0:
                 print(f"  MoR Curriculum: Fixed-depth until step {mor_enable_step:,} ({self.mor_enable_pct:.0%})")
-                print(f"                  Then {self.mor_rampup_steps:,} step rampup to full adaptive")
+                print(f"                  Then {actual_rampup:,} step rampup to full adaptive")
             else:
                 print(f"  MoR Curriculum: Adaptive from start (no delay)")
         else:
@@ -637,6 +667,7 @@ class Trainer:
         '_current_seq_len', '_use_mod_mor', '_start_step', '_mor_enable_step',
         '_diagnostics_file', '_diagnostics_data', '_last_ce_loss', '_last_aux_loss', '_last_ponder_loss',
         '_adaptive_lr', '_batch_filter', '_checkpoint_seq_len', '_checkpoint_config', '_checkpoint_lr'
+        , '_resume_lr_scale', '_kernel_status'
     )
     
     def __init__(self, config: TrainingConfig):
@@ -677,12 +708,23 @@ class Trainer:
         
         # Set dtype
         self.dtype = getattr(torch, config.dtype) if config.dtype != "float32" else torch.float32
+
+        # Configure Triton fused kernels (must happen before training starts).
+        # NOTE: This toggles runtime dispatch inside hydra.layers (RMSNorm/SwiGLU, etc.).
+        self._kernel_status = None
+        try:
+            from hydra.kernels import set_use_triton_kernels, get_kernel_status
+            set_use_triton_kernels(bool(getattr(config, 'use_triton_kernels', False)))
+            self._kernel_status = get_kernel_status()
+        except Exception as e:
+            print(f"WARNING: Failed to configure Triton kernels ({e})")
         
         # Peek at checkpoint to get architecture params for model creation (if resuming)
         # This ensures model is created with MATCHING architecture before loading weights
         self._checkpoint_seq_len = None
         self._checkpoint_config = {}
         self._checkpoint_lr = None  # Will be set if resuming
+        self._resume_lr_scale: float = 1.0
         if config.resume_from:
             self._checkpoint_config = self._peek_checkpoint_config(config.resume_from)
             self._checkpoint_seq_len = self._checkpoint_config.get('max_seq_len', config.max_seq_len)
@@ -733,6 +775,8 @@ class Trainer:
         print(f"Tokens/step: {self._tokens_per_step:,} ({self._tokens_per_step/1e6:.2f}M per optimizer step)")
         print(f"Dataset: {config.dataset_name}")
         print(f"torch.compile: {config.use_compile} (mode={config.compile_mode})")
+        if self._kernel_status is not None:
+            print(f"Triton kernels: {self._kernel_status.get('use_triton_kernels', False)}")
         print(f"AMP dtype: {config.dtype}")
         
         # LR schedule info
@@ -872,19 +916,40 @@ class Trainer:
                     mor_enable_step = 0
                     print(f"MoR RESTART MODE: Adaptive routing enabled from start (resumed after enable point)")
                 
+                # Scale rampup_steps to fit within training budget
+                # Default: 2x enable_step, but cap at remaining training steps
+                # This ensures rampup completes before training ends
+                remaining_steps = config.max_steps - mor_enable_step
+                default_rampup = min(config.mor_rampup_steps, 2 * mor_enable_step)
+                actual_rampup = min(default_rampup, remaining_steps)
+                # Ensure at least some rampup (min 100 steps or 10% of training)
+                actual_rampup = max(actual_rampup, min(100, int(config.max_steps * 0.1)))
+                
                 self.model.set_mor_curriculum(
                     enable_step=mor_enable_step,
-                    rampup_steps=config.mor_rampup_steps
+                    rampup_steps=actual_rampup
                 )
                 self._mor_enable_step = mor_enable_step
                 
                 if mor_enable_step > 0:
-                    print(f"MoR CURRICULUM: Fixed-depth until step {mor_enable_step:,} ({config.mor_enable_pct:.0%}), then {config.mor_rampup_steps:,} step rampup")
+                    print(f"MoR CURRICULUM: Fixed-depth until step {mor_enable_step:,} ({config.mor_enable_pct:.0%}), then {actual_rampup:,} step rampup")
             else:
                 self._mor_enable_step = 0
                 print(f"MoR CURRICULUM: Disabled (adaptive=False, running pure fixed-depth)")
         else:
             raise ValueError(f"Unknown architecture: {config.architecture}")
+        
+        # Enable gradient checkpointing if configured (memory optimization)
+        if config.gradient_checkpointing:
+            if hasattr(self.model, 'enable_gradient_checkpointing'):
+                every_n = getattr(config, 'checkpoint_every_n', 1)
+                self.model.enable_gradient_checkpointing(every_n=every_n)
+                if every_n == 1:
+                    print("Gradient checkpointing: ENABLED (all layers, ~50% memory, ~30% overhead)")
+                else:
+                    print(f"Gradient checkpointing: ENABLED (every {every_n} layers, ~35% memory, ~15% overhead)")
+            else:
+                print("WARNING: Model doesn't support gradient checkpointing")
         
         # Apply torch.compile for maximum performance
         if config.use_compile and self.device == "cuda":
@@ -978,6 +1043,24 @@ class Trainer:
         # Load optimizer and scaler state
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.scaler.load_state_dict(checkpoint["scaler"])
+
+        # Compute a resume LR scale factor so we don't inadvertently jump LR after resuming.
+        # Rationale: the training loop overwrites optimizer.param_groups[].lr from the schedule;
+        # if config differs from the checkpoint, scheduled LR at resume step can be wildly off.
+        try:
+            ckpt_lr = float(self.optimizer.param_groups[0].get('lr', 0.0))
+            sched_lr_at_resume = float(get_lr(checkpoint["step"], self.config))
+            if ckpt_lr > 0.0 and sched_lr_at_resume > 0.0:
+                self._resume_lr_scale = ckpt_lr / sched_lr_at_resume
+                if abs(self._resume_lr_scale - 1.0) > 1e-6:
+                    print(
+                        f"  Resume LR alignment: ckpt_lr={ckpt_lr:.6f}, "
+                        f"sched_lr(step={checkpoint['step']})={sched_lr_at_resume:.6f}, "
+                        f"scale={self._resume_lr_scale:.4f}"
+                    )
+        except Exception:
+            # Never block resume for LR alignment issues
+            self._resume_lr_scale = 1.0
         
         # Set start step
         self._start_step = checkpoint["step"]
@@ -1081,6 +1164,7 @@ class Trainer:
         eval_interval = config.eval_interval
         save_interval = config.save_interval
         tokens_per_step = self._tokens_per_step
+        vocab_size = config.vocab_size
         dtype = self.dtype
         device = self.device
         param_groups = self._param_groups
@@ -1101,6 +1185,11 @@ class Trainer:
         accum_loss = 0.0
         use_scaler = self._use_scaler
         use_mod_mor = self._use_mod_mor
+        
+        # Initialize loss tracking for diagnostics
+        self._last_ce_loss = 0.0
+        self._last_aux_loss = 0.0
+        self._last_ponder_loss = 0.0
         
         eval_batches = 25  # More batches = more stable eval loss (was 8)
         eval_loader = create_universal_loader(
@@ -1125,6 +1214,21 @@ class Trainer:
             step_start = time.time()
             optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
             accum_loss = 0.0
+            micro_diag: List[dict] = []
+            collect_micro_diag = os.environ.get("HYDRA_ENABLE_MICRO_DIAG", "0") == "1"
+            next_step = step + 1
+            track_loss_scalars = collect_micro_diag or (
+                (log_interval > 0 and next_step % log_interval == 0) or (next_step % 500 == 0)
+            )
+
+            # Grad-spike response settings (kept local to avoid changing CLI/config surface area)
+            # Rationale: around warmup end / max LR, a single bad batch can produce huge-but-finite
+            # gradients. Clipping makes the step numerically safe, but Adam moments can still get
+            # polluted; use a temporary LR cooldown and optionally reset moments on top offenders.
+            grad_spike_threshold = 1e6
+            grad_spike_lr_factor = 0.1
+            grad_spike_topk = 32
+            grad_spike_reset_moments = True
 
             # Update global step for MoR warmup scheduling
             if use_mod_mor and hasattr(model, 'set_global_step'):
@@ -1154,22 +1258,104 @@ class Trainer:
                         # ponder_loss encourages efficient MoR depth usage
                         aux_loss = aux_losses.get("aux_loss", 0.0)
                         ponder_loss = aux_losses.get("ponder_loss", 0.0)
+                        
+                        # Safety: clamp aux losses to prevent explosion
+                        # These are regularization terms - shouldn't dominate the main CE loss
+                        if hasattr(aux_loss, 'clamp'):
+                            aux_loss = aux_loss.clamp(max=100.0)
+                        if hasattr(ponder_loss, 'clamp'):
+                            ponder_loss = ponder_loss.clamp(max=100.0)
+                        
                         # Configurable loss scales from config
                         # aux_scale: 0.1 default (MoD load balancing)
                         # ponder_scale: 0.01 default, use ~1e-4 for weak MoR regularization
                         loss = ce_loss + self.config.aux_scale * aux_loss + self.config.ponder_scale * ponder_loss
                         
                         # Track individual losses for diagnostics
-                        self._last_ce_loss = ce_loss.item() if hasattr(ce_loss, 'item') else float(ce_loss)
-                        self._last_aux_loss = aux_loss.item() if hasattr(aux_loss, 'item') else float(aux_loss)
-                        self._last_ponder_loss = ponder_loss.item() if hasattr(ponder_loss, 'item') else float(ponder_loss)
+                        if track_loss_scalars:
+                            self._last_ce_loss = ce_loss.item() if hasattr(ce_loss, 'item') else float(ce_loss)
+                            self._last_aux_loss = aux_loss.item() if hasattr(aux_loss, 'item') else float(aux_loss)
+                            self._last_ponder_loss = ponder_loss.item() if hasattr(ponder_loss, 'item') else float(ponder_loss)
                     else:
-                        logits = model(x)
-                        loss = F.cross_entropy(
-                            logits.view(-1, logits.size(-1)),
-                            y.view(-1),
-                            ignore_index=-100,
-                        )
+                        if self.config.use_chunked_ce and hasattr(model, "forward_hidden"):
+                            # Memory-efficient loss: avoid materializing full logits.
+                            hidden = model.forward_hidden(x)
+                            # Weight is the output projection weight (tied to tok_emb in HybridTransformer).
+                            base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+                            weight = base_model.output.weight
+                            loss = fused_chunked_cross_entropy(
+                                hidden,
+                                weight,
+                                y,
+                                ignore_index=-100,
+                                chunk_size=self.config.chunked_ce_size,
+                            )
+                            # For micro diagnostics, keep a lightweight logits sample when needed.
+                            logits = None
+                        else:
+                            logits = model(x)
+                            loss = F.cross_entropy(
+                                logits.view(-1, logits.size(-1)),
+                                y.view(-1),
+                                ignore_index=-100,
+                            )
+
+                        # Vanilla path: keep diagnostics meaningful
+                        if track_loss_scalars:
+                            self._last_ce_loss = loss.item() if hasattr(loss, 'item') else float(loss)
+                            self._last_aux_loss = 0.0
+                            self._last_ponder_loss = 0.0
+
+                # Optional per-microbatch diagnostics (very expensive; opt-in only)
+                if collect_micro_diag:
+                    try:
+                        with torch.no_grad():
+                            y_flat = y.view(-1)
+                            y_is_ignore = (y_flat == -100)
+                            y_valid = ~y_is_ignore
+                            y_oob = (y_valid & ((y_flat < 0) | (y_flat >= vocab_size))).sum().item()
+                            y_ignore = y_is_ignore.sum().item()
+                            y_min = int(y_flat.min().item()) if y_flat.numel() else 0
+                            y_max = int(y_flat.max().item()) if y_flat.numel() else 0
+
+                            x_flat = x.view(-1)
+                            x_oob = ((x_flat < 0) | (x_flat >= vocab_size)).sum().item()
+                            x_min = int(x_flat.min().item()) if x_flat.numel() else 0
+                            x_max = int(x_flat.max().item()) if x_flat.numel() else 0
+
+                            if logits is None:
+                                logits_isfinite = True
+                                logits_absmax = 0.0
+                                logits_mean = 0.0
+                                logits_std = 0.0
+                            else:
+                                logits_f = logits.detach()
+                                logits_f32 = logits_f.float()
+                                logits_isfinite = torch.isfinite(logits_f32).all().item()
+                                logits_absmax = logits_f32.abs().max().item() if logits_f32.numel() else 0.0
+                                logits_mean = logits_f32.mean().item() if logits_f32.numel() else 0.0
+                                logits_std = logits_f32.std(unbiased=False).item() if logits_f32.numel() else 0.0
+
+                            micro_diag.append({
+                                "micro_step": micro_step,
+                                "loss": float(loss.item()) if hasattr(loss, "item") else float(loss),
+                                "accum_enabled": True,
+                                "x_min": x_min,
+                                "x_max": x_max,
+                                "x_oob": int(x_oob),
+                                "y_min": y_min,
+                                "y_max": y_max,
+                                "y_oob": int(y_oob),
+                                "y_ignore": int(y_ignore),
+                                "y_valid": int(y_flat.numel() - y_ignore),
+                                "logits_isfinite": bool(logits_isfinite),
+                                "logits_absmax": float(logits_absmax),
+                                "logits_mean": float(logits_mean),
+                                "logits_std": float(logits_std),
+                            })
+                    except Exception:
+                        # Diagnostics must never break training
+                        pass
                 
                 # Batch filtering: check if this batch should be skipped
                 # (loss spike from bad data)
@@ -1178,6 +1364,9 @@ class Trainer:
                         loss.item(), step
                     )
                     if should_skip:
+                        if micro_diag:
+                            micro_diag[-1]["accum_enabled"] = False
+                            micro_diag[-1]["skip_reason"] = str(skip_reason)
                         # Skip backward pass - just continue to next micro-batch
                         if step % 500 == 0:  # Log occasionally
                             stats = self._batch_filter.get_stats()
@@ -1185,6 +1374,15 @@ class Trainer:
                                   f"total skipped: {stats['n_skipped']}/{stats['n_total']} "
                                   f"({stats['skip_ratio']*100:.1f}%)")
                         continue
+                
+                # NaN/Inf loss detection - skip batch if loss is corrupted
+                loss_val = loss.item()
+                if not math.isfinite(loss_val):
+                    print(f"  ⚠️  Step {step}: NaN/Inf loss detected, skipping batch")
+                    if micro_diag:
+                        micro_diag[-1]["accum_enabled"] = False
+                        micro_diag[-1]["skip_reason"] = "non_finite_loss"
+                    continue
                 
                 # Scale loss for accumulation
                 scaled_loss = loss * loss_scale
@@ -1199,19 +1397,216 @@ class Trainer:
             # Gradient clipping
             if use_scaler:
                 scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), grad_clip
-            ).item()
             
-            # Update LR (WSD or cosine based on config, with adaptive support)
+            # Get the base model (unwrap torch.compile if needed)
+            base = model._orig_mod if hasattr(model, '_orig_mod') else model
+
+            # Clip gradients.
+            # NOTE: clip_grad_norm_ returns the PRE-clip global norm.
+            pre_clip_norm_t = torch.nn.utils.clip_grad_norm_(base.parameters(), grad_clip)
+            pre_clip_norm = float(pre_clip_norm_t) if torch.is_tensor(pre_clip_norm_t) else float(pre_clip_norm_t)
+            # Post-clip norm is <= grad_clip by construction; avoid an expensive full re-scan.
+            grad_norm = min(pre_clip_norm, float(grad_clip)) if math.isfinite(pre_clip_norm) else float('nan')
+
+            # Collect detailed per-parameter grad info ONLY when needed (spike/non-finite diagnostics).
+            grad_info_pre_clip = None
+
+            spike_detected = math.isfinite(pre_clip_norm) and (pre_clip_norm > grad_spike_threshold)
+            nonfinite_grads = not math.isfinite(pre_clip_norm)
+
+            # Compute the LR that would be used for this step (needed for spike diagnostics)
+            # Note: LR is only applied to param_groups later, after any optional spike response.
             if self._adaptive_lr is not None:
-                # Adaptive LR: update state with smoothed loss every 100 steps
-                # Using per-step losses is too noisy - degradation only visible in smoothed values
                 if step % 100 == 0:
                     self._adaptive_lr.update(step, accum_loss)
                 lr = self._adaptive_lr.get_lr(step)
             else:
                 lr = get_lr(step, config)
+
+            # Align LR on resume to match checkpoint optimizer LR at the resume step.
+            lr = lr * getattr(self, '_resume_lr_scale', 1.0)
+
+            lr_effective = lr
+            if spike_detected:
+                lr_effective = lr * grad_spike_lr_factor
+            
+            # Gradient diagnostic (non-finite OR huge pre-clip norm)
+            if nonfinite_grads or spike_detected:
+                # Build per-parameter grad info (this is expensive; keep it off the hot path).
+                grad_info_pre_clip = []
+                try:
+                    for name, param in base.named_parameters():
+                        if param.grad is None:
+                            continue
+                        g = param.grad.detach()
+                        grad_info_pre_clip.append(
+                            (
+                                name,
+                                float(g.float().norm().item()),
+                                float(g.float().abs().max().item()),
+                                bool(torch.isnan(g).any().item()),
+                                bool(torch.isinf(g).any().item()),
+                            )
+                        )
+                except Exception:
+                    grad_info_pre_clip = []
+
+                # DIAGNOSTIC: Show gradient summary (per-parameter stats are post-clip)
+                clip_coef = grad_clip / (pre_clip_norm + 1e-12)
+                clip_scale = min(1.0, clip_coef) if math.isfinite(clip_coef) else 0.0
+                print(f"\n{'='*60}")
+                print(f"  🔍 GRADIENT EXPLOSION DIAGNOSTIC - Step {step}")
+                print(f"{'='*60}")
+                print(f"  Pre-clip grad_norm:  {pre_clip_norm:.2e}")
+                print(f"  Post-clip grad_norm: {grad_norm:.2e}")
+                print(f"  Clip coefficient:    {clip_coef:.2e}")
+                print(f"  Clip scale applied:  {clip_scale:.2e}")
+                print(f"  LR (scheduled):      {lr:.2e}")
+                if spike_detected:
+                    print(f"  LR (effective):      {lr_effective:.2e} (cooldown x{grad_spike_lr_factor})")
+                print(f"  Accumulated loss this step: {accum_loss:.4f}")
+                ce = getattr(self, '_last_ce_loss', 0.0)
+                aux = getattr(self, '_last_aux_loss', 0.0) 
+                ponder = getattr(self, '_last_ponder_loss', 0.0)
+                print(f"  Last micro-batch losses: CE={ce:.4f}, aux={aux:.4f}, ponder={ponder:.4f}")
+
+                if micro_diag:
+                    print("\n  Micro-batch sanity (this step):")
+                    for md in micro_diag:
+                        skip_note = "" if md.get("accum_enabled", True) else f" SKIPPED({md.get('skip_reason', 'unknown')})"
+                        print(
+                            f"    micro={md.get('micro_step')} loss={md.get('loss', 0.0):.4f}{skip_note} | "
+                            f"x[min,max]=[{md.get('x_min')},{md.get('x_max')}] x_oob={md.get('x_oob')} | "
+                            f"y[min,max]=[{md.get('y_min')},{md.get('y_max')}] y_oob={md.get('y_oob')} "
+                            f"valid={md.get('y_valid')} ignore={md.get('y_ignore')} | "
+                            f"logits finite={md.get('logits_isfinite')} absmax={md.get('logits_absmax', 0.0):.2e} "
+                            f"mean={md.get('logits_mean', 0.0):.2e} std={md.get('logits_std', 0.0):.2e}"
+                        )
+                
+                # Sort pre-clip gradient info by norm (handle inf/nan)
+                def sort_key(x):
+                    if x[3] or x[4]:  # has nan or inf
+                        return float('inf')
+                    return x[1]
+                grad_info_pre_clip.sort(key=sort_key, reverse=True)
+                
+                print(f"  Top 15 gradients by norm (post-clip; est pre-clip in parentheses):")
+                for name, g_norm, g_max, has_nan, has_inf in grad_info_pre_clip[:15]:
+                    flag = ""
+                    if has_nan:
+                        flag += " [NaN!]"
+                    if has_inf:
+                        flag += " [Inf!]"
+                    if clip_scale > 0.0:
+                        g_norm_pre = g_norm / clip_scale
+                        g_max_pre = g_max / clip_scale
+                    else:
+                        g_norm_pre = g_norm
+                        g_max_pre = g_max
+                    print(
+                        f"    {name}: norm={g_norm:.2e} (pre~{g_norm_pre:.2e}), "
+                        f"max={g_max:.2e} (pre~{g_max_pre:.2e}){flag}"
+                    )
+
+                # Update-to-weight ratio diagnostics (uses CLIPPED grads and effective LR)
+                # This is a good proxy for whether we're taking overly-large steps.
+                try:
+                    top_names = [n for (n, *_rest) in grad_info_pre_clip[:15]]
+                    eps = 1e-12
+                    ratios = []
+                    with torch.no_grad():
+                        for name, p in base.named_parameters():
+                            if name not in top_names or p.grad is None:
+                                continue
+                            w = p.detach()
+                            g = p.grad.detach()
+                            w_norm = w.float().norm().item()
+                            g_norm_post = g.float().norm().item()
+                            w_absmax = w.float().abs().max().item()
+                            g_absmax_post = g.float().abs().max().item()
+                            ratio_l2 = (lr_effective * g_norm_post) / (w_norm + eps)
+                            ratio_max = (lr_effective * g_absmax_post) / (w_absmax + eps)
+                            ratios.append((name, ratio_l2, ratio_max, w_norm, g_norm_post))
+                    ratios.sort(key=lambda t: t[1], reverse=True)
+                    if ratios:
+                        print("\n  Update/weight ratios (clipped grads, effective LR):")
+                        for name, r_l2, r_max, w_norm, g_norm_post in ratios[:8]:
+                            print(
+                                f"    {name}: (lr*||g||/||w||)={r_l2:.2e}, (lr*gmax/wmax)={r_max:.2e} | "
+                                f"||w||={w_norm:.2e}, ||g||_post={g_norm_post:.2e}"
+                            )
+                except Exception:
+                    pass
+                
+                # Check router stats if available
+                if hasattr(base, 'layers'):
+                    print(f"\n  Router diagnostics (first 5 layers):")
+                    for i, layer in enumerate(base.layers[:5]):
+                        if hasattr(layer, 'router'):
+                            # Check router weight stats
+                            w = layer.router.weight
+                            b = layer.router.bias if hasattr(layer.router, 'bias') and layer.router.bias is not None else None
+                            print(f"    Layer {i} router.weight: mean={w.mean():.4f}, std={w.std():.4f}, max={w.abs().max():.4f}")
+                            if b is not None:
+                                print(f"    Layer {i} router.bias: {b.item():.4f}")
+                            if w.grad is not None:
+                                print(f"    Layer {i} router.weight.grad: norm={w.grad.norm():.2e}, max={w.grad.abs().max():.2e}")
+                print(f"{'='*60}\n")
+
+                # Non-finite gradients: must skip optimizer update to avoid corrupting moments.
+                if nonfinite_grads:
+                    optimizer.zero_grad(set_to_none=True)
+                    if use_scaler:
+                        scaler.update()  # Still update scaler to adjust scale factor
+                    print(f"  ⚠️  Step {step}: Skipping update - non-finite gradients")
+                    # Advance step so we don't get stuck on one bad batch forever
+                    step += 1
+                    continue
+
+                # Huge but finite gradients: proceed with clipped grads, but protect optimizer state.
+                if spike_detected and grad_spike_reset_moments:
+                    try:
+                        # Identify top offending params by pre-clip grad norm
+                        offenders = sorted(grad_info_pre_clip, key=lambda t: float('inf') if (t[3] or t[4]) else t[1], reverse=True)[:grad_spike_topk]
+                        offender_names = {n for (n, *_rest) in offenders}
+
+                        # Reset AdamW moment buffers for offenders (prevents one spike polluting momentum)
+                        for name, p in base.named_parameters():
+                            if p.grad is None or name not in offender_names:
+                                continue
+                            st = optimizer.state.get(p)
+                            if not st:
+                                continue
+                            if "exp_avg" in st and torch.is_tensor(st["exp_avg"]):
+                                st["exp_avg"].zero_()
+                            if "exp_avg_sq" in st and torch.is_tensor(st["exp_avg_sq"]):
+                                st["exp_avg_sq"].zero_()
+                            if "max_exp_avg_sq" in st and torch.is_tensor(st["max_exp_avg_sq"]):
+                                st["max_exp_avg_sq"].zero_()
+                        print(f"  🔧 Spike response: reset Adam moments for top {len(offenders)} params")
+                    except Exception as e:
+                        print(f"  ⚠️  Spike response: moment reset failed ({e})")
+
+                # Optional debug: stop immediately after first spike to allow forensic analysis.
+                if (spike_detected or nonfinite_grads) and getattr(self.config, 'halt_on_spike', False):
+                    try:
+                        halt_step_time = max(1e-9, time.time() - step_start)
+                        halt_tps = tokens_per_step / halt_step_time
+                        metrics.update(step, accum_loss, lr_effective, grad_norm, halt_tps, halt_step_time)
+                        metrics.total_tokens += tokens_per_step
+                        metrics.final_loss = accum_loss
+                        self._save_checkpoint(step)
+                    except Exception as e:
+                        print(f"  ⚠️  Halt-on-spike: failed to record/save state ({e})")
+                    print(f"  🛑 Halt-on-spike enabled: stopping at step {step}")
+                    metrics.end_time = time.time()
+                    return metrics
+
+            # If we saw a huge-but-finite spike, apply a temporary per-step LR cooldown.
+            # We still do an optimizer step with clipped grads so training continues.
+            if spike_detected:
+                lr = lr_effective
+                print(f"  🔻 Spike response: LR cooldown applied (factor={grad_spike_lr_factor})")
             for pg in param_groups:
                 pg["lr"] = lr
             
@@ -1541,6 +1936,11 @@ class Trainer:
         else:
             suffix = f"step_{step}"
         ckpt_path = ckpt_dir / f"hydra_100m_{suffix}.pt"
+
+        # Avoid overwriting an existing periodic checkpoint (common when resuming/debugging).
+        if (not best) and (not final) and ckpt_path.exists():
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ckpt_path = ckpt_dir / f"hydra_100m_{suffix}_{ts}.pt"
         
         # Get model state (handle compiled model)
         model = self.model
@@ -1857,7 +2257,7 @@ class Trainer:
 # Main Entry Point
 # ============================================
 def main(
-    architecture: str = "vanilla", 
+    architecture: str = "mod_mor",  # Full HYDRA with MoD+MoR routing
     mode: str = "testing", 
     resume_from: Optional[str] = None, 
     max_steps_override: Optional[int] = None,
@@ -1868,26 +2268,41 @@ def main(
     aux_scale: float = 0.1,
     ponder_scale: float = 0.01,
     recalc_lr_schedule: bool = False,
-    adaptive_lr: bool = False,
+    adaptive_lr: bool = True,  # Enabled by default
     use_swa: bool = False,
     swa_start_pct: float = 0.75,
     batch_filter: bool = False,
     batch_filter_threshold: float = 2.5,
     batch_size: Optional[int] = None,
     grad_accum_steps: Optional[int] = None,
-    dataset_name: str = "fineweb_edu",
+    dataset_name: str = "finefineweb",  # Match TrainingConfig default
     model_size: str = "100M",
+    gradient_checkpointing: bool = True,  # Enabled by default
+    checkpoint_every_n: int = 2,  # Checkpoint every N layers (2 = balance of memory/speed)
+    use_triton_kernels: bool = True,
+    use_chunked_ce: bool = True,
+    chunked_ce_size: int = 4096,
+    halt_on_spike: bool = False,
 ):
     """Main training entry point.
     
+        
+        # Avoid overwriting an existing periodic checkpoint (common when resuming/debugging).
+        if (not best) and (not final) and ckpt_path.exists():
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ckpt_path = ckpt_dir / f"hydra_100m_{suffix}_{ts}.pt"
     Args:
-        architecture: "vanilla" or "mod_mor"
-        mode: "testing" (5K), "production" (100K), or "chinchilla_third" (90K)
-        resume_from: Path to checkpoint to resume from
-        max_steps_override: Override max steps (for diagnostic runs, e.g., 500 or 1000)
+                    try:
+                        halt_step_time = max(1e-9, time.time() - step_start)
+                        halt_tps = tokens_per_step / halt_step_time
+                        metrics.update(step, accum_loss, lr_effective, grad_norm, halt_tps, halt_step_time)
+                        metrics.total_tokens += tokens_per_step
+                        metrics.final_loss = accum_loss
+                        self._save_checkpoint(step)
+                    except Exception as e:
+                        print(f"  ⚠️  Halt-on-spike: failed to record/save state ({e})")
         mor_enable_pct: MoR curriculum - enable adaptive after this % of training (0.0-1.0)
         mor_already_enabled: Restart flag - set True if resuming after MoR was enabled
-        mod_capacity: MoD capacity ratio (0.5=50%, 1.0=all tokens=MoD OFF)
         mor_adaptive: MoR adaptive routing (True=on, False=fixed-depth only)
         aux_scale: MoD auxiliary loss scale (0.1 default)
         ponder_scale: MoR ponder loss scale (0.01 default, use ~1e-4 for weak reg)
@@ -1928,7 +2343,9 @@ def main(
     print(f"   dim={size_config['mod_mor_dim']}, blocks={size_config['n_mor_blocks']}, "
           f"heads={size_config['mod_mor_n_heads']}")
     
-    # Configuration for 100M variant testing with WSD scheduler
+    # Configuration for HYDRA training
+    # NOTE: Avoid forcing short-seq/testing defaults here; let TrainingConfig.mode
+    # drive step/seq scheduling unless explicitly overridden.
     config = TrainingConfig(
         # Architecture selection
         architecture=architecture,
@@ -1971,23 +2388,14 @@ def main(
         n_macro_blocks=3,
         n_heads=12,
         n_kv_heads=3,
-        max_seq_len=512,  # Shorter for faster iteration
-        
-        # Training - batch size is critical for scaling!
-        # Default batch sizes depend on model size to fit in GPU memory
-        batch_size=batch_size if batch_size is not None else size_config["default_batch_size"],
-        grad_accum_steps=grad_accum_steps if grad_accum_steps is not None else size_config["default_grad_accum"],
-        max_steps=5000,
-        
-        # WSD Schedule: Warmup 3% -> Stable 67% -> Decay 30%
-        # This keeps high LR much longer than cosine, preventing stagnation
-        lr_schedule="wsd",
-        warmup_steps=150,           # 3% warmup
-        decay_start_step=3500,      # Start decay at 70% (after 67% stable)
-        decay_steps=1500,           # 30% linear decay
-        max_lr=5e-4 if model_size == "100M" else 3e-4,  # Lower LR for larger models
-        min_lr=1.5e-4 if model_size == "100M" else 1e-4,
-        
+
+        # Fused kernels (safe-by-default subset)
+        use_triton_kernels=use_triton_kernels,
+
+        # Chunked CE (memory optimization)
+        use_chunked_ce=use_chunked_ce,
+        chunked_ce_size=chunked_ce_size,
+
         # Dataset
         dataset_name=dataset_name,
         
@@ -1995,6 +2403,11 @@ def main(
         use_compile=True,
         compile_mode="max-autotune-no-cudagraphs",  # "default" avoids CUDA graphs, works with grad accum
         dtype="bfloat16",
+        gradient_checkpointing=gradient_checkpointing,  # Memory optimization
+        checkpoint_every_n=checkpoint_every_n,  # Selective checkpointing (2 = good balance)
+
+        # Debug: stop immediately after first detected spike
+        halt_on_spike=halt_on_spike,
         
         # Logging - 25 steps for print, diagnostics every 100
         log_interval=25,
@@ -2004,12 +2417,12 @@ def main(
     # Apply max_steps override if provided
     if max_steps_override is not None:
         config.max_steps = max_steps_override
-        # Adjust save interval for short runs - use 500 for longer diagnostic runs
-        if max_steps_override >= 2000:
-            config.save_interval = 500  # Every 500 steps for longer runs
+        # Adjust save interval for short runs
+        if config.max_steps >= 2000:
+            config.save_interval = 500
         else:
-            config.save_interval = min(config.save_interval, max(100, max_steps_override // 5))
-        print(f"\n⚠️  DIAGNOSTIC RUN: max_steps={max_steps_override}, save_interval={config.save_interval}")
+            config.save_interval = min(config.save_interval, max(100, config.max_steps // 5))
+        print(f"\n⚠️  OVERRIDE: max_steps={config.max_steps:,}, save_interval={config.save_interval:,}")
     
     # Recalculate LR schedule for extended/resume training
     # This ensures WSD decay happens at the right point relative to ACTUAL max_steps
@@ -2022,6 +2435,9 @@ def main(
         print(f"   Warmup:      {config.warmup_steps:,} steps")
         print(f"   Stable:      steps {config.warmup_steps:,} - {config.decay_start_step:,} at LR={config.max_lr}")
         print(f"   Decay:       steps {config.decay_start_step:,} - {config.max_steps:,} (LR {config.max_lr} -> {config.min_lr})")
+
+    # Print the final resolved configuration (after overrides)
+    config.print_summary()
     
     # Create and run trainer
     trainer = Trainer(config)
@@ -2045,7 +2461,7 @@ def main(
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="HYDRA Training")
-    parser.add_argument("--arch", type=str, default="vanilla", choices=["vanilla", "mod_mor"],
+    parser.add_argument("--arch", type=str, default="mod_mor", choices=["vanilla", "mod_mor"],
                         help="Architecture: vanilla or mod_mor")
     parser.add_argument("--mode", type=str, default="testing", choices=["testing", "production", "chinchilla_third"],
                         help="Mode: testing (5K), production (100K), chinchilla_third (1/3 Chinchilla)")
@@ -2090,6 +2506,28 @@ if __name__ == "__main__":
     # Model size argument
     parser.add_argument("--model_size", type=str, default="100M", choices=["100M", "500M"],
                         help="Model size preset: 100M (~220M params) or 500M (~605M params)")
+    # Kernel/throughput switches
+    parser.add_argument(
+        "--triton_kernels",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable Triton kernels (safe-by-default subset; fused RoPE/RMSNorm remain opt-in)",
+    )
+    parser.add_argument(
+        "--chunked_ce",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable chunked cross-entropy (lower peak memory; may reduce throughput)",
+    )
+    parser.add_argument(
+        "--chunked_ce_size",
+        type=int,
+        default=4096,
+        help="Chunk size for chunked cross-entropy (tokens per chunk)",
+    )
+    # Debug / stability
+    parser.add_argument("--halt_on_spike", action="store_true",
+                        help="Debug: stop training immediately after first gradient spike and save a checkpoint")
     args = parser.parse_args()
     
     main(
@@ -2113,4 +2551,8 @@ if __name__ == "__main__":
         grad_accum_steps=args.grad_accum,
         dataset_name=args.dataset,
         model_size=args.model_size,
+        use_triton_kernels=args.triton_kernels,
+        use_chunked_ce=args.chunked_ce,
+        chunked_ce_size=args.chunked_ce_size,
+        halt_on_spike=args.halt_on_spike,
     )

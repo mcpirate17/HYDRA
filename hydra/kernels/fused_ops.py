@@ -69,12 +69,14 @@ except ImportError:
 USE_TRITON_KERNELS = TRITON_AVAILABLE and os.environ.get("HYDRA_DISABLE_TRITON", "0") != "1"
 
 # Per-kernel switches (for debugging)
-# NOTE: RoPE kernel disabled by default on Blackwell (sm_120) due to memory access pattern issues
-# Other kernels (SwiGLU, RMSNorm, QKNorm) work fine
+# NOTE: RoPE kernel disabled by default (can trigger illegal memory access on some GPUs/stacks).
+# NOTE: Fused RMSNorm is currently DISABLED by default because its backward has been observed
+#       to produce massively incorrect gradients on some stacks. Opt in explicitly via
+#       HYDRA_ENABLE_FUSED_RMS_NORM=1.
 USE_FUSED_ROPE = False  # Disabled until Triton fixes Blackwell support
-USE_FUSED_QK_NORM = USE_TRITON_KERNELS
-USE_FUSED_SWIGLU = USE_TRITON_KERNELS
-USE_FUSED_RMS_NORM = USE_TRITON_KERNELS
+USE_FUSED_QK_NORM = USE_TRITON_KERNELS  # Now autograd-compatible!
+USE_FUSED_SWIGLU = USE_TRITON_KERNELS  # Now autograd-compatible!
+USE_FUSED_RMS_NORM = False  # Opt-in only (see HYDRA_ENABLE_FUSED_RMS_NORM)
 
 
 def set_use_triton_kernels(enabled: bool):
@@ -85,10 +87,12 @@ def set_use_triton_kernels(enabled: bool):
         raise RuntimeError("Triton is not available. Install with: pip install triton")
     
     USE_TRITON_KERNELS = enabled
-    USE_FUSED_ROPE = enabled
+    # Fused RoPE stays opt-in even when enabling Triton globally.
+    USE_FUSED_ROPE = enabled and os.environ.get("HYDRA_ENABLE_FUSED_ROPE", "0") == "1"
     USE_FUSED_QK_NORM = enabled
     USE_FUSED_SWIGLU = enabled
-    USE_FUSED_RMS_NORM = enabled
+    # Fused RMSNorm stays opt-in even when enabling Triton globally.
+    USE_FUSED_RMS_NORM = enabled and os.environ.get("HYDRA_ENABLE_FUSED_RMS_NORM", "0") == "1"
 
 
 def get_kernel_status() -> dict:
@@ -324,8 +328,91 @@ def fused_qk_norm(
         Tuple of (normalized_q, normalized_k)
     """
     if USE_FUSED_QK_NORM and TRITON_AVAILABLE and q.is_cuda:
-        return _fused_qk_norm_triton(q, k, scale, temperature)
+        return FusedQKNormFunction.apply(q, k, scale, temperature)
     return _qk_norm_pytorch(q, k, scale, temperature)
+
+
+class FusedQKNormFunction(torch.autograd.Function):
+    """Autograd-compatible wrapper for fused QK-norm Triton kernel."""
+    
+    @staticmethod
+    def forward(ctx, q: torch.Tensor, k: torch.Tensor, scale: float, temperature: float):
+        """Forward pass using Triton kernel."""
+        B_q, H_q, S_q, D = q.shape
+        B_k, H_k, S_k, _ = k.shape
+        
+        q = q.contiguous()
+        k = k.contiguous()
+        q_out = torch.empty_like(q)
+        k_out = torch.empty_like(k)
+        
+        n_q_elements = B_q * H_q * S_q
+        n_k_elements = B_k * H_k * S_k
+        
+        # Process Q and K in single kernel launch
+        grid = (n_q_elements + n_k_elements,)
+        
+        _fused_qk_norm_kernel[grid](
+            q.view(-1),
+            k.view(-1),
+            q_out.view(-1),
+            k_out.view(-1),
+            scale,
+            temperature,
+            D,
+            n_q_elements,
+            n_k_elements,
+        )
+        
+        # Save for backward
+        ctx.save_for_backward(q, k)
+        ctx.scale = scale
+        ctx.temperature = temperature
+        
+        return q_out, k_out
+    
+    @staticmethod
+    def backward(ctx, grad_q_out: torch.Tensor, grad_k_out: torch.Tensor):
+        """Backward pass for L2 normalization.
+        
+        Forward: out = x / ||x|| * scale
+        
+        Backward: d_out/d_x = scale * (I - x*x^T / ||x||^2) / ||x||
+                            = scale / ||x|| * (grad - x * (x dot grad) / ||x||^2)
+        
+        Note: We compute in float32 for numerical stability, then cast back.
+        """
+        q, k = ctx.saved_tensors
+        scale = ctx.scale
+        temperature = ctx.temperature
+        
+        # Q gradient (float32 for stability)
+        q_f32 = q.float()
+        grad_q_f32 = grad_q_out.float()
+        q_norm_sq = (q_f32 * q_f32).sum(dim=-1, keepdim=True)
+        q_norm = q_norm_sq.sqrt().clamp(min=1e-6)  # Clamp to avoid division by zero
+        q_normalized = q_f32 / q_norm
+        
+        # Gradient: scale * (grad - normalized * dot(normalized, grad)) / norm
+        q_dot_grad = (q_normalized * grad_q_f32).sum(dim=-1, keepdim=True)
+        grad_q = scale * (grad_q_f32 - q_normalized * q_dot_grad) / q_norm
+        # Clamp gradient magnitude to prevent explosions
+        grad_q = grad_q.clamp(-100.0, 100.0)
+        grad_q = grad_q.to(q.dtype)
+        
+        # K gradient (includes temperature, float32 for stability)
+        k_f32 = k.float()
+        grad_k_f32 = grad_k_out.float()
+        k_norm_sq = (k_f32 * k_f32).sum(dim=-1, keepdim=True)
+        k_norm = k_norm_sq.sqrt().clamp(min=1e-6)
+        k_normalized = k_f32 / k_norm
+        
+        k_dot_grad = (k_normalized * grad_k_f32).sum(dim=-1, keepdim=True)
+        grad_k = scale * temperature * (grad_k_f32 - k_normalized * k_dot_grad) / k_norm
+        grad_k = grad_k.clamp(-100.0, 100.0)
+        grad_k = grad_k.to(k.dtype)
+        
+        return grad_q, grad_k, None, None
 
 
 @compiler_disable
@@ -427,8 +514,65 @@ def fused_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
         Output tensor [..., hidden_dim]
     """
     if USE_FUSED_SWIGLU and TRITON_AVAILABLE and gate.is_cuda:
-        return _fused_swiglu_triton(gate, up)
+        return FusedSwiGLUFunction.apply(gate, up)
     return _swiglu_pytorch(gate, up)
+
+
+class FusedSwiGLUFunction(torch.autograd.Function):
+    """Autograd-compatible wrapper for fused SwiGLU Triton kernel."""
+    
+    @staticmethod
+    def forward(ctx, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        """Forward pass using Triton kernel."""
+        orig_shape = gate.shape
+        gate_flat = gate.contiguous().view(-1)
+        up_flat = up.contiguous().view(-1)
+        out = torch.empty_like(gate_flat)
+        
+        n_elements = gate_flat.numel()
+        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        
+        _fused_swiglu_kernel[grid](gate_flat, up_flat, out, n_elements)
+        
+        # Save for backward
+        ctx.save_for_backward(gate, up)
+        ctx.orig_shape = orig_shape
+        
+        return out.view(orig_shape)
+    
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Backward pass computed in PyTorch (float32 for stability).
+        
+        Forward: out = silu(gate) * up = gate * sigmoid(gate) * up
+        
+        d_out/d_gate = up * (sigmoid(gate) + gate * sigmoid(gate) * (1 - sigmoid(gate)))
+                     = up * sigmoid(gate) * (1 + gate * (1 - sigmoid(gate)))
+        d_out/d_up = silu(gate)
+        """
+        gate, up = ctx.saved_tensors
+        
+        # Compute in float32 for stability
+        gate_f32 = gate.float()
+        up_f32 = up.float()
+        grad_out_f32 = grad_output.float()
+        
+        sigmoid_gate = torch.sigmoid(gate_f32)
+        silu_gate = gate_f32 * sigmoid_gate
+        
+        # Gradient w.r.t. gate
+        # d(silu)/d(gate) = sigmoid(gate) + gate * sigmoid(gate) * (1 - sigmoid(gate))
+        #                 = sigmoid(gate) * (1 + gate - gate * sigmoid(gate))
+        dsilu = sigmoid_gate * (1.0 + gate_f32 * (1.0 - sigmoid_gate))
+        grad_gate = grad_out_f32 * up_f32 * dsilu
+        # Clamp to prevent explosions
+        grad_gate = grad_gate.clamp(-100.0, 100.0).to(gate.dtype)
+        
+        # Gradient w.r.t. up
+        grad_up = grad_out_f32 * silu_gate
+        grad_up = grad_up.clamp(-100.0, 100.0).to(up.dtype)
+        
+        return grad_gate, grad_up
 
 
 @compiler_disable
@@ -524,8 +668,81 @@ def fused_rms_norm(
         Normalized tensor [..., dim]
     """
     if USE_FUSED_RMS_NORM and TRITON_AVAILABLE and x.is_cuda:
-        return _fused_rms_norm_triton(x, weight, eps)
+        return FusedRMSNormFunction.apply(x, weight, eps)
     return _rms_norm_pytorch(x, weight, eps)
+
+
+class FusedRMSNormFunction(torch.autograd.Function):
+    """Autograd-compatible wrapper for fused RMSNorm Triton kernel."""
+    
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+        """Forward pass using Triton kernel."""
+        orig_shape = x.shape
+        dim = orig_shape[-1]
+        x_flat = x.contiguous().view(-1, dim)
+        n_rows = x_flat.shape[0]
+        
+        out = torch.empty_like(x_flat)
+        weight = weight.contiguous()
+        
+        # Compute RMS for backward pass
+        x_float = x_flat.float()
+        rms_inv = torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + eps)
+        
+        grid = (n_rows,)
+        _fused_rms_norm_kernel[grid](
+            x_flat, weight, out, eps, dim, n_rows,
+        )
+        
+        # Save for backward
+        ctx.save_for_backward(x_flat, weight, rms_inv)
+        ctx.eps = eps
+        ctx.orig_shape = orig_shape
+        
+        return out.view(orig_shape)
+    
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Backward pass computed in PyTorch (Triton backward is complex).
+        
+        Forward: out = x * rsqrt(mean(x^2) + eps) * weight
+        
+        Computed in float32 for numerical stability with gradient clamping.
+        """
+        x, weight, rms_inv = ctx.saved_tensors
+        eps = ctx.eps
+        orig_shape = ctx.orig_shape
+        dim = x.shape[-1]
+
+        # grad_output may be non-contiguous (e.g., due to preceding transpose/view patterns).
+        # Use reshape to avoid RuntimeError and ensure correct flattening.
+        grad_output_flat = grad_output.reshape(-1, dim)
+        
+        # All computations in float32 for stability
+        x_f32 = x.float()
+        weight_f32 = weight.float()
+        grad_out_f32 = grad_output_flat.float()
+        rms_inv_f32 = rms_inv.float()
+        
+        # Gradient w.r.t. weight: sum over batch of (x * rms_inv * grad_output)
+        x_norm = x_f32 * rms_inv_f32
+        grad_weight = (x_norm * grad_out_f32).sum(dim=0)
+        # Clamp weight gradient
+        grad_weight = grad_weight.clamp(-100.0, 100.0).to(weight.dtype)
+        
+        # Gradient w.r.t. x
+        # d/dx [x * rsqrt(mean(x^2) + eps) * w]
+        # = w * rsqrt(...) - w * x * x * rsqrt(...)^3 / dim
+        # = w * rsqrt(...) * (1 - x^2 / (dim * (mean(x^2) + eps)))
+        grad_x = grad_out_f32 * weight_f32 * rms_inv_f32
+        # Correction term for the derivative of rsqrt
+        correction = (grad_out_f32 * weight_f32 * x_norm).mean(dim=-1, keepdim=True)
+        grad_x = grad_x - x_norm * correction
+        # Clamp gradient magnitude
+        grad_x = grad_x.clamp(-100.0, 100.0).to(x.dtype)
+        
+        return grad_x.view(orig_shape), grad_weight, None
 
 
 @compiler_disable
@@ -550,10 +767,269 @@ def _fused_rms_norm_triton(x: torch.Tensor, weight: torch.Tensor, eps: float) ->
 
 def _rms_norm_pytorch(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """PyTorch fallback for RMSNorm."""
+    # Prefer native PyTorch RMSNorm when available (fast + stable).
+    if hasattr(F, "rms_norm"):
+        return F.rms_norm(x, [x.shape[-1]], weight=weight, eps=eps)
+
     dtype = x.dtype
     x = x.float()
     rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
     return (x * rms).to(dtype) * weight
+
+
+# =============================================================================
+# 6. Chunked Cross-Entropy Loss
+# =============================================================================
+# This is a MAJOR memory optimization for language models.
+# Instead of materializing the full logits tensor (batch × seq × vocab_size),
+# we compute the loss in chunks, dramatically reducing peak memory usage.
+# 
+# For a 50K vocab with batch=16, seq=512:
+#   - Full logits: 16 × 512 × 50257 × 2 bytes = 819 MB (bf16)
+#   - Chunked (8 chunks): 16 × 64 × 50257 × 2 bytes = 102 MB per chunk
+#   - Peak memory reduction: ~8x
+#
+# This technique is used by Liger Kernel and other frontier training libraries.
+# =============================================================================
+
+USE_CHUNKED_CROSS_ENTROPY = True  # Enable by default for memory efficiency
+CROSS_ENTROPY_CHUNK_SIZE = 4096  # Process this many tokens at a time
+
+
+def chunked_cross_entropy(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    ignore_index: int = -100,
+    chunk_size: int = None,
+) -> torch.Tensor:
+    """Memory-efficient cross-entropy that avoids materializing full logits.
+    
+    Instead of computing all logits at once, we:
+    1. Split the sequence into chunks
+    2. Compute logits and loss for each chunk
+    3. Accumulate the total loss
+    
+    This reduces peak memory from O(batch × seq × vocab) to 
+    O(batch × chunk_size × vocab), which can be 4-8x smaller.
+    
+    Args:
+        hidden_states: [batch, seq, dim] - output of final norm layer
+        weight: [vocab_size, dim] - output projection weight (lm_head)
+        targets: [batch, seq] - target token ids
+        ignore_index: Index to ignore in loss computation (default: -100)
+        chunk_size: Number of tokens per chunk (default: CROSS_ENTROPY_CHUNK_SIZE)
+        
+    Returns:
+        Scalar cross-entropy loss
+    """
+    if chunk_size is None:
+        chunk_size = CROSS_ENTROPY_CHUNK_SIZE
+    
+    batch_size, seq_len, dim = hidden_states.shape
+    vocab_size = weight.shape[0]
+    
+    # Flatten batch and sequence dimensions
+    hidden_flat = hidden_states.view(-1, dim)  # [batch * seq, dim]
+    targets_flat = targets.view(-1)  # [batch * seq]
+    
+    total_tokens = hidden_flat.shape[0]
+    
+    # If sequence is small enough, just compute directly
+    if total_tokens <= chunk_size:
+        logits = F.linear(hidden_flat, weight)  # [batch * seq, vocab]
+        return F.cross_entropy(logits, targets_flat, ignore_index=ignore_index)
+    
+    # Compute loss in chunks
+    total_loss = 0.0
+    n_valid_tokens = 0
+    
+    for start_idx in range(0, total_tokens, chunk_size):
+        end_idx = min(start_idx + chunk_size, total_tokens)
+        
+        # Get chunk of hidden states and targets
+        hidden_chunk = hidden_flat[start_idx:end_idx]  # [chunk, dim]
+        target_chunk = targets_flat[start_idx:end_idx]  # [chunk]
+        
+        # Compute logits for this chunk only
+        logits_chunk = F.linear(hidden_chunk, weight)  # [chunk, vocab]
+        
+        # Count valid tokens in this chunk (not ignore_index)
+        valid_mask = target_chunk != ignore_index
+        n_valid_chunk = valid_mask.sum().item()
+        
+        if n_valid_chunk > 0:
+            # Compute loss for this chunk (reduction='sum' for proper averaging)
+            chunk_loss = F.cross_entropy(
+                logits_chunk, target_chunk, 
+                ignore_index=ignore_index,
+                reduction='sum'
+            )
+            total_loss = total_loss + chunk_loss
+            n_valid_tokens += n_valid_chunk
+    
+    # Average over all valid tokens
+    if n_valid_tokens > 0:
+        return total_loss / n_valid_tokens
+    else:
+        # No valid tokens - return zero loss
+        return torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+
+
+class ChunkedCrossEntropyFunction(torch.autograd.Function):
+    """Autograd function for chunked cross-entropy with fused backward.
+    
+    This is even more memory efficient as it recomputes logits during backward
+    instead of storing them, trading compute for memory.
+    """
+    
+    @staticmethod
+    def forward(
+        ctx, 
+        hidden_states: torch.Tensor, 
+        weight: torch.Tensor, 
+        targets: torch.Tensor,
+        ignore_index: int,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        batch_size, seq_len, dim = hidden_states.shape
+        
+        # Flatten for computation
+        hidden_flat = hidden_states.view(-1, dim)
+        targets_flat = targets.view(-1)
+        total_tokens = hidden_flat.shape[0]
+        
+        # Save for backward (recompute logits to save memory)
+        ctx.save_for_backward(hidden_states, weight, targets)
+        ctx.ignore_index = ignore_index
+        ctx.chunk_size = chunk_size
+        
+        # Compute loss in chunks
+        total_loss = 0.0
+        n_valid_tokens = 0
+        
+        for start_idx in range(0, total_tokens, chunk_size):
+            end_idx = min(start_idx + chunk_size, total_tokens)
+            hidden_chunk = hidden_flat[start_idx:end_idx]
+            target_chunk = targets_flat[start_idx:end_idx]
+            
+            logits_chunk = F.linear(hidden_chunk, weight)
+            valid_mask = target_chunk != ignore_index
+            n_valid_chunk = valid_mask.sum().item()
+            
+            if n_valid_chunk > 0:
+                chunk_loss = F.cross_entropy(
+                    logits_chunk, target_chunk,
+                    ignore_index=ignore_index,
+                    reduction='sum'
+                )
+                total_loss = total_loss + chunk_loss
+                n_valid_tokens += n_valid_chunk
+        
+        ctx.n_valid_tokens = n_valid_tokens
+        
+        if n_valid_tokens > 0:
+            return total_loss / n_valid_tokens
+        else:
+            return torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+    
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        hidden_states, weight, targets = ctx.saved_tensors
+        ignore_index = ctx.ignore_index
+        chunk_size = ctx.chunk_size
+        n_valid_tokens = ctx.n_valid_tokens
+        
+        if n_valid_tokens == 0:
+            return (
+                torch.zeros_like(hidden_states),
+                torch.zeros_like(weight),
+                None, None, None
+            )
+        
+        batch_size, seq_len, dim = hidden_states.shape
+        hidden_flat = hidden_states.view(-1, dim)
+        targets_flat = targets.view(-1)
+        total_tokens = hidden_flat.shape[0]
+        
+        # Accumulate gradients in chunks (use float32 for stability)
+        grad_hidden = torch.zeros_like(hidden_flat, dtype=torch.float32)
+        grad_weight = torch.zeros_like(weight, dtype=torch.float32)
+        
+        # Scale gradient by 1/n_valid_tokens (from mean reduction)
+        # Ensure scale is float32 for numerical stability
+        scale = grad_output.float() / n_valid_tokens
+        
+        for start_idx in range(0, total_tokens, chunk_size):
+            end_idx = min(start_idx + chunk_size, total_tokens)
+            hidden_chunk = hidden_flat[start_idx:end_idx].float()
+            target_chunk = targets_flat[start_idx:end_idx]
+            chunk_len = end_idx - start_idx
+            
+            # Recompute logits for this chunk (float32 for stability)
+            logits_chunk = F.linear(hidden_chunk, weight.float())
+            
+            # Compute softmax probabilities (float32)
+            probs = F.softmax(logits_chunk, dim=-1)
+            
+            # Gradient of cross-entropy w.r.t. logits: p - one_hot(y)
+            # VECTORIZED: avoid slow Python for-loop
+            grad_logits = probs.clone()
+            valid_mask = target_chunk != ignore_index
+            
+            # Create indices for scatter operation
+            # For valid tokens: subtract 1 from the probability at the target index
+            valid_indices = torch.where(valid_mask)[0]
+            if valid_indices.numel() > 0:
+                valid_targets = target_chunk[valid_indices]
+                # Vectorized subtraction: grad_logits[valid_indices, valid_targets] -= 1.0
+                grad_logits[valid_indices, valid_targets] -= 1.0
+            
+            # Zero out gradients for ignored tokens
+            invalid_indices = torch.where(~valid_mask)[0]
+            if invalid_indices.numel() > 0:
+                grad_logits[invalid_indices] = 0.0
+            
+            grad_logits = grad_logits * scale
+            
+            # Gradient w.r.t. hidden: grad_logits @ weight (float32)
+            grad_hidden[start_idx:end_idx] = grad_logits @ weight.float()
+            
+            # Gradient w.r.t. weight: grad_logits.T @ hidden (float32)
+            grad_weight += grad_logits.T @ hidden_chunk
+        
+        # Cast back to original dtype
+        return grad_hidden.view_as(hidden_states).to(hidden_states.dtype), grad_weight.to(weight.dtype), None, None, None
+
+
+def fused_chunked_cross_entropy(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    ignore_index: int = -100,
+    chunk_size: int = None,
+) -> torch.Tensor:
+    """Fused chunked cross-entropy with memory-efficient backward pass.
+    
+    This version uses an autograd function that recomputes logits during
+    backward, further reducing memory usage at the cost of extra compute.
+    
+    Args:
+        hidden_states: [batch, seq, dim] - output of final norm layer
+        weight: [vocab_size, dim] - output projection weight (lm_head)
+        targets: [batch, seq] - target token ids
+        ignore_index: Index to ignore in loss computation (default: -100)
+        chunk_size: Number of tokens per chunk (default: CROSS_ENTROPY_CHUNK_SIZE)
+        
+    Returns:
+        Scalar cross-entropy loss
+    """
+    if chunk_size is None:
+        chunk_size = CROSS_ENTROPY_CHUNK_SIZE
+    
+    return ChunkedCrossEntropyFunction.apply(
+        hidden_states, weight, targets, ignore_index, chunk_size
+    )
 
 
 # =============================================================================
@@ -636,12 +1112,16 @@ def benchmark_kernels(
     x = torch.randn(batch_size, n_heads, seq_len, head_dim, device=device, dtype=torch.float16)
     cos = torch.randn(1, 1, seq_len, head_dim // 2, device=device, dtype=torch.float16)
     sin = torch.randn(1, 1, seq_len, head_dim // 2, device=device, dtype=torch.float16)
-    
-    results["rope"] = _benchmark(
-        "RoPE",
-        lambda: _fused_rope_triton(x, cos, sin) if TRITON_AVAILABLE else None,
-        lambda: _rope_pytorch(x, cos, sin),
-    )
+
+    # Fused RoPE is opt-in only (it can be unsafe on some stacks).
+    if USE_FUSED_ROPE and TRITON_AVAILABLE:
+        results["rope"] = _benchmark(
+            "RoPE",
+            lambda: _fused_rope_triton(x, cos, sin),
+            lambda: _rope_pytorch(x, cos, sin),
+        )
+    else:
+        results["rope"] = {"skipped": True, "reason": "fused_rope disabled by default"}
     
     # QK Norm benchmark
     q = torch.randn(batch_size, n_heads, seq_len, head_dim, device=device, dtype=torch.float16)
