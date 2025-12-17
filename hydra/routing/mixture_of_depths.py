@@ -46,6 +46,9 @@ class MoDRouter(nn.Module):
 
     Scores each token and selects top-k for processing.
     Uses straight-through estimator for gradient flow.
+    
+    NOTE: k is computed statically from max_seq_len to avoid torch.compile
+    recompilation from data-dependent shapes.
     """
 
     def __init__(
@@ -54,6 +57,7 @@ class MoDRouter(nn.Module):
         capacity_ratio: float = 0.5,
         aux_loss_weight: float = 0.01,
         jitter_noise: float = 0.0,
+        max_seq_len: int = 2048,
     ):
         """
         Args:
@@ -61,12 +65,17 @@ class MoDRouter(nn.Module):
             capacity_ratio: Fraction of tokens to process (0.0-1.0)
             aux_loss_weight: Weight for load balancing loss
             jitter_noise: Noise for exploration during training
+            max_seq_len: Maximum sequence length (used to compute static k)
         """
         super().__init__()
         self.dim = dim
         self.capacity_ratio = capacity_ratio
         self.aux_loss_weight = aux_loss_weight
         self.jitter_noise = jitter_noise
+        # Static k computation for torch.compile compatibility
+        # This avoids recompilation from data-dependent k = int(L * capacity_ratio)
+        self.max_seq_len = max_seq_len
+        self.static_k = max(1, int(max_seq_len * capacity_ratio))
 
         # Simple linear router (cheap)
         self.router = nn.Linear(dim, 1, bias=True)
@@ -99,7 +108,9 @@ class MoDRouter(nn.Module):
             scores: Router scores if return_scores=True
         """
         B, L, D = x.shape
-        k = max(1, int(L * self.capacity_ratio))  # Number of tokens to process
+        # Use static k for torch.compile compatibility (no data-dependent shapes)
+        # Clamp to actual sequence length to handle shorter sequences
+        k = min(self.static_k, L)
 
         # Get router scores
         scores = self.router(x).squeeze(-1)  # [B, L]

@@ -475,22 +475,26 @@ class MoDMLPWrapper(nn.Module):
         capacity_ratio: float = 0.5,
         aux_loss_weight: float = 0.01,
         warmup_steps: int = 100,
+        max_seq_len: int = 2048,
     ):
         super().__init__()
         self.mlp = mlp
         self.capacity_ratio = capacity_ratio
         self.aux_loss_weight = aux_loss_weight
         self.warmup_steps = warmup_steps
+        self.max_seq_len = max_seq_len
         
         # Use tensor buffer for global_step to avoid torch.compile recompilation
         # (Dynamo treats Python int attributes as static, causing recompile storm)
         self.register_buffer("_global_step", torch.zeros((), dtype=torch.int64), persistent=False)
         
         # MoDRouter for token selection (gather/scatter pattern)
+        # max_seq_len enables static k computation for torch.compile compatibility
         self.mod_router = MoDRouter(
             dim=dim,
             capacity_ratio=capacity_ratio,
             aux_loss_weight=aux_loss_weight,
+            max_seq_len=max_seq_len,
         )
         assert isinstance(self.mod_router, MoDRouter), \
             f"mod_router must be MoDRouter, got {type(self.mod_router)}"
@@ -528,17 +532,14 @@ class MoDMLPWrapper(nn.Module):
             return self._forward_soft(x)
 
     def _forward_hard(self, x: torch.Tensor) -> torch.Tensor:
-        """Hard routing: gather top-k, MLP, scatter back."""
+        """Hard routing: gather top-k, MLP, scatter back.
+        
+        NOTE: No data-dependent branches (if k >= L, if k == 0) to ensure
+        torch.compile generates a single static graph.
+        """
         B, L, D = x.shape
         
         mask, indices, _ = self.mod_router(x)  # indices: [B, k]
-        k = indices.shape[1]
-        
-        # Early exit: all tokens or no tokens
-        if k >= L:
-            return self.mlp(x)
-        if k == 0:
-            return torch.zeros_like(x)
         
         # Sort indices ascending to maintain position monotonicity
         indices, _ = torch.sort(indices, dim=1)
@@ -558,7 +559,11 @@ class MoDMLPWrapper(nn.Module):
         return output
 
     def _forward_hard_with_ste(self, x: torch.Tensor) -> torch.Tensor:
-        """Hard routing with STE for gradient flow during training."""
+        """Hard routing with STE for gradient flow during training.
+        
+        NOTE: No data-dependent branches (if k >= L, if k == 0) to ensure
+        torch.compile generates a single static graph.
+        """
         B, L, D = x.shape
         self._tokens_total = L
         self._routing_mode = "hard"
@@ -571,14 +576,7 @@ class MoDMLPWrapper(nn.Module):
         # Store detached tensors for diagnostics (avoids .item() graph break)
         self._last_probs_mean_t = probs.mean().detach()
         self._last_probs_std_t = probs.std().detach()
-        
-        # Early exit
-        if k >= L:
-            self._tokens_processed = L
-            return self.mlp(x)
-        if k == 0:
-            self._tokens_processed = 0
-            return torch.zeros_like(x)
+        self._tokens_processed = k
         
         # Sort indices ascending to maintain position monotonicity
         indices, sort_order = torch.sort(indices, dim=1)
@@ -722,6 +720,7 @@ class CCGQABlockWithMoDMLP(nn.Module):
             capacity_ratio=mod_capacity_ratio,
             aux_loss_weight=mod_aux_loss_weight,
             warmup_steps=mod_warmup_steps,
+            max_seq_len=max_seq_len,
         )
 
     def set_global_step(self, step: int):
@@ -1012,6 +1011,7 @@ class CCGQAMoRBlock(nn.Module):
                 capacity_ratio=mod_mlp_capacity,
                 aux_loss_weight=mod_mlp_aux_weight,
                 warmup_steps=mod_mlp_warmup,
+                max_seq_len=max_seq_len,
             )
         else:
             self.mod_mlp_wrapper = None
@@ -1409,8 +1409,8 @@ class CCGQAMoRBlock(nn.Module):
         self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         if self.adaptive:
-            # GRAPH-STABLE TRANSITION: Always compute both paths to avoid torch.compile
-            # recompilation when transitioning. The router learns from step 0.
+            # GRAPH-STABLE TRANSITION: Compute both paths during rampup to avoid
+            # torch.compile recompilation when transitioning. Router learns from step 0.
             
             # Get rampup scale (0.0 before enable, 0.0-1.0 during rampup, 1.0 after)
             rampup_scale = self.get_mor_rampup_scale()
@@ -1418,14 +1418,15 @@ class CCGQAMoRBlock(nn.Module):
             # Always compute adaptive output (router trains from step 0)
             adaptive_output, _ = self.forward_fast_routing(x)
             
-            # Optimization: skip fixed computation when fully ramped
+            # OPTIMIZATION: Skip fixed path when rampup is complete (rampup_scale=1.0)
+            # This saves ~30% compute after MoR is fully enabled.
+            # The graph has already seen scale=1.0 at the final quantized rampup step,
+            # so this branch won't cause recompilation.
             if rampup_scale >= 1.0:
                 return adaptive_output
             
-            # Compute fixed output for blending
+            # During rampup (scale < 1.0): blend both paths for smooth transition
             fixed_output = self.forward_fixed(x)
-            
-            # Blend: rampup_scale=0 → 100% fixed, rampup_scale=1 → 100% adaptive
             return rampup_scale * adaptive_output + (1.0 - rampup_scale) * fixed_output
         return self.forward_fixed(x)
 
@@ -1438,11 +1439,9 @@ class CCGQAMoRBlock(nn.Module):
         - ponder_loss: MoR's compute cost (higher depth = more compute)
         - aux_loss: MoD's load balancing loss (if using MoD on MLP)
 
-        GRAPH-STABLE TRANSITION: Always compute both paths from step 0.
-        This ensures:
-        1. Router learns from the beginning (gets gradient signal)
-        2. No torch.compile graph changes at transition
-        3. Smooth blending when rampup_scale increases
+        GRAPH-STABLE TRANSITION: Compute both paths during rampup to avoid
+        torch.compile recompilation. Router learns from step 0.
+        After rampup (scale=1.0), skip fixed path for ~30% compute savings.
         """
         device = x.device
         
@@ -1457,24 +1456,26 @@ class CCGQAMoRBlock(nn.Module):
             # The router regularization component needs full strength to prevent collapse
             # The scalable components (ponder_cost, depth_dist) are already scaled internally
             
-            # Optimization: skip fixed computation when fully ramped
-            if rampup_scale >= 1.0:
-                output = adaptive_output
-            else:
-                # Compute fixed output for blending
-                fixed_output = self.forward_fixed(x)
-                # Blend: rampup_scale=0 → 100% fixed, rampup_scale=1 → 100% adaptive
-                output = rampup_scale * adaptive_output + (1.0 - rampup_scale) * fixed_output
-            
-            # Update cached loss for get_ponder_loss() consistency
-            if self.training:
-                self._ponder_loss = ponder_loss.detach()
-            
             # Collect aux_loss from MoD MLP wrapper if present
             if self.mod_mlp_wrapper is not None:
                 aux_loss = self.mod_mlp_wrapper.get_aux_loss()
             else:
                 aux_loss = torch.tensor(0.0, device=device)
+            
+            # OPTIMIZATION: Skip fixed path when rampup is complete (rampup_scale=1.0)
+            # This saves ~30% compute after MoR is fully enabled.
+            if rampup_scale >= 1.0:
+                if self.training:
+                    self._ponder_loss = ponder_loss.detach()
+                return adaptive_output, {"ponder_loss": ponder_loss, "aux_loss": aux_loss}
+            
+            # During rampup (scale < 1.0): blend both paths for smooth transition
+            fixed_output = self.forward_fixed(x)
+            output = rampup_scale * adaptive_output + (1.0 - rampup_scale) * fixed_output
+            
+            # Update cached loss for get_ponder_loss() consistency
+            if self.training:
+                self._ponder_loss = ponder_loss.detach()
             
             return output, {"ponder_loss": ponder_loss, "aux_loss": aux_loss}
         else:

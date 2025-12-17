@@ -66,10 +66,16 @@ torch.backends.cudnn.allow_tf32 = True  # TF32 for cuDNN ops
 torch.set_float32_matmul_precision('high')  # Use TF32 for matmuls (faster on Ampere+)
 
 # ============================================
-# Fix torch.compile recompilation storm for step counters
-# Dynamo treats module integer attributes as static; this allows them to vary
+# Fix torch.compile recompilation storm
 # ============================================
+# Dynamo treats module integer attributes as static; this allows them to vary
 torch._dynamo.config.allow_unspec_int_on_nn_module = True
+# Hybrid attention uses MQA/CCGQA/MLA per-layer - each has different type
+# Increase cache limit to accommodate the 8 macro-blocks × 3 attention types
+torch._dynamo.config.cache_size_limit = 64
+# Increase per-function recompile limit (default=8 is too low for polymorphic layers)
+# This allows each function to have more specialized versions before falling back
+torch._dynamo.config.recompile_limit = 32
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
