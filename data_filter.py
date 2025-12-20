@@ -23,9 +23,8 @@ Usage:
 import re
 import hashlib
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, Set, Iterator, Dict, Any
+from typing import Optional, List, Tuple, Set, Dict, Any
 from collections import Counter
-import unicodedata
 from pathlib import Path
 
 
@@ -133,7 +132,7 @@ class TextQualityFilter:
                 return False, f"word_repetition:{most_common_ratio:.2f}"
         
         # Line repetition check
-        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
         if len(lines) > 3:
             line_counts = Counter(lines)
             dup_lines = sum(c - 1 for c in line_counts.values() if c > 1)
@@ -407,11 +406,11 @@ def filter_dataset_streaming(
     
     # Summary
     if verbose:
-        print(f"\n=== Filtering Complete ===")
+        print("\n=== Filtering Complete ===")
         print(f"Total processed: {stats['total']:,}")
         print(f"Passed: {stats['passed']:,} ({stats['passed']/stats['total']*100:.1f}%)")
         print(f"Duplicates removed: {stats['duplicates']:,}")
-        print(f"\nRejection reasons:")
+        print("\nRejection reasons:")
         for reason, count in stats["rejected"].most_common(10):
             print(f"  {reason}: {count:,}")
     
@@ -830,7 +829,7 @@ def create_educational_filter(
     # Print stats
     import numpy as np
     scores = np.array(stats["scores"])
-    print(f"\n=== Educational Filter Stats ===")
+    print("\n=== Educational Filter Stats ===")
     print(f"Total: {stats['total']:,}")
     print(f"Passed (score >= {min_score}): {stats['passed']:,} ({stats['passed']/stats['total']*100:.1f}%)")
     print(f"Score distribution: mean={scores.mean():.2f}, std={scores.std():.2f}")
@@ -882,7 +881,7 @@ Examples:
     
     # Datatrove options
     parser.add_argument("--skip-dedup", action="store_true",
-                        help="Skip deduplication stage (faster)")
+                        help="Skip datatrove deduplication stage (faster, only affects --use-datatrove mode)")
     parser.add_argument("--edu-filter", action="store_true",
                         help="Apply educational quality filter")
     parser.add_argument("--edu-threshold", type=float, default=3.0,
@@ -894,7 +893,8 @@ Examples:
     parser.add_argument("--min-length", type=int, default=50)
     parser.add_argument("--min-words", type=int, default=10)
     parser.add_argument("--min-alpha", type=float, default=0.60)
-    parser.add_argument("--no-dedup", action="store_true", help="Disable deduplication")
+    parser.add_argument("--no-dedup", action="store_true", 
+                        help="Disable built-in deduplication (only affects non-datatrove mode, sets FilterConfig.enable_dedup=False)")
     
     args = parser.parse_args()
     

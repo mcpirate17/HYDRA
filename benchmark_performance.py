@@ -60,6 +60,16 @@ def get_gpu_memory_stats() -> Dict[str, float]:
     }
 
 
+# Model size presets (must match trainer.py)
+MODEL_SIZE_PRESETS = {
+    "100M": {"dim": 768, "n_mor_blocks": 3, "n_heads": 12, "n_kv_heads": 3, "recursions": 4},
+    "500M": {"dim": 1280, "n_mor_blocks": 8, "n_heads": 20, "n_kv_heads": 5, "recursions": 3},
+    "750M": {"dim": 1792, "n_mor_blocks": 16, "n_heads": 28, "n_kv_heads": 4, "recursions": 4},
+    "900M": {"dim": 2048, "n_mor_blocks": 12, "n_heads": 32, "n_kv_heads": 4, "recursions": 4},
+    "1B": {"dim": 2048, "n_mor_blocks": 20, "n_heads": 32, "n_kv_heads": 4, "recursions": 4},
+}
+
+
 def reset_memory_stats():
     """Reset GPU memory statistics."""
     if torch.cuda.is_available():
@@ -72,35 +82,36 @@ def create_model(
     device: torch.device,
     vocab_size: int = 50257,
     max_seq_len: int = 512,
-    dim: int = 1280,
-    n_layers: int = 8,
-    n_heads: int = 20,
-    n_kv_heads: int = 5,
-    mor_recursions: int = 3,
+    model_size: str = "500M",
     mod_capacity: float = 0.5,
     use_compile: bool = True,
     aggressive: bool = False,
     no_grad_checkpoint: bool = False,
 ) -> nn.Module:
     """Create HYDRA model for benchmarking."""
-    
-    use_checkpointing = not no_grad_checkpoint
+    # Default attention pattern (per MoR block): 3:1 macro-block [LLA2, LLA2, LLA2, CCQA].
+    # Keep this CUDA-only: LLA2 requires the external lightning-attention CUDA kernels.
+    if device.type == "cuda":
+        os.environ.setdefault("HYDRA_MOR_ATTENTION_PATTERN_NAME", "lla2x3+ccqa")
+
+    preset = MODEL_SIZE_PRESETS[model_size]
+    dim = preset["dim"]
+    n_mor_blocks = preset["n_mor_blocks"]
+    n_heads = preset["n_heads"]
+    n_kv_heads = preset["n_kv_heads"]
+    recursions_per_block = preset["recursions"]
     
     model = CCGQAMoDMoRModel(
         vocab_size=vocab_size,
         dim=dim,
-        n_layers=n_layers,
+        n_mor_blocks=n_mor_blocks,
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
         max_seq_len=max_seq_len,
-        ff_mult=4.0,
-        dropout=0.0,
-        capacity_ratio=mod_capacity,
-        mor_recursions=mor_recursions,
-        mor_adaptive=True,
-        mor_threshold=0.1,
-        use_gradient_checkpointing=use_checkpointing,
-        checkpoint_every_n=2,
+        mlp_ratio=4.0,
+        mod_capacity=mod_capacity,
+        recursions_per_block=recursions_per_block,
+        adaptive=True,
     )
     
     model = model.to(device)
@@ -183,6 +194,7 @@ def run_benchmark(
     device_str: str = "cuda",
     aggressive: bool = False,
     no_grad_checkpoint: bool = False,
+    model_size: str = "500M",
 ) -> Dict:
     """Run benchmark and return results."""
     
@@ -215,6 +227,7 @@ def run_benchmark(
     
     tokens_per_step = batch_size * grad_accum_steps * seq_len
     print(f"\nConfiguration:")
+    print(f"  Model size:        {model_size}")
     print(f"  Batch size:        {batch_size}")
     print(f"  Sequence length:   {seq_len}")
     print(f"  Grad accum steps:  {grad_accum_steps}")
@@ -230,7 +243,7 @@ def run_benchmark(
     
     # Create model
     print("\nCreating model...")
-    model = create_model(device=device, vocab_size=vocab_size, max_seq_len=seq_len, use_compile=use_compile, aggressive=aggressive, no_grad_checkpoint=no_grad_checkpoint)
+    model = create_model(device=device, vocab_size=vocab_size, max_seq_len=seq_len, model_size=model_size, use_compile=use_compile, aggressive=aggressive, no_grad_checkpoint=no_grad_checkpoint)
     
     # Count parameters
     n_params = sum(p.numel() for p in model.parameters())
@@ -443,6 +456,8 @@ def main():
     parser.add_argument("--use-8bit", action="store_true", help="Use 8-bit AdamW optimizer")
     parser.add_argument("--aggressive", action="store_true", help="Use aggressive torch.compile optimizations")
     parser.add_argument("--no-grad-checkpoint", action="store_true", help="Disable gradient checkpointing (faster but uses more memory)")
+    parser.add_argument("--model-size", type=str, default="500M", choices=["100M", "500M", "750M", "900M", "1B"],
+                        help="Model size preset (default: 500M)")
     parser.add_argument("--save", type=str, help="Save results to JSON file")
     
     args = parser.parse_args()
@@ -457,6 +472,7 @@ def main():
         use_8bit=args.use_8bit,
         aggressive=args.aggressive,
         no_grad_checkpoint=args.no_grad_checkpoint,
+        model_size=args.model_size,
     )
     
     if args.save:

@@ -28,24 +28,35 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
+from typing import Optional, Tuple, Union
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 # =============================================================================
-# VALIDATION: MoDRouter is imported from mixture_of_depths.py
-# This is the REAL MoD implementation with gather/scatter compute-skipping.
-# DO NOT replace with soft gating or custom router.
+# VALIDATION: Routing modules imported from hydra.routing
+# MoD: gather/scatter compute-skipping for token selection
+# MoR: Mixture-of-Recursions for adaptive depth per token
 # =============================================================================
 from hydra.routing.mixture_of_depths import MoDRouter
+from hydra.routing.mixture_of_recursions import (
+    MoRConfig,
+    MoRRouter,
+    MoRExecutor,
+    dim_to_depth_scale,
+)
+from hydra.routing.loss_tracker import MovingAverageBaseline
 
 # =============================================================================
-# HYBRID ATTENTION: Import MQA, MLA for hybrid pattern
-# Pattern: MQA → MQA → CCGQA → CCGQA → CCGQA → MLA → MQA → MLA
+# Optional attention variants (locked to LLA2 only).
+# CCQA is implemented in this file as `CCGQAAttention`.
 # =============================================================================
-from hydra.model.hybrid_attention import AttentionType, MQAAttention, MLAAttention
+from hydra.model.hybrid_attention_variants import (
+    build_hybrid_attention_module,
+    resolve_hybrid_attention_choice,
+)
 
-# Validate MoDRouter import at module load time
-assert hasattr(MoDRouter, 'forward'), "MoDRouter must have forward method"
-assert hasattr(MoDRouter, 'get_aux_loss'), "MoDRouter must have get_aux_loss method"
+# Import shared layers from hydra.layers (canonical implementations)
+from hydra.layers import RMSNorm, SwiGLUMLPFused as SwiGLUMLP
 
 # Import fused kernels for optimized operations (fused_rope used in CCGQAAttention._apply_rope)
 try:
@@ -55,10 +66,9 @@ except ImportError:
     FUSED_KERNELS_AVAILABLE = False
     fused_rope = None
 
-# Import shared layers from hydra.layers (canonical implementations)
-from hydra.layers import RMSNorm, SwiGLUMLPFused as SwiGLUMLP
-
-from typing import Optional, Tuple, Union
+# Validate MoDRouter import at module load time
+assert hasattr(MoDRouter, 'forward'), "MoDRouter must have forward method"
+assert hasattr(MoDRouter, 'get_aux_loss'), "MoDRouter must have get_aux_loss method"
 
 
 class CCGQAAttention(nn.Module):
@@ -919,9 +929,7 @@ class CCGQAMoRBlock(nn.Module):
     1. Attention NEEDS full context - token i must attend to all j <= i
     2. MLP is position-independent - each token's MLP is independent
     
-    Layer-aware depth targeting:
-        - Early layers target shallower depths
-        - Late layers target deeper depths for more compute
+    Uses MoRRouter and MoRExecutor from hydra.routing.mixture_of_recursions.
     """
 
     def __init__(
@@ -938,7 +946,11 @@ class CCGQAMoRBlock(nn.Module):
         ponder_loss_weight: float = 0.01,
         layer_idx: int = 0,
         total_layers: int = 1,
-        attention_type: AttentionType = AttentionType.CCQA,  # Hybrid attention type
+        attention_type: str = "lla2",  # Set by parent based on layer_idx % 4
+        # Dimension-aware depth scaling (optional, backward compatible)
+        dim_ref: int = 768,
+        depth_alpha: float = 0.0,  # 0.0 = disabled (default), 0.25-0.5 = enabled
+        depth_scale_max: float = 2.0,
         **attention_kwargs,
     ):
         super().__init__()
@@ -949,13 +961,10 @@ class CCGQAMoRBlock(nn.Module):
         self.total_layers = total_layers
         self.dim = dim
         self.attention_type = attention_type
-
-        # =====================================================================
-        # OPTION A ARCHITECTURE: Separate attention (dense) from MLP (recursive)
-        # - Attention runs ONCE on full sequence
-        # - MLP can run multiple times with adaptive halting
-        # =====================================================================
         
+        # Compute depth scale once at init (compile-safe: build-time constant)
+        self._depth_scale = dim_to_depth_scale(dim, dim_ref, depth_alpha, depth_scale_max)
+
         # Pop MoD params (they apply to MLP only, handled separately)
         mod_mlp_capacity = attention_kwargs.pop("mod_mlp_capacity", None)
         mod_mlp_aux_weight = attention_kwargs.pop("mod_mlp_aux_weight", 0.01)
@@ -963,29 +972,20 @@ class CCGQAMoRBlock(nn.Module):
         self.use_mod_mlp = mod_mlp_capacity is not None and mod_mlp_capacity > 0
         
         # =====================================================================
-        # HYBRID ATTENTION: MQA → CCGQA → MLA pattern
-        # - MQA: Cheap local extraction (first layers, skip paths)
-        # - CCGQA: Compressed global mixer (middle layers)
-        # - MLA: Latent-space summarizer (late layers)
+        # Attention: 3×LLA2 + 1×CCGQA pattern (determined by attention_type param)
         # =====================================================================
-        if attention_type == AttentionType.MQA:
-            self.attention = MQAAttention(
+        if attention_type == "lla2":
+            resolved = resolve_hybrid_attention_choice("lla2", default="lla2")
+            self.attention = build_hybrid_attention_module(
+                resolved,
                 dim=dim,
                 n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
                 max_seq_len=max_seq_len,
-                use_rope=attention_kwargs.get("use_rope", True),
+                attention_kwargs=attention_kwargs,
             )
-            self.residual_scale = 1.0  # Full residual for MQA
-        elif attention_type == AttentionType.MLA:
-            self.attention = MLAAttention(
-                dim=dim,
-                n_heads=n_heads,
-                max_seq_len=max_seq_len,
-                use_rope=attention_kwargs.get("use_rope", True),
-                latent_ratio=attention_kwargs.get("latent_ratio", 0.5),
-            )
-            self.residual_scale = 0.5  # Reduced for stability
-        else:  # CCGQA (default)
+            self.residual_scale = 0.5
+        else:  # ccgqa
             self.attention = CCGQAAttention(
                 dim=dim,
                 n_heads=n_heads,
@@ -994,16 +994,24 @@ class CCGQAMoRBlock(nn.Module):
                 max_seq_len=max_seq_len,
                 **attention_kwargs,
             )
-            self.residual_scale = 0.5  # Reduced for MoR stability
-        self.norm1 = RMSNorm(dim)  # Pre-attention norm
+            self.residual_scale = 0.5
+
+        # Norm selection
+        use_ada_norm = os.environ.get("HYDRA_USE_ADA_RMSNORM", "1") == "1"
+        if use_ada_norm:
+            from hydra.layers import AdaRMSNorm as _Norm
+        else:
+            from hydra.layers import RMSNorm as _Norm
+
+        self.norm1 = _Norm(dim)  # Pre-attention norm
         
-        # MLP: Can run multiple times with adaptive halting (recursive)
+        # MLP
         hidden_dim = int(dim * mlp_ratio)
         hidden_dim = ((hidden_dim + 255) // 256) * 256
         self.mlp = SwiGLUMLP(dim, hidden_dim)
-        self.norm2 = RMSNorm(dim)  # Pre-MLP norm
+        self.norm2 = _Norm(dim)  # Pre-MLP norm
         
-        # Optional MoD on MLP (applied within recursions)
+        # Optional MoD on MLP
         if self.use_mod_mlp:
             self.mod_mlp_wrapper = MoDMLPWrapper(
                 mlp=self.mlp,
@@ -1016,98 +1024,53 @@ class CCGQAMoRBlock(nn.Module):
         else:
             self.mod_mlp_wrapper = None
         
-        # Keep self.block for backward compatibility (points to a simple wrapper)
-        # This is used by some diagnostics that expect .block attribute
-        self.block = self._create_block_wrapper()
+        # Backward compatibility
+        self.block = None
 
-        # Recursion-specific biases (cheap way to differentiate MLP passes)
-        self.recursion_bias = nn.Parameter(
-            torch.zeros(max_recursions, 1, 1, dim) * 0.02
+        # =====================================================================
+        # MoR Router and Executor (from hydra.routing.mixture_of_recursions)
+        # =====================================================================
+        mor_config = MoRConfig(
+            dim=dim,
+            n_recursions=max_recursions,
+            ponder_loss_weight=ponder_loss_weight,
+            warmup_steps=2500,
+            layer_idx=layer_idx,
+            total_layers=total_layers,
+            dim_ref=dim_ref,
+            depth_alpha=depth_alpha,
+            depth_scale_max=depth_scale_max,
         )
-        self.recursion_embed = nn.Embedding(max_recursions, dim)
-        nn.init.normal_(self.recursion_embed.weight, std=0.02)
+        self.mor_router = MoRRouter(mor_config)
+        self.mor_executor = MoRExecutor(mor_config)
+        
+        # Store config for diagnostics
+        self._mor_config = mor_config
+        self.ponder_loss_weight = ponder_loss_weight
 
-        # Adaptive halting predictor
+        # Legacy adaptive halting predictor (for backward compat)
         if adaptive:
             self.halt_threshold = halt_threshold
-            self.ponder_loss_weight = ponder_loss_weight
             self.halt_predictor = nn.Sequential(
                 nn.Linear(dim, dim // 4),
                 nn.GELU(),
                 nn.Linear(dim // 4, 1),
             )
 
-        # Expert-choice routing (MoR paper arXiv:2507.10524)
-        # Linear router with sigmoid activation - predicts which tokens to recurse
-        # NOTE: Using bias=True and initializing to target deeper recursions
-        # Without this, sigmoid(0)=0.5 -> depth=1.5 which is too shallow
-        self.router = nn.Linear(dim, 1, bias=True)
-        # Initialize router:
-        # - Small non-zero weights so router can differentiate tokens
-        # - Bias set to match geometric target distribution (prefer shallow depths)
-        nn.init.normal_(self.router.weight, mean=0.0, std=0.02)
-
-        # Router bias initialization (LAYER-AWARE):
-        # Per MoR paper - early layers process more shallowly, later layers more deeply
-        # This provides a natural curriculum: early = refine, late = complex reasoning
-        # layer_ratio: 0.0 for first layer, 1.0 for last layer
-        layer_ratio = self.layer_idx / max(1, self.total_layers - 1)
-        
-        # Target probability: 0.2 for early layers, 0.5 for late layers
-        # This means: early layers → most tokens exit quickly (shallow)
-        #            late layers → more tokens go deeper
-        target_prob = 0.2 + 0.3 * layer_ratio  # 0.2 to 0.5
-
-        self.target_depth_ratio = target_prob  # Store for logging
-        bias_value = torch.log(
-            torch.tensor(target_prob / (1 - target_prob + 1e-8))
-        ).item()  # logit
-        nn.init.constant_(self.router.bias, bias_value)
-        
-        # Global step for warmup scheduling (set externally by training loop)
-        # Use tensor buffer to avoid torch.compile recompilation storm
+        # Global step for warmup scheduling
         self.register_buffer("_global_step", torch.zeros((), dtype=torch.int64), persistent=False)
-        self._warmup_steps = 500  # Fast warmup for per-layer constraints
-        
-        # MoR CURRICULUM: Step at which adaptive routing enables
-        # Before this step, use fixed-depth (all tokens through all recursions)
-        # This allows the base model to learn before adding routing complexity
-        # Set via set_mor_enable_step() from training loop
-        # SOFT TRANSITION: During rampup, outputs are blended to prevent loss spike
-        self._mor_enable_step = 0  # 0 = always enabled (legacy behavior)
-        self._mor_rampup_steps = 5000  # INCREASED: Longer rampup with soft blending
-        
-        # Per-layer depth distribution weight
-        # Must be strong enough to overcome sigmoid saturation (grad ≈ 0.045 at prob=0.047)
-        self.layer_dist_weight = 0.50  # Increased 5x to fight router saturation
-
-        # Capacity schedule: what fraction of tokens to keep at each recursion
-        # Paper uses hierarchical filtering - fewer tokens at deeper recursions
-        # E.g. [0.8, 0.6, 0.4, 0.3] means 80% at r=0, 60% of those at r=1, etc.
-        default_capacities = [max(0.25, 1.0 - 0.15 * i) for i in range(max_recursions)]
-        self.register_buffer(
-            "capacity_schedule",
-            torch.tensor(default_capacities, dtype=torch.float32),
-            persistent=False,
-        )
-        self.aux_loss_coef = 0.001  # From paper Table 3
+        self._warmup_steps = 2500
+        self._mor_enable_step = 0
+        self._mor_rampup_steps = 0
 
         self.final_norm = RMSNorm(dim)
-        # Use regular attributes instead of buffers to avoid CUDAGraph issues
         self._ponder_loss: torch.Tensor = torch.tensor(0.0)
         self._avg_ponder_time: torch.Tensor = torch.tensor(0.0)
 
-        # Debug stats for routing analysis
+        # Debug stats
         self._last_target_depths: Optional[torch.Tensor] = None
         self._last_router_probs_mean: float = 0.0
         self._last_router_probs_std: float = 0.0
-
-        # Pre-compute recursion indices to avoid creating tensors every forward pass
-        self.register_buffer(
-            "_recursion_indices",
-            torch.arange(max_recursions, dtype=torch.long),
-            persistent=False,
-        )
 
     def _create_block_wrapper(self):
         """Create a simple wrapper for backward compatibility with .block attribute.
@@ -1123,15 +1086,17 @@ class CCGQAMoRBlock(nn.Module):
         """Fixed recursion mode - attention once, then all MLP recursions.
         
         OPTION A: Attention is dense (full sequence), MLP is recursive.
+        Uses mor_executor's recursion_bias/embed for consistency.
         """
         # ATTENTION: Runs ONCE on full sequence (dense)
-        # Use residual_scale: 1.0 for MQA, 0.5 for CCQA/MLA
         h = x + self.residual_scale * self.attention(self.norm1(x))
         
-        # MLP RECURSIONS: Run max_recursions times
+        # MLP RECURSIONS: Run max_recursions times (all tokens, all depths)
         for i in range(self.max_recursions):
-            rec_bias = self.recursion_bias[i].squeeze()
-            rec_embed = self.recursion_embed(self._recursion_indices[i : i + 1]).squeeze()
+            rec_bias = self.mor_executor.recursion_bias[i].squeeze()
+            rec_embed = self.mor_executor.recursion_embed(
+                self.mor_executor._recursion_indices[i:i+1]
+            ).squeeze()
             h_with_rec = h + rec_bias + rec_embed
             
             # Apply MLP (with optional MoD)
@@ -1145,198 +1110,90 @@ class CCGQAMoRBlock(nn.Module):
     def forward_fast_routing(
         self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """OPTION A: Mixture-of-Recursions on MLP only (OPTIMIZED).
+        """MoR forward pass using MoRRouter and MoRExecutor.
         
         Architecture:
         1. ATTENTION runs ONCE on full sequence (dense, all tokens)
-        2. MLP recursions with per-token adaptive halting (sparse)
-        3. Tokens can exit early from MLP recursions
-        
-        Performance optimizations:
-        - No unnecessary tensor clones (h is mutated in-place for MLP recursions)
-        - Fully vectorized exit logic (no nonzero() token packing)
-        - BF16/FP16 friendly (preserves input dtype throughout)
-        - torch.compile friendly (no Python .item() in hot path)
+        2. MoRRouter predicts per-token depth
+        3. MoRExecutor applies MLP recursions with depth routing
         """
-        B, L, D = x.shape
-        device = x.device
-        dtype = x.dtype  # Preserve dtype for BF16/FP16
-        
         # =====================================================================
         # STEP 1: ATTENTION (ONCE, DENSE)
-        # Use residual_scale: 1.0 for MQA, 0.5 for CCQA/MLA
         # =====================================================================
         h = x + self.residual_scale * self.attention(self.norm1(x))  # [B, L, D]
         
         # =====================================================================
-        # STEP 2: ROUTER - Predict per-token MLP recursion depth
+        # STEP 2: MoR ROUTER - Predict per-token MLP recursion depth
         # =====================================================================
-        router_logits = self.router(h).squeeze(-1)  # [B, L]
+        depths, probs, logits = self.mor_router(h)
         
-        # SOFT clamp: tanh scaling preserves gradients at boundaries
-        router_logits = torch.tanh(router_logits / 2.0) * 3.0
-        router_probs = torch.sigmoid(router_logits)  # [B, L] in [0, 1]
-        
-        # Map to continuous target depth [0, max_recursions-1]
-        target_depth_soft = router_probs * (self.max_recursions - 1)  # [B, L]
-        
-        # DISCRETE depth assignment with straight-through estimator
-        target_depth_discrete = torch.round(target_depth_soft).long()  # [B, L]
-        target_depth_discrete = torch.clamp(target_depth_discrete, 0, self.max_recursions - 1)
-        
-        # Store for diagnostics (outside hot path - store tensor, not scalar)
-        self._last_target_depths = target_depth_discrete.detach()
-        self._last_router_probs_tensor = router_probs.detach()
-        
-        # Find max depth needed in this batch (for efficiency)
-        # Use torch.max to keep on GPU (compile-friendly)
-        max_depth_needed = target_depth_discrete.max() + 1
+        # Store for diagnostics and later advantage computation
+        self._last_target_depths = depths.detach().float()
+        self._last_router_probs_tensor = probs.detach()
+        self._last_router_logits = logits  # Keep with grad for advantage loss
+        self._last_depths = depths
+        self._last_probs = probs
         
         # =====================================================================
-        # STEP 3: MLP RECURSIONS (FULLY VECTORIZED - NO nonzero() LOOPS)
-        # All tokens compute all recursions, but outputs are masked.
-        # This is faster on GPU than sparse token packing for moderate sequences.
+        # STEP 3: MoR EXECUTOR - Apply MLP recursions with depth routing
         # =====================================================================
+        # Choose MLP (with optional MoD wrapper)
+        mlp = self.mod_mlp_wrapper if self.mod_mlp_wrapper is not None else self.mlp
         
-        # Pre-compute exit masks for each depth: [max_recursions, B, L]
-        # Token exits at depth i means it completes recursion i and stops
-        depth_indices = torch.arange(self.max_recursions, device=device)
-        exit_at_depth = (target_depth_discrete.unsqueeze(0) == depth_indices.view(-1, 1, 1))  # [R, B, L]
-        
-        # Pre-compute cumulative "still processing" mask: token is active at depth i
-        # if its target_depth >= i. Active at depth 0 = all tokens.
-        # active_at_depth[i] = (target_depth >= i) for i in 0..R-1
-        active_at_depth = (target_depth_discrete.unsqueeze(0) >= depth_indices.view(-1, 1, 1))  # [R, B, L]
-        
-        # Pre-compute STE weights: exp(-((target_soft - depth_index)^2))
-        # Only significant for tokens exiting at that depth
-        depth_indices_f = depth_indices.to(dtype)  # [R]
-        ste_weights = torch.exp(-((target_depth_soft.unsqueeze(0) - depth_indices_f.view(-1, 1, 1)) ** 2))  # [R, B, L]
-        
-        # Initialize output accumulator and current state
-        output = torch.zeros_like(h)  # [B, L, D]
-        current = h  # No clone needed - we accumulate into output, don't modify h
-        
-        # Track tokens processed per depth for diagnostics
-        if self.training:
-            self._recursion_tokens_processed = []
-        
-        for i in range(self.max_recursions):
-            # Early exit: if max depth in batch < i, we're done
-            if i >= max_depth_needed:
-                break
-            
-            # Get masks for this depth (already computed, no Python conditionals)
-            active_mask = active_at_depth[i].unsqueeze(-1).to(dtype)  # [B, L, 1]
-            exit_mask = exit_at_depth[i].unsqueeze(-1).to(dtype)  # [B, L, 1]
-            ste_weight_i = ste_weights[i].unsqueeze(-1)  # [B, L, 1]
-            
-            # Track for diagnostics (only if training) - store tensor, not scalar
-            if self.training:
-                self._recursion_tokens_processed.append(active_at_depth[i].sum().detach())
-            
-            # Add recursion embeddings
-            rec_bias = self.recursion_bias[i].squeeze()  # [D]
-            rec_embed = self.recursion_embed(self._recursion_indices[i : i + 1]).squeeze()  # [D]
-            h_with_rec = current + rec_bias + rec_embed
-            
-            # MLP pass (with optional MoD)
-            if self.mod_mlp_wrapper is not None:
-                mlp_delta = self.mod_mlp_wrapper(self.norm2(h_with_rec))
-            else:
-                mlp_delta = self.mlp(self.norm2(h_with_rec))
-            
-            # Update current state (masked - only active tokens evolve)
-            current = current + mlp_delta * active_mask
-            
-            # Accumulate output for exiting tokens with STE gradient path
-            # STE: forward uses 1.0, backward flows through ste_weight
-            ste_grad = ste_weight_i - ste_weight_i.detach()  # Zero forward, gradient backward
-            weighted_exit = (1.0 + ste_grad) * current * exit_mask
-            output = output + weighted_exit
+        output = self.mor_executor(h, depths, probs, mlp, self.norm2)
         
         # =====================================================================
-        # STEP 4: COMPUTE PONDER LOSS (from router/depth decisions)
+        # STEP 4: COMPUTE PONDER LOSS (use mor_router's method)
         # =====================================================================
-        
-        # Depth distribution loss - encourage spread across depths
-        flat_depths = target_depth_soft.flatten()
-        sigma = 1.0
-        depth_bins = torch.arange(self.max_recursions, device=device, dtype=dtype)
-        diff_sq = (depth_bins.unsqueeze(1) - flat_depths.unsqueeze(0)) ** 2
-        hist_l = torch.exp(-diff_sq / (2 * sigma ** 2)).mean(dim=1)
-        hist_l = hist_l / (hist_l.sum() + 1e-8)
-        
-        # Target: geometric distribution (prefer shallow)
-        decay_rate = 0.5
-        weights = decay_rate ** depth_bins
-        target_l = weights / weights.sum()
-        depth_dist_loss_l = F.mse_loss(hist_l, target_l)
-        
-        # Ponder cost: weak penalty for compute (use constant divisor)
-        avg_depth = target_depth_soft.mean()
-        depth_divisor = float(max(1, self.max_recursions - 1))
-        ponder_cost = avg_depth / depth_divisor
-        
-        # Router regularization (avoid creating scalar tensors in loop)
-        # Pre-register target_logit as buffer for compile-friendliness
-        router_mean = router_logits.mean()
-        logit_mean_loss = (router_mean - (-1.1)) ** 2  # Inline MSE
-        logit_var_loss = F.relu(1.0 - router_logits.var())
-        router_variance = router_probs.var()
-        router_entropy_loss = torch.exp(-router_variance * 10.0)
-        
-        # Clamp individual loss components to prevent explosion
-        # These are regularization losses - they shouldn't dominate training
-        logit_mean_loss = torch.clamp(logit_mean_loss, max=10.0)
-        logit_var_loss = torch.clamp(logit_var_loss, max=1.0)
-        
-        # SEPARATE router regularization (ALWAYS full strength) from scalable losses
-        # This prevents router collapse during MoR rampup transition
-        # Router regularization: keeps routers from collapsing to 0/1
-        router_reg_loss = (
-            0.02 * router_entropy_loss +
-            0.5 * logit_mean_loss +
-            2.0 * logit_var_loss
+        # Base ponder loss without advantage (advantage added post-CE in model)
+        ponder_loss = self.mor_router.compute_ponder_loss(
+            depths, probs, logits,
+            token_losses=None,  # No CE losses yet
+            baseline=None,
         )
         
-        # Scalable losses: ponder cost and depth distribution
-        # These can be ramped in gradually without causing collapse
-        scalable_loss = (
-            0.0001 * ponder_cost +
-            self.layer_dist_weight * depth_dist_loss_l
-        )
-        
-        # Warmup: ramp in over first N steps (use cached step value)
-        warmup_denom = float(max(1, self._warmup_steps))
-        # Use cached step from set_global_step (Python int, no .item() needed)
-        cached_step = getattr(self, '_cached_global_step', 0)
-        warmup_scale = min(1.0, float(cached_step) / warmup_denom)
-        
-        # Combined loss: router_reg is NOT scaled (prevents collapse)
-        # scalable_loss IS scaled (gradual adaptation)
-        ponder_loss = router_reg_loss + warmup_scale * scalable_loss
-        
-        # Final safety clamp: ponder_loss per layer should never exceed 10
-        # This prevents gradient explosion when summed across 24 layers
-        ponder_loss = torch.clamp(ponder_loss, max=10.0)
-        
-        # =====================================================================
-        # DIAGNOSTICS (only during training, after hot path)
-        # =====================================================================
+        # Diagnostics
         if self.training:
-            # Vectorized depth counting
-            flat_discrete = target_depth_discrete.flatten()  # [B*L]
-            depth_counts = (flat_discrete.unsqueeze(1) == depth_bins.long().unsqueeze(0)).float().sum(dim=0)
-            
-            # Store diagnostics (detached tensors, no .item() in compile region)
+            n_rec = self.max_recursions
+            depth_continuous = probs * (n_rec - 1)
             self._ponder_loss = ponder_loss.detach()
-            self._last_target_depths = target_depth_discrete.detach().float()
-            self._last_router_probs_tensor = router_probs.detach()
-            self._last_depth_histogram = depth_counts.detach()
-            self._last_depth_dist_loss_tensor = depth_dist_loss_l.detach()
+            self._last_avg_depth = depth_continuous.mean().detach()
         
         return self.final_norm(output), ponder_loss
+
+    def compute_advantage_loss(
+        self,
+        token_losses: torch.Tensor,
+        baseline: "MovingAverageBaseline",
+    ) -> torch.Tensor:
+        """Compute advantage-scaled loss for loss-driven routing.
+        
+        Call this AFTER forward pass with per-token CE losses.
+        Returns additional loss term that scales router gradients by advantage.
+        
+        Args:
+            token_losses: Per-token CE losses [batch, seq]
+            baseline: MovingAverageBaseline from parent model
+        
+        Returns:
+            Advantage loss tensor (scalar) - add to total loss for backprop.
+        """
+        if not hasattr(self, '_last_probs') or self._last_probs is None:
+            return torch.tensor(0.0, device=token_losses.device)
+        
+        probs = self._last_probs
+        n_rec = self.max_recursions
+        depth_continuous = probs * (n_rec - 1)
+        
+        # Compute advantage from baseline
+        advantage = baseline.compute_advantage(token_losses)
+        
+        # Loss-driven routing: reward depth for hard tokens, penalize for easy
+        # Positive advantage (hard) * high depth → negative loss → encourages depth
+        # Negative advantage (easy) * high depth → positive loss → penalizes depth
+        advantage_loss = -(advantage * depth_continuous).mean() * 0.1
+        
+        return advantage_loss
 
     def forward_adaptive_with_loss(
         self, x: torch.Tensor
@@ -1344,6 +1201,7 @@ class CCGQAMoRBlock(nn.Module):
         """Adaptive recursion mode (legacy ACT-style, BF16/FP16 friendly).
         
         NOTE: This uses Option A architecture - attention ONCE, then MLP recursions.
+        Uses mor_executor's recursion_bias/embed for consistency.
         
         Returns (output, ponder_loss) where ponder_loss has gradients attached.
         Per ACT paper, ponder_loss is computed from cumulative halt probability.
@@ -1362,9 +1220,11 @@ class CCGQAMoRBlock(nn.Module):
         current = h  # Start from attention output (no clone needed)
 
         for i in range(self.max_recursions):
-            # Add recursion info
-            rec_bias = self.recursion_bias[i].squeeze()
-            rec_embed = self.recursion_embed(self._recursion_indices[i : i + 1]).squeeze()
+            # Add recursion info (from mor_executor)
+            rec_bias = self.mor_executor.recursion_bias[i].squeeze()
+            rec_embed = self.mor_executor.recursion_embed(
+                self.mor_executor._recursion_indices[i:i+1]
+            ).squeeze()
             h_with_rec = current + rec_bias + rec_embed
 
             # Run MLP only (not attention)
@@ -1414,6 +1274,11 @@ class CCGQAMoRBlock(nn.Module):
             
             # Get rampup scale (0.0 before enable, 0.0-1.0 during rampup, 1.0 after)
             rampup_scale = self.get_mor_rampup_scale()
+
+            # Pre-enable: run fixed-depth only (avoid wasting compute on adaptive path
+            # when its contribution is exactly zero).
+            if rampup_scale <= 0.0:
+                return self.forward_fixed(x)
             
             # Always compute adaptive output (router trains from step 0)
             adaptive_output, _ = self.forward_fast_routing(x)
@@ -1448,13 +1313,28 @@ class CCGQAMoRBlock(nn.Module):
         if self.adaptive:
             # Get rampup scale (0.0 before enable, 0.0-1.0 during rampup, 1.0 after)
             rampup_scale = self.get_mor_rampup_scale()
+
+            # Pre-enable: run fixed-depth only and fully gate ponder_loss.
+            # This preserves the intended curriculum behavior and avoids doing
+            # 2x compute for the first ~mor_enable_pct of training.
+            if rampup_scale <= 0.0:
+                output = self.forward_fixed(x)
+                if self.mod_mlp_wrapper is not None:
+                    aux_loss = self.mod_mlp_wrapper.get_aux_loss()
+                else:
+                    aux_loss = torch.tensor(0.0, device=device)
+                zero_loss = torch.tensor(0.0, device=device)
+                if self.training:
+                    self._ponder_loss = zero_loss.detach()
+                return output, {"ponder_loss": zero_loss, "aux_loss": aux_loss}
             
             # Always compute adaptive output (router trains from step 0)
             adaptive_output, ponder_loss = self.forward_fast_routing(x)
-            
-            # NOTE: ponder_loss is NOT scaled by rampup_scale anymore
-            # The router regularization component needs full strength to prevent collapse
-            # The scalable components (ponder_cost, depth_dist) are already scaled internally
+
+            # Apply MoR curriculum to ponder loss.
+            # Before enable (rampup_scale=0), this fully gates MoR regularization so
+            # fixed-depth training behaves like fixed-depth training.
+            ponder_loss = ponder_loss * rampup_scale
             
             # Collect aux_loss from MoD MLP wrapper if present
             if self.mod_mlp_wrapper is not None:
@@ -1658,6 +1538,10 @@ class CCGQAMoDMoRModel(nn.Module):
         adaptive: bool = True,
         tie_weights: bool = True,
         hybrid_attention: bool = True,
+        # Dimension-aware MoR depth scaling (optional)
+        dim_ref: int = 768,  # Reference dimension for scale=1.0
+        depth_alpha: float = 0.0,  # Power-law exponent (0=disabled)
+        depth_scale_max: float = 2.0,  # Maximum scaling factor
         **kwargs,
     ):
         super().__init__()
@@ -1675,6 +1559,11 @@ class CCGQAMoDMoRModel(nn.Module):
         self.mod_capacity = mod_capacity
         self.adaptive = adaptive
         self.hybrid_attention = hybrid_attention
+        
+        # Store dim-aware depth scaling params for introspection/checkpoint
+        self.dim_ref = dim_ref
+        self.depth_alpha = depth_alpha
+        self.depth_scale_max = depth_scale_max
 
         # Auto-scale aux_loss_weight based on effective depth and dimension
         # Deeper/larger models need stronger regularization to maintain capacity
@@ -1698,33 +1587,14 @@ class CCGQAMoDMoRModel(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, dim)
 
         # =====================================================================
-        # Attention pattern
-        #
-        # Paper-compliant default: every MoR block uses CCGQA (AttentionType.CCQA).
-        # Hybrid attention (MQA/MLA mix) is an optional frontier optimization.
+        # Attention pattern: FIXED 3×LLA2 + 1×CCGQA (repeating every 4 blocks)
+        # This is the canonical HYDRA architecture - no configurability.
         # =====================================================================
-        if hybrid_attention:
-            def get_attention_pattern(n_blocks: int) -> list:
-                """Generate hybrid attention pattern for n blocks.
-
-                Pattern repeats: MQA, MQA, CCGQA, CCGQA, CCGQA, MLA, MQA, MLA
-                """
-                base_pattern = [
-                    AttentionType.MQA,   # Cheap local
-                    AttentionType.MQA,   # Cheap local
-                    AttentionType.CCQA,  # CCGQA global mixer
-                    AttentionType.CCQA,  # CCGQA global mixer
-                    AttentionType.CCQA,  # CCGQA global mixer
-                    AttentionType.MLA,   # Latent summarizer
-                    AttentionType.MQA,   # Skip path
-                    AttentionType.MLA,   # Latent summarizer
-                ]
-                return [base_pattern[i % len(base_pattern)] for i in range(n_blocks)]
-
-            attention_pattern = get_attention_pattern(n_mor_blocks)
-        else:
-            attention_pattern = [AttentionType.CCQA] * n_mor_blocks
-
+        def _get_attention_type(block_idx: int) -> str:
+            """Return attention type for block: LLA2 for idx%4 in {0,1,2}, CCGQA for idx%4==3."""
+            return "ccgqa" if (block_idx % 4 == 3) else "lla2"
+        
+        attention_pattern = [_get_attention_type(i) for i in range(n_mor_blocks)]
         self._attention_pattern = attention_pattern  # Store for introspection
 
         # MoR blocks - MoD applies to MLP sublayer only (attention is always dense)
@@ -1750,6 +1620,10 @@ class CCGQAMoDMoRModel(nn.Module):
                 mod_mlp_capacity=mod_capacity if use_mod_mlp else None,
                 mod_mlp_aux_weight=self.aux_loss_weight if use_mod_mlp else 0.0,
                 mod_mlp_warmup=100,  # Soft routing warmup steps
+                # Dimension-aware depth scaling
+                dim_ref=dim_ref,
+                depth_alpha=depth_alpha,
+                depth_scale_max=depth_scale_max,
             )
             self.layers.append(mor_block)
 
@@ -1758,6 +1632,13 @@ class CCGQAMoDMoRModel(nn.Module):
 
         # Output projection
         self.output = nn.Linear(dim, vocab_size, bias=False)
+
+        # Loss-driven routing baseline (Gemini approach)
+        # Tracks EMA of per-token CE losses to provide advantage signal
+        self.loss_baseline = MovingAverageBaseline(
+            decay=0.99,
+            warmup_steps=1000,
+        )
 
         # Initialize weights BEFORE tying (so Linear init doesn't overwrite Embedding)
         self._init_weights()
@@ -1881,14 +1762,33 @@ class CCGQAMoDMoRModel(nn.Module):
         h = self.tok_emb(x) * math.sqrt(self.dim)
 
         if return_losses:
-            # Collect losses during forward pass
-            # NOTE: Gradient checkpointing is NOT used when return_losses=True
-            # because forward_with_losses returns aux losses that can't be
-            # easily checkpointed (they're not tensors in the compute graph)
-            layer_results = []
-            for layer in self.layers:
-                h, layer_losses = layer.forward_with_losses(h)
-                layer_results.append(layer_losses)
+            # Training path: collect losses AND use gradient checkpointing
+            # FIX: We now support checkpointing WITH loss collection.
+            # Strategy: Use forward_with_losses but wrap in checkpoint.
+            # The losses are live tensors computed in forward - they will be
+            # recomputed during backward automatically.
+            
+            if self._gradient_checkpointing and self.training:
+                # Checkpointed forward with loss collection
+                layer_results = []
+                for i, layer in enumerate(self.layers):
+                    if i % self._checkpoint_every_n == 0:
+                        # Checkpoint this layer - wrap forward_with_losses
+                        # We use a custom wrapper to handle tuple output
+                        h, layer_losses = gradient_checkpoint(
+                            layer.forward_with_losses,
+                            h,
+                            use_reentrant=False,
+                        )
+                    else:
+                        h, layer_losses = layer.forward_with_losses(h)
+                    layer_results.append(layer_losses)
+            else:
+                # Non-checkpointed forward with loss collection
+                layer_results = []
+                for layer in self.layers:
+                    h, layer_losses = layer.forward_with_losses(h)
+                    layer_results.append(layer_losses)
 
             # Use list comprehensions for loss extraction
             aux_losses = [
@@ -1932,6 +1832,81 @@ class CCGQAMoDMoRModel(nn.Module):
             h = self.norm(h)
             return self.output(h)
 
+    def forward_hidden(self, x: torch.Tensor) -> torch.Tensor:
+        """Return post-norm hidden states (pre-logits).
+
+        Used for memory-efficient loss functions (e.g., chunked CE) that avoid
+        materializing the full logits tensor.
+
+        Args:
+            x: Input token ids [batch, seq_len]
+
+        Returns:
+            Hidden states after final norm, shape [batch, seq_len, dim]
+        """
+        # Token embedding with sqrt(dim) scaling (LLaMA style)
+        h = self.tok_emb(x) * math.sqrt(self.dim)
+
+        # Forward through layers with gradient checkpointing support
+        if self._gradient_checkpointing and self.training:
+            for i, layer in enumerate(self.layers):
+                if i % self._checkpoint_every_n == 0:
+                    h = gradient_checkpoint(layer, h, use_reentrant=False)
+                else:
+                    h = layer(h)
+        else:
+            for layer in self.layers:
+                h = layer(h)
+
+        return self.norm(h)
+
+    def forward_hidden_with_losses(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+        """Return post-norm hidden states + auxiliary losses (no logits).
+
+        Memory-efficient alternative to forward(return_losses=True) that avoids
+        materializing the full logits tensor. Use with chunked cross-entropy.
+
+        Args:
+            x: Input token ids [batch, seq_len]
+
+        Returns:
+            Tuple of:
+                - hidden: Hidden states after final norm [batch, seq_len, dim]
+                - losses: Dict with 'aux_loss' and 'ponder_loss'
+        """
+        # Token embedding with sqrt(dim) scaling (LLaMA style)
+        h = self.tok_emb(x) * math.sqrt(self.dim)
+
+        # Forward through layers collecting losses
+        if self._gradient_checkpointing and self.training:
+            # Checkpointed forward WITH loss collection (mirrors forward(return_losses=True)).
+            layer_results = []
+            for i, layer in enumerate(self.layers):
+                if i % self._checkpoint_every_n == 0:
+                    h, layer_losses = gradient_checkpoint(
+                        layer.forward_with_losses,
+                        h,
+                        use_reentrant=False,
+                    )
+                else:
+                    h, layer_losses = layer.forward_with_losses(h)
+                layer_results.append(layer_losses)
+        else:
+            layer_results = []
+            for layer in self.layers:
+                h, layer_losses = layer.forward_with_losses(h)
+                layer_results.append(layer_losses)
+
+        # Aggregate losses
+        aux_losses = [losses["aux_loss"] for losses in layer_results if "aux_loss" in losses]
+        ponder_losses = [losses["ponder_loss"] for losses in layer_results if "ponder_loss" in losses]
+
+        device = h.device
+        aux_loss = sum(aux_losses) if aux_losses else torch.tensor(0.0, device=device)
+        ponder_loss = sum(ponder_losses) if ponder_losses else torch.tensor(0.0, device=device)
+
+        return self.norm(h), {"aux_loss": aux_loss, "ponder_loss": ponder_loss}
+
     def get_aux_losses(self) -> dict:
         """Get all auxiliary losses for training.
         
@@ -1969,6 +1944,133 @@ class CCGQAMoDMoRModel(nn.Module):
             "mor_ponder_loss": mor_ponder_loss,
             "total": mod_aux_loss + mor_ponder_loss,
         }
+
+    def update_loss_baseline(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        ignore_index: int = -100,
+    ) -> torch.Tensor:
+        """Update loss baseline with per-token CE losses and return advantage.
+        
+        This is the core of loss-driven routing (Gemini approach):
+        1. Compute per-token CE losses (not reduced)
+        2. Update EMA baseline with batch statistics
+        3. Return advantage signal for router gradient scaling
+        
+        Call this in training loop AFTER forward pass but BEFORE backward:
+        
+            logits, aux_losses = model(x, return_losses=True)
+            advantage = model.update_loss_baseline(logits, targets)
+            # advantage can be used to scale ponder loss if desired
+            ce_loss = F.cross_entropy(logits.view(-1, vocab), targets.view(-1))
+            total_loss = ce_loss + aux_losses['aux_loss'] + aux_losses['ponder_loss']
+            total_loss.backward()
+        
+        Args:
+            logits: Model output logits [batch, seq, vocab]
+            targets: Target token ids [batch, seq]
+            ignore_index: Index to ignore in loss computation (default: -100)
+        
+        Returns:
+            Advantage tensor [batch, seq] - positive for hard tokens, negative for easy
+        """
+        B, L, V = logits.shape
+        
+        # Compute per-token cross-entropy (no reduction)
+        logits_flat = logits.view(-1, V)  # [B*L, V]
+        targets_flat = targets.view(-1)   # [B*L]
+        
+        # Per-token loss without reduction
+        with torch.no_grad():
+            token_losses = F.cross_entropy(
+                logits_flat,
+                targets_flat,
+                ignore_index=ignore_index,
+                reduction='none',
+            ).view(B, L)  # [B, L]
+            
+            # Mask ignored positions
+            valid_mask = (targets != ignore_index)
+            token_losses = token_losses * valid_mask.float()
+        
+        # Update baseline with this batch
+        self.loss_baseline.update(token_losses[valid_mask])
+        
+        # Compute advantage (positive = harder than baseline)
+        advantage = self.loss_baseline.compute_advantage(token_losses)
+        
+        # Store for diagnostics
+        self._last_advantage = advantage.detach()
+        self._last_baseline = self.loss_baseline.baseline
+        
+        # Return mean advantage as scalar for backward compatibility with tests
+        return advantage.mean()
+
+    def compute_advantage_loss(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        ignore_index: int = -100,
+    ) -> torch.Tensor:
+        """Compute advantage-scaled loss for loss-driven routing.
+        
+        This is the main entry point for loss-driven MoR training.
+        Call after forward pass but with logits that have gradients.
+        
+        The advantage loss encourages:
+        - More depth for hard tokens (high CE loss)
+        - Less depth for easy tokens (low CE loss)
+        
+        Usage in training loop:
+            logits, aux_losses = model(x, return_losses=True)
+            advantage_loss = model.compute_advantage_loss(logits, targets)
+            ce_loss = F.cross_entropy(logits.view(-1, V), targets.view(-1))
+            total = ce_loss + aux_losses['ponder_loss'] + advantage_loss
+            total.backward()
+        
+        Args:
+            logits: Model output logits [batch, seq, vocab]
+            targets: Target token ids [batch, seq]
+            ignore_index: Index to ignore in loss computation
+        
+        Returns:
+            Scalar advantage loss to add to total loss.
+        """
+        B, L, V = logits.shape
+        device = logits.device
+        
+        # Compute per-token CE losses (no reduction, no grad needed here)
+        logits_flat = logits.view(-1, V)
+        targets_flat = targets.view(-1)
+        
+        with torch.no_grad():
+            token_losses = F.cross_entropy(
+                logits_flat,
+                targets_flat,
+                ignore_index=ignore_index,
+                reduction='none',
+            ).view(B, L)
+            
+            valid_mask = (targets != ignore_index)
+            token_losses = token_losses * valid_mask.float()
+        
+        # Update baseline EMA
+        self.loss_baseline.update(token_losses[valid_mask])
+        
+        # Collect advantage loss from all blocks
+        total_advantage_loss = torch.tensor(0.0, device=device)
+        for layer in self.layers:
+            if hasattr(layer, 'compute_advantage_loss'):
+                layer_adv = layer.compute_advantage_loss(token_losses, self.loss_baseline)
+                total_advantage_loss = total_advantage_loss + layer_adv
+        
+        # Store diagnostics
+        self._last_token_losses = token_losses.detach()
+        self._last_baseline_value = self.loss_baseline.baseline
+        self._last_advantage_loss = total_advantage_loss.detach()
+        
+        return total_advantage_loss
 
     def get_efficiency_losses(self) -> dict:
         """Get all efficiency-related losses (legacy method).
@@ -2352,6 +2454,10 @@ def create_ccgqa_mod_mor_model(
     aux_loss_weight: float = None,  # None = auto-scale based on depth
     adaptive: bool = True,
     hybrid_attention: bool = True,
+    # Dimension-aware MoR depth scaling (optional)
+    dim_ref: int = 768,  # Reference dimension for scale=1.0
+    depth_alpha: float = 0.0,  # Power-law exponent (0=disabled)
+    depth_scale_max: float = 2.0,  # Maximum scaling factor
 ) -> CCGQAMoDMoRModel:
     """
     Create CCGQA + MoD + MoR model with specified parameters.
@@ -2366,6 +2472,11 @@ def create_ccgqa_mod_mor_model(
     aux_loss_weight: Controls MoD capacity regularization strength.
         None (default): Auto-scales based on effective depth.
         0.01 * (effective_layers / 32) is used as baseline.
+        
+    dim_ref, depth_alpha, depth_scale_max: Dimension-aware MoR depth scaling.
+        Larger models (dim > dim_ref) get scaled up target recursion depths
+        when depth_alpha > 0. Formula: scale = (dim/dim_ref)^alpha, clamped to max.
+        Default depth_alpha=0.0 disables this (backward compatible).
     """
     return CCGQAMoDMoRModel(
         vocab_size=vocab_size,
@@ -2381,388 +2492,18 @@ def create_ccgqa_mod_mor_model(
         aux_loss_weight=aux_loss_weight,
         adaptive=adaptive,
         hybrid_attention=hybrid_attention,
+        dim_ref=dim_ref,
+        depth_alpha=depth_alpha,
+        depth_scale_max=depth_scale_max,
     )
 
 
-def save_model_architecture(model: nn.Module, save_path: str):
-    """Save the model architecture code to a file for verification."""
-    import inspect
-    import os
-
-    os.makedirs(
-        os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True
-    )
-
-    with open(save_path, "w") as f:
-        f.write("# Auto-generated model architecture\n")
-        f.write(f"# Model class: {model.__class__.__name__}\n")
-        f.write(
-            f"# Total parameters: {sum(p.numel() for p in model.parameters()):,}\n\n"
-        )
-
-        f.write("# Model configuration:\n")
-        for key, value in vars(model).items():
-            if not key.startswith("_") and not isinstance(
-                value, (nn.Module, nn.ModuleList)
-            ):
-                f.write(f"# {key}: {value}\n")
-
-        f.write("\n# Full model structure:\n")
-        f.write(str(model))
-
-        f.write("\n\n# Parameter breakdown:\n")
-        for name, param in model.named_parameters():
-            f.write(f"# {name}: {param.shape} ({param.numel():,} params)\n")
-
-    print(f"Model architecture saved to: {save_path}")
 
 
-# For benchmarking/testing
-if __name__ == "__main__":
-    # Test CCGQA attention
-    print("Testing CCGQA Attention...")
-
-    B, S, D = 2, 512, 1344
-    x = torch.randn(B, S, D)
-
-    attn = CCGQAAttention(
-        dim=D,
-        n_heads=21,
-        n_kv_heads=3,
-        compression_factor=4,
-    )
-
-    out = attn(x)
-    print(f"Input: {x.shape}, Output: {out.shape}")
-
-    # Count parameters
-    n_params = sum(p.numel() for p in attn.parameters())
-    print(f"CCGQA Attention params: {n_params:,}")
-
-    # Compare to standard GQA
-    # GQA would have: q_proj(D, D) + kv_proj(D, 2*D//7) + o_proj(D, D)
-    gqa_params = D * D + D * (2 * D // 7) + D * D
-    print(f"Standard GQA params (approx): {gqa_params:,}")
-    print(f"Compression ratio: {gqa_params / n_params:.2f}x")
-
-    # Test full model
-    print("\nTesting CCGQA Model...")
-
-    class MockSpec:
-        vocab_size = 50257
-        dim = 1344
-        n_layers = 24
-        n_heads = 21
-        n_kv_heads = 3
-        compression_factor = 4
-        mlp_ratio = 2.67
-        max_seq_len = 8192
-
-    model = create_ccgqa_model(MockSpec())
-
-    tokens = torch.randint(0, 50257, (2, 512))
-    logits = model(tokens)
-    print(f"Tokens: {tokens.shape}, Logits: {logits.shape}")
-
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total model params: {total_params:,} ({total_params / 1e6:.1f}M)")
-
-    # Test CCGQA + MoD + MoR model
-    print("\n" + "=" * 60)
-    print("Testing CCGQA + MoD + MoR Model (>500M target)...")
-    print("=" * 60)
-
-    mod_mor_model = create_ccgqa_mod_mor_model(
-        dim=2048,
-        n_mor_blocks=8,
-        recursions_per_block=4,
-        n_heads=32,
-        n_kv_heads=4,
-        mlp_ratio=4.0,
-    )
-
-    tokens = torch.randint(0, 50257, (2, 256))
-    logits = mod_mor_model(tokens)
-    print(f"Tokens: {tokens.shape}, Logits: {logits.shape}")
-
-    total_params = sum(p.numel() for p in mod_mor_model.parameters())
-    print(f"Total model params: {total_params:,} ({total_params / 1e6:.1f}M)")
-    print(f"Effective layers: {mod_mor_model.effective_layers}")
-
-    # Save architecture to file
-    save_model_architecture(mod_mor_model, "./pipeline_output/model_architecture.txt")
-
-    # =========================================================================
-    # STEP 6: VALIDATION TESTS
-    # =========================================================================
-    print("\n" + "=" * 60)
-    print("STEP 6: VALIDATION TESTS")
-    print("=" * 60)
-
-    def run_validation_tests():
-        """Run all validation tests for MoD + MoR architecture."""
-        import torch.nn.functional as F
-        
-        all_passed = True
-        
-        # ---------------------------------------------------------------------
-        # TEST 1: Shape Invariants
-        # ---------------------------------------------------------------------
-        print("\n[TEST 1] Shape Invariants...")
-        
-        model = CCGQAMoDMoRModel(
-            vocab_size=1000,
-            dim=128,
-            n_mor_blocks=4,  # Need 4+ layers for MoD on middle layers
-            recursions_per_block=2,
-            n_heads=4,
-            n_kv_heads=2,
-            mod_capacity=0.5,
-        )
-        model.train()
-        model.set_global_step(200)  # Hard routing mode
-        
-        # Test various batch/seq combinations
-        test_shapes = [(1, 16), (2, 32), (4, 64), (1, 128)]
-        for batch, seq in test_shapes:
-            x = torch.randint(0, 1000, (batch, seq))
-            out, losses = model(x, return_losses=True)
-            
-            expected_shape = (batch, seq, 1000)
-            assert out.shape == expected_shape, f"Shape mismatch: {out.shape} != {expected_shape}"
-            assert "aux_loss" in losses, "Missing aux_loss"
-            assert "ponder_loss" in losses, "Missing ponder_loss"
-            assert losses["aux_loss"].shape == (), f"aux_loss should be scalar, got {losses['aux_loss'].shape}"
-            assert losses["ponder_loss"].shape == (), f"ponder_loss should be scalar, got {losses['ponder_loss'].shape}"
-        
-        print(f"   ✓ All shapes correct for {test_shapes}")
-        
-        # ---------------------------------------------------------------------
-        # TEST 2: No Cross-Batch Mixing
-        # ---------------------------------------------------------------------
-        print("\n[TEST 2] No Cross-Batch Mixing...")
-        
-        model.eval()
-        torch.manual_seed(42)
-        
-        # Create two different sequences
-        seq_a = torch.randint(0, 1000, (1, 32))
-        seq_b = torch.randint(0, 1000, (1, 32))
-        
-        # Run them separately
-        with torch.no_grad():
-            out_a_solo = model(seq_a)
-            out_b_solo = model(seq_b)
-        
-        # Run them batched (A first, B second)
-        with torch.no_grad():
-            batched_ab = torch.cat([seq_a, seq_b], dim=0)
-            out_ab = model(batched_ab)
-        
-        # Run them batched (B first, A second)
-        with torch.no_grad():
-            batched_ba = torch.cat([seq_b, seq_a], dim=0)
-            out_ba = model(batched_ba)
-        
-        # Check: output for A should be the same regardless of batch position
-        # (within floating point tolerance)
-        a_from_ab = out_ab[0:1]  # A when batched with B
-        a_from_ba = out_ba[1:2]  # A when batched with B (reversed order)
-        
-        diff_a = (a_from_ab - a_from_ba).abs().max().item()
-        diff_solo = (out_a_solo - a_from_ab).abs().max().item()
-        
-        # Both should be very close (within fp32 precision)
-        assert diff_a < 1e-4, f"Cross-batch mixing detected! diff={diff_a}"
-        assert diff_solo < 1e-4, f"Solo vs batched mismatch! diff={diff_solo}"
-        
-        print(f"   ✓ No cross-batch mixing (max diff: {max(diff_a, diff_solo):.2e})")
-        
-        # ---------------------------------------------------------------------
-        # TEST 3: MoD Preserves Full Attention Context (capacity=1.0)
-        # ---------------------------------------------------------------------
-        print("\n[TEST 3] MoD MLP Preserves Full Context (capacity=1.0)...")
-        
-        # Create model with capacity=1.0 (all tokens through MLP)
-        model_full = CCGQAMoDMoRModel(
-            vocab_size=1000,
-            dim=128,
-            n_mor_blocks=2,
-            recursions_per_block=2,
-            n_heads=4,
-            n_kv_heads=2,
-            mod_capacity=1.0,  # Full capacity - no skipping
-        )
-        model_full.eval()
-        model_full.set_global_step(200)
-        
-        # Create model with capacity=0.5 (sparse MLP)
-        model_sparse = CCGQAMoDMoRModel(
-            vocab_size=1000,
-            dim=128,
-            n_mor_blocks=2,
-            recursions_per_block=2,
-            n_heads=4,
-            n_kv_heads=2,
-            mod_capacity=0.5,
-        )
-        model_sparse.eval()
-        model_sparse.set_global_step(200)
-        
-        # Copy weights from full to sparse (same network, different routing)
-        model_sparse.load_state_dict(model_full.state_dict(), strict=False)
-        
-        x = torch.randint(0, 1000, (2, 32))
-        
-        with torch.no_grad():
-            out_full = model_full(x)
-            out_sparse = model_sparse(x)
-        
-        # They should differ because sparse skips some tokens
-        diff = (out_full - out_sparse).abs().mean().item()
-        
-        # But full model should have processed more tokens
-        full_stats = model_full.get_routing_stats()
-        sparse_stats = model_sparse.get_routing_stats()
-        
-        # Check MoD layers processed more tokens with capacity=1.0
-        if full_stats["mod_layers"] and sparse_stats["mod_layers"]:
-            full_ratio = sum(s.get("compute_ratio", 1.0) for s in full_stats["mod_layers"]) / len(full_stats["mod_layers"])
-            sparse_ratio = sum(s.get("compute_ratio", 1.0) for s in sparse_stats["mod_layers"]) / len(sparse_stats["mod_layers"])
-            assert full_ratio >= sparse_ratio, f"Full should process >= sparse tokens"
-            print(f"   ✓ Full capacity ratio: {full_ratio:.2f}, Sparse: {sparse_ratio:.2f}")
-        else:
-            print(f"   ✓ Outputs differ as expected (diff={diff:.4f})")
-        
-        # ---------------------------------------------------------------------
-        # TEST 4: MoD Token Count Drops with Lower Capacity
-        # ---------------------------------------------------------------------
-        print("\n[TEST 4] MoD Token Count Drops with Lower Capacity...")
-        
-        model.train()
-        model.set_global_step(200)  # Hard routing
-        
-        x = torch.randint(0, 1000, (4, 64))
-        out, _ = model(x, return_losses=True)
-        
-        stats = model.get_routing_stats()
-        
-        # Check that MoD layers are routing
-        mod_stats = stats.get("mod_layers", [])
-        if mod_stats:
-            for i, layer_stats in enumerate(mod_stats):
-                tokens_processed = layer_stats.get("tokens_processed", 0)
-                tokens_total = layer_stats.get("tokens_total", 1)
-                compute_ratio = layer_stats.get("compute_ratio", 1.0)
-                savings_pct = layer_stats.get("compute_savings_pct", 0.0)
-                
-                print(f"   Layer {i}: {tokens_processed}/{tokens_total} tokens ({compute_ratio:.1%}), savings={savings_pct:.1f}%")
-                
-                # With capacity=0.5, should process roughly half the tokens
-                assert compute_ratio <= 0.7, f"Expected compute_ratio <= 0.7, got {compute_ratio}"
-        else:
-            print("   (No MoD layers with routing stats)")
-        
-        # Check MoR depth distribution
-        mor_stats = stats.get("mor_layers", [])
-        if mor_stats:
-            for i, layer_stats in enumerate(mor_stats):
-                avg_depth = layer_stats.get("avg_depth", -1)
-                if avg_depth >= 0:
-                    print(f"   MoR Layer {i}: avg_depth={avg_depth:.2f}")
-        
-        print("   ✓ Token counts verified")
-        
-        # ---------------------------------------------------------------------
-        # TEST 5: Gradient Flow Through All Components
-        # ---------------------------------------------------------------------
-        print("\n[TEST 5] Gradient Flow...")
-        
-        model.train()
-        model.zero_grad()
-        
-        x = torch.randint(0, 1000, (2, 32))
-        targets = torch.randint(0, 1000, (2, 32))
-        
-        out, losses = model(x, return_losses=True)
-        total_loss = (
-            F.cross_entropy(out.view(-1, 1000), targets.view(-1)) +
-            losses["aux_loss"] +
-            losses["ponder_loss"]
-        )
-        total_loss.backward()
-        
-        # Count parameters with gradients
-        grad_params = sum(1 for p in model.parameters() if p.grad is not None)
-        total_params = sum(1 for p in model.parameters())
-        
-        # Check specific components have gradients
-        has_tok_emb_grad = model.tok_emb.weight.grad is not None
-        has_output_grad = model.output.weight.grad is not None
-        
-        # Check router gradients
-        router_grads = []
-        for layer in model.layers:
-            if hasattr(layer, "router"):
-                if layer.router[0].weight.grad is not None:
-                    router_grads.append(layer.router[0].weight.grad.abs().mean().item())
-        
-        print(f"   Params with gradients: {grad_params}/{total_params}")
-        print(f"   tok_emb grad: {has_tok_emb_grad}, output grad: {has_output_grad}")
-        if router_grads:
-            print(f"   Router grad magnitudes: {[f'{g:.2e}' for g in router_grads]}")
-        
-        assert grad_params > total_params * 0.8, f"Too few params have gradients: {grad_params}/{total_params}"
-        assert has_tok_emb_grad, "tok_emb missing gradient"
-        assert has_output_grad, "output missing gradient"
-        
-        print("   ✓ Gradient flow verified")
-        
-        # ---------------------------------------------------------------------
-        # TEST 6: BF16 Numerical Stability
-        # ---------------------------------------------------------------------
-        print("\n[TEST 6] BF16 Numerical Stability...")
-        
-        model_bf16 = model.bfloat16()
-        model_bf16.train()
-        model_bf16.zero_grad()
-        
-        x = torch.randint(0, 1000, (2, 32))
-        targets = torch.randint(0, 1000, (2, 32))
-        
-        out_bf16, losses_bf16 = model_bf16(x, return_losses=True)
-        
-        # Check for NaN/Inf
-        assert not torch.isnan(out_bf16).any(), "NaN in BF16 output"
-        assert not torch.isinf(out_bf16).any(), "Inf in BF16 output"
-        assert not torch.isnan(losses_bf16["aux_loss"]), "NaN in aux_loss"
-        assert not torch.isnan(losses_bf16["ponder_loss"]), "NaN in ponder_loss"
-        
-        # Backward should also work
-        loss_bf16 = (
-            F.cross_entropy(out_bf16.view(-1, 1000), targets.view(-1)) +
-            losses_bf16["aux_loss"] +
-            losses_bf16["ponder_loss"]
-        )
-        loss_bf16.backward()
-        
-        # Check gradients for NaN
-        nan_grads = sum(1 for p in model_bf16.parameters() if p.grad is not None and torch.isnan(p.grad).any())
-        assert nan_grads == 0, f"Found {nan_grads} parameters with NaN gradients"
-        
-        print(f"   ✓ BF16 stable (output dtype={out_bf16.dtype})")
-        
-        # ---------------------------------------------------------------------
-        # SUMMARY
-        # ---------------------------------------------------------------------
-        print("\n" + "=" * 60)
-        print("ALL VALIDATION TESTS PASSED ✓")
-        print("=" * 60)
-        return True
-
-    # Run the tests
-    try:
-        run_validation_tests()
-    except AssertionError as e:
-        print(f"\n❌ TEST FAILED: {e}")
-        raise
+# Note: Testing and benchmarking code moved to:
+# - tests/test_ccgqa_model.py - Model validation tests (pytest)
+# - diagnostics/benchmark_ccgqa.py - Performance benchmarks
+# - hydra.utils.save_model_architecture() - Architecture export utility
+#
+# Run tests with: pytest tests/test_ccgqa_model.py -v
+# Run benchmarks with: python -m diagnostics.benchmark_ccgqa

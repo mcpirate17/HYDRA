@@ -427,7 +427,7 @@ class TestDataLoaderRobustness:
 
     def test_labels_are_shifted(self, tmp_path):
         """Test that labels are properly shifted by 1."""
-        # Create predictable data
+        # Create predictable data with sequential tokens
         chunk_data = [{"input_ids": list(range(600)), "length": 600} for _ in range(10)]
         torch.save(chunk_data, tmp_path / "chunk_0000.pt")
 
@@ -438,11 +438,25 @@ class TestDataLoaderRobustness:
         )
 
         batch = loader.get_batch()
-        # Labels should be input_ids shifted by 1
-        # input_ids[i, j] predicts labels[i, j]
-        # So input_ids[:, 1:] should equal labels[:, :-1] if properly shifted
-        # Actually our loader returns: input_ids = tokens[:, :-1], labels = tokens[:, 1:]
-        # So labels[i, j] = input_ids[i, j+1] for the original sequence
+        input_ids = batch["input_ids"]
+        labels = batch["labels"]
+        
+        # Our loader returns: input_ids = tokens[:-1], labels = tokens[1:]
+        # So for a sequence [0,1,2,3,4,5,6,7,8,9,10], we get:
+        #   input_ids = [0,1,2,3,4,5,6,7,8,9]
+        #   labels    = [1,2,3,4,5,6,7,8,9,10]
+        # Therefore: labels[i] == input_ids[i] + 1 for sequential data
+        
+        # Verify shapes match
+        assert input_ids.shape == labels.shape, f"Shape mismatch: {input_ids.shape} vs {labels.shape}"
+        
+        # For sequential data, labels should be exactly input_ids + 1
+        # (since we created range(600) as input)
+        assert torch.all(labels == input_ids + 1), (
+            f"Labels not properly shifted! "
+            f"input_ids[:5]={input_ids[0, :5].tolist()}, "
+            f"labels[:5]={labels[0, :5].tolist()}"
+        )
 
     def test_dtype_is_long(self):
         """Test that output tensors are long dtype."""

@@ -262,6 +262,11 @@ def run_diagnostic(
     if device is None:
         device = get_device()
 
+    # Default attention pattern (per MoR block): 3:1 macro-block [LLA2, LLA2, LLA2, CCQA].
+    # Keep this CUDA-only: LLA2 requires the external lightning-attention CUDA kernels.
+    if device == "cuda":
+        os.environ.setdefault("HYDRA_MOR_ATTENTION_PATTERN_NAME", "lla2x3+ccqa")
+
     vocab_size = 50257
 
     print(f"\n{'=' * 60}")
@@ -370,6 +375,13 @@ def run_diagnostic(
     # Final analysis
     final_mod_prob = mod_probs[-1] if mod_probs else 0.75
     final_mor_depth = mor_depths[-1] if mor_depths else 1.0
+    
+    # Convert to Python floats if they're tensors
+    if hasattr(final_mod_prob, 'item'):
+        final_mod_prob = final_mod_prob.item()
+    if hasattr(final_mor_depth, 'item'):
+        final_mor_depth = final_mor_depth.item()
+    
     avg_time = (
         sum(step_times[5:]) / len(step_times[5:])
         if len(step_times) > 5

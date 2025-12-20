@@ -10,6 +10,11 @@ Refactored to leverage HuggingFace's native PyTorch integration for:
 - Distributed training ready
 - HF Transfer for faster downloads (requires: pip install hf-transfer)
 
+Environment Variables:
+    HF_HUB_ENABLE_HF_TRANSFER: Set to "1" to enable faster HuggingFace downloads.
+        This module enables it by default if not already set. To disable,
+        set HF_HUB_ENABLE_HF_TRANSFER="0" before importing this module.
+
 Usage:
     # Simple - auto-select based on model size
     loader = create_universal_loader(model_params=60_000_000, batch_size=16, seq_len=512)
@@ -32,18 +37,18 @@ import os
 
 # Enable HF Transfer for faster downloads (5-10x speedup)
 # Requires: pip install hf-transfer
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+# Only set if not already configured by user (respects existing env)
+if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 import torch
 import logging
 import time
-import gc
 import glob
 import random
 from pathlib import Path
-from typing import Dict, Any, Optional, Iterator, List, Union
+from typing import Dict, Any, Optional, List
 from collections import deque
-from torch.utils.data import DataLoader, IterableDataset
 
 logger = logging.getLogger("dmta.universal_data")
 
@@ -134,8 +139,13 @@ FINEFINEWEB_DOMAINS = [
     "christianity", "gamble",
 ]
 
-# Default cache directory for FineFineWeb local download
-FINEFINEWEB_CACHE_DIR = "/mnt/nvme0/hf_finefineweb"
+# Default cache directory for FineFineWeb local data
+# Configurable via HYDRA_CACHE_DIR environment variable
+# NOTE: Default points to user's existing 109GB cache on fast NVMe
+FINEFINEWEB_CACHE_DIR = os.environ.get(
+    "HYDRA_CACHE_DIR",
+    "/mnt/nvme0/hf_finefineweb"  # User's pre-downloaded 109GB cache
+)
 
 
 def download_finefineweb_subset(
@@ -197,7 +207,7 @@ def download_finefineweb_subset(
                 downloaded += 1
                 if downloaded % 50 == 0:
                     logger.info(f"Downloaded {downloaded} files...")
-            except Exception as e:
+            except Exception:
                 # Some domains may not have all file indices
                 failed += 1
                 if failed <= 5:
@@ -368,6 +378,27 @@ DATASET_CONFIGS = {
         "max_files_per_domain": 10,
         "description": "Local cache only (67 domains × 10 files, ~113GB)",
     },
+    # Gradual transition mode: local cache -> HF streaming based on % of training
+    # - 0-33% of max_steps: 100% local (fast, from pre-downloaded cache)
+    # - 33-66% of max_steps: blend local + HF streaming
+    # - 66-100% of max_steps: mostly HF streaming (fresh data diversity)
+    # NOTE: Does NOT auto-download - uses existing local cache only
+    "finefineweb-sequential": {
+        "path": "m-a-p/FineFineWeb",
+        "name": None,
+        "text_column": "text",
+        "format": "jsonl",
+        "use_gradual_transition": True,
+        "local_end_pct": 0.33,       # 100% local until 33% of training
+        "transition_end_pct": 0.66,  # 100% HF by 66% of training
+        "cache_dir": FINEFINEWEB_CACHE_DIR,
+        "domains": FINEFINEWEB_DOMAINS,
+        "max_files_per_domain": 10,
+        "auto_download": False,      # Use existing cache only, no downloads
+        "hf_dataset": "m-a-p/FineFineWeb",
+        "hf_dataset_name": None,
+        "description": "Gradual: local (0-33%) -> blend (33-66%) -> HF streaming (66%+)",
+    },
     # Local pre-tokenized datasets
     "pleias_synth": {
         "local": True,
@@ -423,6 +454,66 @@ DATASET_CONFIGS = {
         "text_column": None,
         "formatter": "chat",
         "description": "Chat/QA instruction data",
+    },
+    # ============================================
+    # MIXED PRETRAINING CONFIGS (for chat-capable models)
+    # ============================================
+    # Phase 1: Pretraining mix - local first, then HF streaming + local high-quality data
+    "pretrain_1b": {
+        "mixed": True,
+        "sources": [
+            {"name": "finefineweb-sequential", "weight": 0.85},  # Local→HF transition (uses your 109GB cache first!)
+            {"name": "pleias_synth", "weight": 0.10},            # Local synthetic reasoning
+            {"name": "tinystories", "weight": 0.05},             # Narrative coherence
+        ],
+        "description": "Pretraining mix for 1B+ chat model: 85% web (local-first) + 10% reasoning + 5% stories",
+    },
+    # Phase 2: SFT mix - instruction tuning for chat capability
+    "sft_chat": {
+        "mixed": True,
+        "sources": [
+            {"name": "chat", "weight": 0.70},             # UltraChat conversations
+            {"name": "math", "weight": 0.20},             # Math reasoning
+            {"name": "code", "weight": 0.10},             # Code generation
+        ],
+        "description": "SFT mix for chat: 70% conversation + 20% math + 10% code",
+    },
+    # ============================================
+    # PRETRAINING MIX: Local FineFineWeb + UltraChat + TinyStories
+    # ============================================
+    # For SMALL models (250M-500M): More curated data, less noisy web
+    # - Smaller models learn better from structured/clean data
+    # - UltraChat teaches conversational patterns
+    # - TinyStories provides coherent narrative structure
+    # - Web data supplements with knowledge but can be noisy
+    "pretrain_mix": {
+        "mixed": True,
+        "sources": [
+            {"name": "finefineweb-local", "weight": 0.40},  # Web knowledge (reduced for small models)
+            {"name": "chat", "weight": 0.35},               # UltraChat - structured conversations
+            {"name": "tinystories", "weight": 0.25},        # TinyStories - narrative coherence
+        ],
+        "description": "Small model mix: 40% FineFineWeb + 35% UltraChat + 25% TinyStories",
+    },
+    # For MEDIUM+ models (750M+): More web data, they can handle noise
+    "pretrain_web": {
+        "mixed": True,
+        "sources": [
+            {"name": "finefineweb-local", "weight": 0.70},  # Heavy web focus
+            {"name": "chat", "weight": 0.15},               # Some chat
+            {"name": "tinystories", "weight": 0.15},        # Some stories
+        ],
+        "description": "Medium+ model mix: 70% FineFineWeb + 15% UltraChat + 15% TinyStories",
+    },
+    # Chat-heavy variant for conversational models
+    "pretrain_chat": {
+        "mixed": True,
+        "sources": [
+            {"name": "finefineweb-local", "weight": 0.30},  # Minimal web
+            {"name": "chat", "weight": 0.45},               # Heavy chat focus
+            {"name": "tinystories", "weight": 0.25},        # Good narrative base
+        ],
+        "description": "Chat-focused: 30% FineFineWeb + 45% UltraChat + 25% TinyStories",
     },
 }
 
@@ -567,6 +658,7 @@ class HFStreamingDataLoader:
         prefetch_factor: int = 2,
         buffer_size: int = 10000,
         max_retries: int = 3,
+        seed: Optional[int] = None,  # For reproducible shuffling
         **kwargs,
     ):
         self.dataset_name = dataset_name.lower()
@@ -576,6 +668,8 @@ class HFStreamingDataLoader:
         self.device = device
         self.buffer_size = buffer_size
         self.max_retries = max_retries
+        # Use provided seed or fall back to time-based seed
+        self.seed = seed if seed is not None else int(time.time())
 
         self.tokenizer = get_tokenizer(tokenizer_name)
         self._closed = False
@@ -589,6 +683,28 @@ class HFStreamingDataLoader:
         self.iterator = None
         self.formatter = None
         self.text_column = "text"
+        
+        # Gradual transition mode (local -> HF based on % of training)
+        self.gradual_transition_mode = False
+        self.local_end_pct = 0.30       # 100% local until this % of max_steps
+        self.transition_end_pct = 0.60  # 100% HF by this % of max_steps
+        self.max_steps = kwargs.get("max_steps", 100000)  # Total training steps
+        self.current_step = 0
+        
+        # Dataset sources for gradual transition
+        self.local_dataset = None
+        self.local_iterator = None
+        self.hf_dataset = None
+        self.hf_iterator = None
+        self.hf_config = None
+        self.hf_initialized = False
+        
+        # Legacy sequential mode (kept for backward compat)
+        self.sequential_mode = False
+        self.local_epochs_target = 0
+        self.local_epochs_completed = 0
+        self.using_hf_phase2 = False
+        self.hf_phase2_config = None
 
         self._init_dataset()
 
@@ -631,7 +747,72 @@ class HFStreamingDataLoader:
 
                 # Use local cache for FineFineWeb (download once, stream locally)
                 # This avoids 502 errors and is much faster than remote streaming
-                if config.get("use_hybrid"):
+                if config.get("use_gradual_transition"):
+                    # Gradual transition mode: local -> HF based on % of training
+                    self.gradual_transition_mode = True
+                    self.local_end_pct = config.get("local_end_pct", 0.33)
+                    self.transition_end_pct = config.get("transition_end_pct", 0.66)
+                    self.hf_config = {
+                        "path": config.get("hf_dataset", "m-a-p/FineFineWeb"),
+                        "name": config.get("hf_dataset_name"),
+                    }
+                    
+                    cache_dir = config.get("cache_dir", FINEFINEWEB_CACHE_DIR)
+                    domains = config.get("domains", FINEFINEWEB_DOMAINS)
+                    max_files = config.get("max_files_per_domain", 10)
+                    auto_download = config.get("auto_download", False)  # Default: no downloads
+                    
+                    # Initialize local dataset (use existing cache, no downloads by default)
+                    self.local_dataset = load_finefineweb_local(
+                        cache_dir=cache_dir,
+                        domains=domains,
+                        streaming=True,
+                        auto_download=auto_download,
+                        max_files_per_domain=max_files,
+                    )
+                    if self.buffer_size and self.buffer_size > 0:
+                        self.local_dataset = self.local_dataset.shuffle(
+                            seed=42, buffer_size=min(self.buffer_size, 2048)
+                        )
+                    self.local_batched = self.local_dataset.batch(batch_size=32)
+                    self.local_iterator = iter(self.local_batched)
+                    
+                    # HF dataset initialized lazily when needed
+                    self.hf_initialized = False
+                    
+                    # Point main dataset/iterator to local for now
+                    self.dataset = self.local_dataset
+                    self.iterator = self.local_iterator
+                    
+                    logger.info(f"Gradual transition mode: max_steps={self.max_steps}")
+                    logger.info(f"  0-{self.local_end_pct*100:.0f}%: 100% local")
+                    logger.info(f"  {self.local_end_pct*100:.0f}-{self.transition_end_pct*100:.0f}%: gradual HF phase-in")
+                    logger.info(f"  {self.transition_end_pct*100:.0f}-100%: 100% HF streaming")
+                elif config.get("use_sequential"):
+                    # Sequential mode: Phase 1 (local cache) then Phase 2 (HF streaming)
+                    self.sequential_mode = True
+                    self.local_epochs_target = config.get("local_epochs", 5)
+                    self.local_epochs_completed = 0
+                    self.using_hf_phase2 = False
+                    self.hf_phase2_config = {
+                        "path": config.get("hf_phase2", config.get("hf_fallback", "m-a-p/FineFineWeb")),
+                        "name": config.get("hf_phase2_name", config.get("hf_fallback_name")),
+                    }
+                    
+                    cache_dir = config.get("cache_dir", FINEFINEWEB_CACHE_DIR)
+                    domains = config.get("domains", FINEFINEWEB_DOMAINS)
+                    max_files = config.get("max_files_per_domain", 10)
+                    auto_download = config.get("auto_download", False)
+                    
+                    self.dataset = load_finefineweb_local(
+                        cache_dir=cache_dir,
+                        domains=domains,
+                        streaming=True,
+                        auto_download=auto_download,
+                        max_files_per_domain=max_files,
+                    )
+                    logger.info(f"Sequential mode: local cache for {self.local_epochs_target} epochs, then HF streaming")
+                elif config.get("use_hybrid"):
                     # Hybrid mode: local cache + remote streaming interleaved
                     cache_dir = config.get("cache_dir", FINEFINEWEB_CACHE_DIR)
                     domains = config.get("domains", FINEFINEWEB_DOMAINS)
@@ -645,7 +826,7 @@ class HFStreamingDataLoader:
                     )
                     logger.info(f"Hybrid mode: {local_weight*100:.0f}% local, {(1-local_weight)*100:.0f}% remote")
                 elif config.get("use_local_cache"):
-                    # Local-only mode: 100% from disk cache
+                    # Local-only mode: 100% from disk cache (no downloads)
                     cache_dir = config.get("cache_dir", FINEFINEWEB_CACHE_DIR)
                     domains = config.get("domains", FINEFINEWEB_DOMAINS)
                     max_files = config.get("max_files_per_domain", 10)
@@ -654,7 +835,7 @@ class HFStreamingDataLoader:
                         cache_dir=cache_dir,
                         domains=domains,
                         streaming=True,
-                        auto_download=True,
+                        auto_download=False,  # Local-only = no downloads ever
                         max_files_per_domain=max_files,
                     )
                     logger.info(f"Loaded from local cache: {cache_dir}")
@@ -709,8 +890,12 @@ class HFStreamingDataLoader:
             and consecutive_failures < max_consecutive_failures
         ):
             try:
-                # Get batch of samples using HF's batch() method
-                batch = next(self.iterator)
+                # Gradual transition mode: mix local and HF based on step %
+                if self.gradual_transition_mode:
+                    batch = self._get_gradual_batch()
+                else:
+                    # Standard mode: single source
+                    batch = next(self.iterator)
 
                 # Process each sample in the batch
                 if self.formatter:
@@ -741,9 +926,20 @@ class HFStreamingDataLoader:
                         consecutive_failures = 0
 
             except StopIteration:
+                # Handle epoch completion for sequential mode
+                if self.sequential_mode:
+                    self.local_epochs_completed += 1
+                    logger.info(f"Local epoch {self.local_epochs_completed}/{self.local_epochs_target} completed")
+                    
+                    if self.local_epochs_completed >= self.local_epochs_target and not self.using_hf_phase2:
+                        # Phase 1 complete -> Switch to Phase 2 (HF streaming)
+                        self._switch_to_hf_phase2()
+                        consecutive_failures = 0
+                        continue
+                
                 logger.info("Iterator exhausted, resetting...")
                 self.dataset = self.dataset.shuffle(
-                    seed=int(time.time()), buffer_size=self.buffer_size
+                    seed=self.seed, buffer_size=self.buffer_size
                 )
                 self.batched_dataset = self.dataset.batch(batch_size=32)
                 self.iterator = iter(self.batched_dataset)
@@ -757,6 +953,135 @@ class HFStreamingDataLoader:
         if consecutive_failures >= max_consecutive_failures:
             logger.warning("Too many failures, adding synthetic tokens")
             self._add_synthetic_tokens(needed - len(self.token_buffer))
+
+    def _switch_to_hf_phase2(self):
+        """Switch from local cache (Phase 1) to HuggingFace streaming (Phase 2).
+        
+        This is the INTENDED transition after N epochs on local cache:
+        - Phase 1: Fast training on local cache (no network latency)
+        - Phase 2: Fresh data from HF streaming (unlimited, diverse)
+        """
+        if not self.hf_phase2_config:
+            logger.warning("No HF Phase 2 configured, continuing with local cache")
+            return
+        
+        logger.info("=" * 60)
+        logger.info(f"PHASE 2: Switching to HF streaming after {self.local_epochs_completed} local epochs")
+        logger.info(f"HF dataset: {self.hf_phase2_config['path']}")
+        logger.info("=" * 60)
+        
+        try:
+            self.dataset = load_dataset(
+                self.hf_phase2_config["path"],
+                self.hf_phase2_config.get("name"),
+                split="train",
+                streaming=True,
+            )
+            
+            if self.buffer_size and self.buffer_size > 0:
+                self.dataset = self.dataset.shuffle(
+                    seed=self.seed, buffer_size=min(self.buffer_size, 2048)
+                )
+            
+            self.batched_dataset = self.dataset.batch(batch_size=32)
+            self.iterator = iter(self.batched_dataset)
+            self.using_hf_phase2 = True
+            
+            logger.info("Phase 2 active: Now streaming from HuggingFace!")
+        except Exception as e:
+            logger.error(f"Failed to switch to HF Phase 2: {e}")
+            logger.info("Continuing with local cache (will loop)")
+            # Reset local iterator
+            self.dataset = self.dataset.shuffle(
+                seed=self.seed, buffer_size=self.buffer_size
+            )
+            self.batched_dataset = self.dataset.batch(batch_size=32)
+            self.iterator = iter(self.batched_dataset)
+
+    def _init_hf_streaming(self):
+        """Initialize HuggingFace streaming dataset (lazy, called when needed)."""
+        if self.hf_initialized or not self.hf_config:
+            return
+        
+        logger.info("=" * 60)
+        logger.info(f"Initializing HF streaming: {self.hf_config['path']}")
+        logger.info("=" * 60)
+        
+        try:
+            self.hf_dataset = load_dataset(
+                self.hf_config["path"],
+                self.hf_config.get("name"),
+                split="train",
+                streaming=True,
+            )
+            
+            if self.buffer_size and self.buffer_size > 0:
+                self.hf_dataset = self.hf_dataset.shuffle(
+                    seed=self.seed, buffer_size=min(self.buffer_size, 2048)
+                )
+            
+            self.hf_batched = self.hf_dataset.batch(batch_size=32)
+            self.hf_iterator = iter(self.hf_batched)
+            self.hf_initialized = True
+            
+            logger.info("HF streaming initialized successfully!")
+        except Exception as e:
+            logger.error(f"Failed to initialize HF streaming: {e}")
+            self.hf_initialized = False
+    
+    def _get_gradual_batch(self):
+        """Get batch with gradual local->HF transition based on training progress.
+        
+        Schedule:
+        - 0% to local_end_pct: 100% local
+        - local_end_pct to transition_end_pct: linear interpolation
+        - transition_end_pct to 100%: 100% HF
+        """
+        import random
+        
+        progress = self.current_step / max(self.max_steps, 1)
+        
+        # Calculate HF probability
+        if progress < self.local_end_pct:
+            hf_prob = 0.0
+        elif progress >= self.transition_end_pct:
+            hf_prob = 1.0
+        else:
+            # Linear interpolation
+            hf_prob = (progress - self.local_end_pct) / (self.transition_end_pct - self.local_end_pct)
+        
+        # Decide source for this batch
+        use_hf = random.random() < hf_prob
+        
+        if use_hf:
+            # Ensure HF is initialized
+            if not self.hf_initialized:
+                self._init_hf_streaming()
+            
+            if self.hf_initialized and self.hf_iterator is not None:
+                try:
+                    return next(self.hf_iterator)
+                except StopIteration:
+                    # HF exhausted (shouldn't happen with streaming), reset
+                    self.hf_dataset = self.hf_dataset.shuffle(
+                        seed=self.seed, buffer_size=min(self.buffer_size, 2048)
+                    )
+                    self.hf_batched = self.hf_dataset.batch(batch_size=32)
+                    self.hf_iterator = iter(self.hf_batched)
+                    return next(self.hf_iterator)
+        
+        # Use local
+        try:
+            return next(self.local_iterator)
+        except StopIteration:
+            # Local exhausted, reset and continue
+            logger.debug("Local iterator exhausted, resetting...")
+            self.local_dataset = self.local_dataset.shuffle(
+                seed=self.seed, buffer_size=min(self.buffer_size, 2048)
+            )
+            self.local_batched = self.local_dataset.batch(batch_size=32)
+            self.local_iterator = iter(self.local_batched)
+            return next(self.local_iterator)
 
     def _add_synthetic_tokens(self, count: int):
         """Add synthetic random tokens as fallback."""
@@ -775,7 +1100,9 @@ class HFStreamingDataLoader:
 
         # Extract tokens from buffer
         batch_tokens = [self.token_buffer.popleft() for _ in range(needed)]
-        tokens = torch.tensor(batch_tokens, dtype=torch.long)
+        # If training on CUDA, pinned memory allows non_blocking H2D copies.
+        pin = (self.device == "cpu") and torch.cuda.is_available()
+        tokens = torch.tensor(batch_tokens, dtype=torch.long, pin_memory=pin)
         tokens = tokens.view(self.batch_size, self.seq_len + 1)
 
         self.total_batches += 1
@@ -784,6 +1111,16 @@ class HFStreamingDataLoader:
             "input_ids": tokens[:, :-1],
             "labels": tokens[:, 1:],
         }
+    
+    def set_step(self, step: int):
+        """Update current training step (for gradual transition mode)."""
+        self.current_step = step
+    
+    def set_max_steps(self, max_steps: int):
+        """Update max training steps (for gradual transition mode)."""
+        self.max_steps = max_steps
+        if self.gradual_transition_mode:
+            logger.info(f"Updated max_steps to {max_steps}")
 
     def __iter__(self):
         return self
@@ -797,12 +1134,40 @@ class HFStreamingDataLoader:
 
     def stats(self) -> Dict[str, Any]:
         """Return loader statistics."""
-        return {
+        stats = {
             "total_batches": self.total_batches,
             "batch_size": self.batch_size,
             "buffer_size": len(self.token_buffer),
             "dataset": self.dataset_name,
         }
+        if self.gradual_transition_mode:
+            progress = self.current_step / max(self.max_steps, 1)
+            if progress < self.local_end_pct:
+                hf_pct = 0
+                phase = "Phase 1 (100% local)"
+            elif progress >= self.transition_end_pct:
+                hf_pct = 100
+                phase = "Phase 3 (100% HF streaming)"
+            else:
+                hf_pct = int(100 * (progress - self.local_end_pct) / (self.transition_end_pct - self.local_end_pct))
+                phase = f"Phase 2 (transition: {100-hf_pct}% local, {hf_pct}% HF)"
+            stats.update({
+                "gradual_transition_mode": True,
+                "current_step": self.current_step,
+                "max_steps": self.max_steps,
+                "progress_pct": progress * 100,
+                "hf_probability_pct": hf_pct,
+                "phase": phase,
+            })
+        elif self.sequential_mode:
+            stats.update({
+                "sequential_mode": True,
+                "local_epochs_completed": self.local_epochs_completed,
+                "local_epochs_target": self.local_epochs_target,
+                "using_hf_phase2": self.using_hf_phase2,
+                "phase": "Phase 2 (HF streaming)" if self.using_hf_phase2 else f"Phase 1 (local, epoch {self.local_epochs_completed + 1}/{self.local_epochs_target})",
+            })
+        return stats
 
 
 # ============================================
@@ -887,6 +1252,41 @@ class InterleavedDataLoader:
                 samples_append(0)
                 continue
 
+            # Handle local pre-tokenized .pt files differently
+            if config.get("local"):
+                try:
+                    local_path = Path(config["path"])
+                    pt_files = sorted(local_path.glob("*.pt"))
+                    if not pt_files:
+                        raise FileNotFoundError(f"No .pt files found in {local_path}")
+                    
+                    # Create a generator that yields pre-tokenized batches
+                    local_loader = LocalDataLoader(
+                        data_dir=str(local_path),
+                        batch_size=self.batch_size,
+                        seq_len=self.seq_len,
+                        vocab_size=self.vocab_size,
+                        device="cpu",  # Keep on CPU for interleaving
+                    )
+                    
+                    # Mark as local dataset (special handling in _refill_buffer)
+                    datasets_append(("local", local_loader))
+                    iterators_append(iter(local_loader))
+                    formatters_append(None)  # Already tokenized
+                    text_columns_append(None)  # Not text, already tokens
+                    samples_append(0)
+                    
+                    logger.info(f"  ✓ Loaded {name} (local .pt files: {len(pt_files)} chunks)")
+                    continue
+                except Exception as e:
+                    logger.warning(f"  ✗ Failed to load local dataset {name}: {e}")
+                    datasets_append(None)
+                    iterators_append(None)
+                    formatters_append(None)
+                    text_columns_append("text")
+                    samples_append(0)
+                    continue
+
             try:
                 load_kwargs = {
                     "split": config.get("split", "train"),
@@ -954,6 +1354,20 @@ class InterleavedDataLoader:
             idx = random.choices(available_indices, weights=weights)[0]
 
             try:
+                ds_entry = self.datasets[idx]
+                
+                # Handle local pre-tokenized datasets differently
+                if isinstance(ds_entry, tuple) and ds_entry[0] == "local":
+                    # Local dataset returns already-tokenized batches
+                    batch = next(self.iterators[idx])
+                    input_ids = batch.get("input_ids")
+                    if input_ids is not None:
+                        # Flatten and add to buffer
+                        tokens = input_ids.flatten().tolist()
+                        self.token_buffer.extend(tokens)
+                        self.samples_by_dataset[idx] += input_ids.shape[0]
+                    continue
+                
                 batch = next(self.iterators[idx])
 
                 # Process samples
@@ -985,10 +1399,18 @@ class InterleavedDataLoader:
 
             except StopIteration:
                 # Reset iterator
-                self.datasets[idx] = self.datasets[idx].shuffle(
-                    seed=int(time.time()), buffer_size=self.buffer_size
-                )
-                self.iterators[idx] = iter(self.datasets[idx].batch(batch_size=32))
+                ds_entry = self.datasets[idx]
+                if isinstance(ds_entry, tuple) and ds_entry[0] == "local":
+                    # Reset local loader
+                    local_loader = ds_entry[1]
+                    local_loader.current_chunk = 0
+                    local_loader.current_idx = 0
+                    self.iterators[idx] = iter(local_loader)
+                else:
+                    self.datasets[idx] = self.datasets[idx].shuffle(
+                        seed=self.seed, buffer_size=self.buffer_size
+                    )
+                    self.iterators[idx] = iter(self.datasets[idx].batch(batch_size=32))
 
             except Exception as e:
                 logger.debug(f"Sample error from dataset {idx}: {e}")
@@ -1012,7 +1434,9 @@ class InterleavedDataLoader:
             self._refill_buffer()
 
         batch_tokens = [self.token_buffer.popleft() for _ in range(needed)]
-        tokens = torch.tensor(batch_tokens, dtype=torch.long)
+        # If training on CUDA, pinned memory allows non_blocking H2D copies.
+        pin = (self.device == "cpu") and torch.cuda.is_available()
+        tokens = torch.tensor(batch_tokens, dtype=torch.long, pin_memory=pin)
         tokens = tokens.view(self.batch_size, self.seq_len + 1)
 
         self.total_batches += 1
@@ -1306,6 +1730,7 @@ def create_universal_loader(
     data_dir: Optional[str] = None,
     num_workers: int = 4,  # NEW: parallel workers
     prefetch_factor: int = 2,  # NEW: prefetch batches per worker
+    seed: Optional[int] = None,  # For reproducible shuffling
     # Mix weights for interleaved datasets
     text_weight: float = 0.40,
     math_weight: float = 0.20,
@@ -1333,6 +1758,7 @@ def create_universal_loader(
         data_dir: Directory for local data (required if dataset="local")
         num_workers: Number of parallel data loading workers (default: 4)
         prefetch_factor: Batches to prefetch per worker (default: 2)
+        seed: Random seed for reproducible shuffling (default: None = time-based)
 
     Returns:
         DataLoader instance
@@ -1364,26 +1790,30 @@ def create_universal_loader(
         "vocab_size": vocab_size,
         "device": device,
         "tokenizer_name": tokenizer_name,
+        "seed": seed,
     }
+    
+    # Kwargs without seed for loaders that don't support it
+    basic_kwargs = {k: v for k, v in common_kwargs.items() if k != "seed"}
 
     # Create loader based on type
     if dataset == "synthetic":
-        return SyntheticDataLoader(**common_kwargs)
+        return SyntheticDataLoader(**basic_kwargs)
 
     elif dataset == "local":
         if not data_dir:
             raise ValueError("data_dir required for local dataset")
-        return LocalDataLoader(data_dir=data_dir, **common_kwargs)
+        return LocalDataLoader(data_dir=data_dir, **basic_kwargs)
     
     elif dataset == "local_jsonl" or dataset == "jsonl":
         if not data_dir:
             raise ValueError("data_dir required for local_jsonl dataset")
-        return LocalJSONLDataLoader(data_dir=data_dir, **common_kwargs)
+        return LocalJSONLDataLoader(data_dir=data_dir, **basic_kwargs)
 
     # Check if it's a configured local dataset (pre-tokenized .pt files)
     elif dataset in DATASET_CONFIGS and DATASET_CONFIGS[dataset].get("local"):
         config = DATASET_CONFIGS[dataset]
-        return LocalDataLoader(data_dir=config["path"], **common_kwargs)
+        return LocalDataLoader(data_dir=config["path"], **basic_kwargs)
 
     elif dataset in ["synthetic_mix", "mix"]:
         # Use interleaved loader with multiple datasets
@@ -1403,6 +1833,26 @@ def create_universal_loader(
             **kwargs,
         )
 
+    # Support for mixed dataset configs (pretrain_1b, sft_chat, etc.)
+    elif dataset in DATASET_CONFIGS and DATASET_CONFIGS[dataset].get("mixed"):
+        config = DATASET_CONFIGS[dataset]
+        sources = config["sources"]
+        
+        datasets_config = [{"name": s["name"]} for s in sources]
+        probabilities = [s["weight"] for s in sources]
+        
+        logger.info(f"Creating mixed dataset '{dataset}':")
+        for s in sources:
+            logger.info(f"  - {s['name']}: {s['weight']*100:.0f}%")
+        
+        return InterleavedDataLoader(
+            datasets_config=datasets_config,
+            probabilities=probabilities,
+            num_workers=num_workers,
+            **common_kwargs,
+            **kwargs,
+        )
+
     elif dataset in DATASET_CONFIGS:
         return HFStreamingDataLoader(
             dataset_name=dataset,
@@ -1414,7 +1864,7 @@ def create_universal_loader(
 
     else:
         logger.warning(f"Unknown dataset '{dataset}', using synthetic")
-        return SyntheticDataLoader(**common_kwargs)
+        return SyntheticDataLoader(**basic_kwargs)
 
 
 # ============================================
