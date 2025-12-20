@@ -12,6 +12,7 @@ Usage:
 from .common import (
     # Core layers
     RMSNorm,
+    AdaRMSNorm,
     SwiGLUMLP,
     SwiGLUMLPFused,
     RotaryEmbedding,
@@ -38,6 +39,7 @@ from .common import (
 __all__ = [
     # Core layers
     "RMSNorm",
+    "AdaRMSNorm",
     "SwiGLUMLP",
     "SwiGLUMLPFused",
     "RotaryEmbedding",

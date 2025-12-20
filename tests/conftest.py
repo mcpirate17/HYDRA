@@ -23,38 +23,6 @@ def dtype():
     return torch.float32
 
 
-@pytest.fixture
-def small_model_config():
-    """Configuration for a small test model."""
-    return {
-        "vocab_size": 1000,
-        "dim": 256,
-        "n_mor_blocks": 2,
-        "recursions": 2,
-        "n_heads": 4,
-        "n_kv_heads": 2,
-        "compression_factor": 4,
-        "capacity_ratio": 0.75,
-        "max_seq_len": 128,
-    }
-
-
-@pytest.fixture
-def medium_model_config():
-    """Configuration for a medium test model (100M scale)."""
-    return {
-        "vocab_size": 32000,
-        "dim": 768,
-        "n_mor_blocks": 8,
-        "recursions": 4,
-        "n_heads": 12,
-        "n_kv_heads": 3,
-        "compression_factor": 4,
-        "capacity_ratio": 0.75,
-        "max_seq_len": 512,
-    }
-
-
 def pytest_configure(config):
     """Configure custom markers."""
     config.addinivalue_line(

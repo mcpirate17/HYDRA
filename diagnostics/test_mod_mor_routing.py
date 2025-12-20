@@ -25,13 +25,12 @@ class TestMoDMoRRouting:
         model = CCGQAMoDMoRModel(
             vocab_size=1000,
             dim=256,
-            n_layers=4,  # 4 MoR blocks
+            n_mor_blocks=4,  # 4 MoR blocks
             n_heads=4,
             max_seq_len=128,
             n_kv_heads=2,
-            ffn_dim_multiplier=1.0,
-            norm_eps=1e-5,
-            max_recursions=3,
+            mlp_ratio=1.0,
+            recursions_per_block=3,
             mod_capacity=0.5,
         )
         return model
@@ -44,21 +43,28 @@ class TestMoDMoRRouting:
         return torch.randint(0, 1000, (batch_size, seq_len))
     
     def test_mod_capacity_not_collapsed(self, model, sample_input):
-        """Test that MoD layers don't collapse to 0 or 1."""
-        model.eval()
+        """Test that MoD layers don't collapse to 0 or 1.
+        
+        Note: Uses train mode because eval mode may show different routing
+        behavior (hard vs soft routing). This test validates training behavior.
+        """
+        model.train()  # Use train mode for soft routing
         with torch.no_grad():
             _ = model(sample_input)
         
+        # Use stable API for routing stats
+        stats = model.get_routing_stats()
+        mod_layers = stats.get("mod_layers", [])
+        
         # Check MoD layers
         mod_issues = []
-        for i, layer in enumerate(model.layers):
-            if hasattr(layer, 'inner') and hasattr(layer.inner, '_last_probs_mean'):
-                probs = layer.inner._last_probs_mean
-                if probs is not None:
-                    if probs > 0.95:
-                        mod_issues.append(f"Layer {i}: probs={probs:.3f} (collapsed to process all)")
-                    elif probs < 0.05:
-                        mod_issues.append(f"Layer {i}: probs={probs:.3f} (collapsed to skip all)")
+        for layer_stat in mod_layers:
+            probs = layer_stat.get("probs_mean", 0.5)
+            layer_idx = layer_stat.get("layer", "?")
+            if probs > 0.95:
+                mod_issues.append(f"Layer {layer_idx}: probs={probs:.3f} (collapsed to process all)")
+            elif probs < 0.05:
+                mod_issues.append(f"Layer {layer_idx}: probs={probs:.3f} (collapsed to skip all)")
         
         assert len(mod_issues) == 0, f"MoD collapse detected:\n" + "\n".join(mod_issues)
     
@@ -76,28 +82,17 @@ class TestMoDMoRRouting:
             with torch.no_grad():
                 _ = model(sample_input)
         
-        # Check MoR layers - they have _last_router_probs_mean directly
-        mor_layers_found = 0
-        router_values = []
-        for i, layer in enumerate(model.layers):
-            probs = None
-            # Direct MoR block
-            if hasattr(layer, '_last_router_probs_mean'):
-                probs = layer._last_router_probs_mean
-                mor_layers_found += 1
-            # MoD wrapper around MoR block
-            elif hasattr(layer, 'inner') and hasattr(layer.inner, '_last_router_probs_mean'):
-                probs = layer.inner._last_router_probs_mean
-                mor_layers_found += 1
-            
-            if probs is not None:
-                router_values.append((i, probs))
+        # Use stable API for routing stats
+        stats = model.get_routing_stats()
+        mor_layers = stats.get("mor_layers", [])
         
         # Should have found some MoR layers
-        assert mor_layers_found > 0, "No MoR layers found in model"
+        assert len(mor_layers) > 0, "No MoR layers found in model"
         
         # Router values should be valid (between 0 and 1)
-        for layer_idx, probs in router_values:
+        for layer_stat in mor_layers:
+            probs = layer_stat.get("router_probs_mean", 0.5)
+            layer_idx = layer_stat.get("layer", "?")
             assert 0.0 <= probs <= 1.0, f"Layer {layer_idx}: invalid router_probs={probs}"
     
     def test_aux_loss_reasonable_magnitude(self, model, sample_input):
@@ -136,18 +131,13 @@ class TestMoDMoRRouting:
             with torch.no_grad():
                 _ = model(sample_input)
         
-        # Collect MoD probs
-        mod_probs = []
-        for layer in model.layers:
-            if hasattr(layer, 'inner') and hasattr(layer.inner, '_last_probs_mean'):
-                probs = layer.inner._last_probs_mean
-                if probs is not None:
-                    mod_probs.append(probs)
+        # Use stable API for routing stats
+        stats = model.get_routing_stats()
+        summary = stats.get("summary", {})
+        avg_probs = summary.get("mod_probs_mean", 0.5)
         
-        if mod_probs:
-            avg_probs = sum(mod_probs) / len(mod_probs)
-            # Allow 0.2-0.8 range initially (not collapsed)
-            assert 0.2 < avg_probs < 0.8, f"MoD avg probs {avg_probs:.3f} too far from target 0.5"
+        # Allow 0.2-0.8 range initially (not collapsed)
+        assert 0.2 < avg_probs < 0.8, f"MoD avg probs {avg_probs:.3f} too far from target 0.5"
     
     def test_gradients_flow_through_routers(self, model, sample_input):
         """Test that gradients flow through both MoD and MoR routers."""
@@ -191,13 +181,12 @@ class TestAuxLossWeighting:
         model = CCGQAMoDMoRModel(
             vocab_size=1000,
             dim=128,
-            n_layers=2,
+            n_mor_blocks=2,
             n_heads=2,
             max_seq_len=64,
             n_kv_heads=1,
-            ffn_dim_multiplier=1.0,
-            norm_eps=1e-5,
-            max_recursions=2,
+            mlp_ratio=1.0,
+            recursions_per_block=2,
             mod_capacity=0.5,
             aux_loss_weight=0.1,  # Test with 0.1
         )

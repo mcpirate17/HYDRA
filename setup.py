@@ -12,7 +12,6 @@ setup(
     description="Hybrid Dynamic Routing Architecture - CCGQA + MoD + MoR Transformer",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourname/hydra",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",

@@ -12,10 +12,11 @@ Key design decisions for compile compatibility:
 """
 
 import math
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Callable
+from typing import Any, Optional, Tuple, Callable
 
 # =============================================================================
 # FEATURE FLAGS: Detect available backends at import time
@@ -32,11 +33,19 @@ except ImportError:
     fused_qk_norm = None
 
 FLASH_ATTN_AVAILABLE = False
+FLASH_ATTN_VERSION = (0, 0, 0)
 try:
     from flash_attn import flash_attn_func
+    import flash_attn
     FLASH_ATTN_AVAILABLE = True
+    # Parse version for FA3 features
+    _fa_ver = getattr(flash_attn, "__version__", "0.0.0")
+    FLASH_ATTN_VERSION = tuple(int(x) for x in _fa_ver.split(".")[:3])
 except ImportError:
     flash_attn_func = None
+
+# Flash Attention 3 has additional optimizations (FP8 support, better perf)
+FLASH_ATTN_3_AVAILABLE = FLASH_ATTN_AVAILABLE and FLASH_ATTN_VERSION >= (3, 0, 0)
 
 XFORMERS_AVAILABLE = False
 try:
@@ -87,11 +96,24 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Prefer PyTorch's native RMSNorm when available (fast + stable).
-        # This is generally safer than custom fused kernels.
+        # HYDRA's Triton fused RMSNorm is opt-in because its backward has been
+        # observed to be incorrect on some stacks.
+        prefer_fused = os.environ.get("HYDRA_PREFER_FUSED_RMS_NORM", "0") == "1"
+        allow_fused_backward = os.environ.get("HYDRA_ALLOW_FUSED_RMS_NORM_BACKWARD", "0") == "1"
+
+        if prefer_fused and FUSED_KERNELS_AVAILABLE and fused_rms_norm is not None:
+            # Safety: do not allow training/backward to silently use a potentially-wrong fused backward.
+            if x.requires_grad and not allow_fused_backward:
+                raise RuntimeError(
+                    "HYDRA_PREFER_FUSED_RMS_NORM=1 requested, but fused RMSNorm backward is disabled by default. "
+                    "Set HYDRA_ALLOW_FUSED_RMS_NORM_BACKWARD=1 to acknowledge the risk (or leave prefer_fused=0)."
+                )
+            return fused_rms_norm(x, self.weight, self.eps)
+
         if hasattr(F, "rms_norm"):
             return F.rms_norm(x, [x.shape[-1]], weight=self.weight, eps=self.eps)
 
-        # Use fused kernel if available (already wrapped with @compiler.disable in fused_ops.py)
+        # Fallback to fused kernel only if native rms_norm is unavailable.
         if FUSED_KERNELS_AVAILABLE and fused_rms_norm is not None:
             return fused_rms_norm(x, self.weight, self.eps)
         
@@ -101,6 +123,60 @@ class RMSNorm(nn.Module):
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
         return (self.weight * x).to(dtype)
+
+
+class AdaRMSNorm(nn.Module):
+    """Adaptive RMSNorm.
+
+    Unconditioned path matches RMSNorm behavior.
+    Conditioned path applies a learned scale/shift from an external conditioning
+    vector (broadcast over sequence length).
+
+    This is provided to mirror the `norm_AdaRMSNorm` variant seen in DMTA2
+    benchmarks, while keeping HYDRA's default unchanged.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        cond_dim: Optional[int] = None,
+        eps: float = 1e-6,
+        **_: Any,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.cond_dim = cond_dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+        # Only allocate conditioning projection if requested.
+        self._cond_proj: Optional[nn.Linear]
+        if cond_dim is not None:
+            self._cond_proj = nn.Linear(cond_dim, 2 * dim)
+        else:
+            self._cond_proj = None
+
+    def _rmsnorm(self, x: torch.Tensor) -> torch.Tensor:
+        # Keep this as simple ops to allow torch.compile to fuse aggressively.
+        rms = x.pow(2).mean(dim=-1, keepdim=True)
+        x_norm = x * torch.rsqrt(rms + self.eps)
+        return x_norm * self.weight
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._rmsnorm(x)
+
+    def forward_conditioned(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        if self._cond_proj is None:
+            raise RuntimeError(
+                "AdaRMSNorm was constructed without cond_dim; "
+                "conditioning is not available."
+            )
+
+        h = self._rmsnorm(x)
+        sb = self._cond_proj(cond)
+        s, b = sb.chunk(2, dim=-1)
+        return h * (1.0 + s.unsqueeze(1)) + b.unsqueeze(1)
 
 
 # =============================================================================

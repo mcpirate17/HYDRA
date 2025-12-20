@@ -30,14 +30,63 @@ Usage:
     # Or use the router standalone
     router = MoDRouter(dim=512, capacity_ratio=0.5)
     mask, indices = router(x)  # Get which tokens to process
+    
+    # Or use config-based initialization
+    config = MoDConfig(dim=512, capacity_ratio=0.5)
+    router = MoDRouter.from_config(config)
 """
 
+from __future__ import annotations
+
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
+
+__all__ = [
+    "MoDConfig",
+    "MoDRouter",
+    "MixtureOfDepthsBlock",
+    "MoDMLPBlock",
+    "MoDAttentionMLPBlock",
+    "MoDConditionalBlock",
+]
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+@dataclass(frozen=True, slots=True)
+class MoDConfig:
+    """Immutable configuration for Mixture of Depths.
+    
+    Attributes:
+        dim: Model hidden dimension
+        capacity_ratio: Fraction of tokens to process (0.0-1.0)
+        aux_loss_weight: Weight for load balancing auxiliary loss
+        jitter_noise: Noise added during training for exploration
+        max_seq_len: Maximum sequence length (for static k computation)
+        warmup_steps: Steps before switching to hard routing
+    """
+    dim: int
+    capacity_ratio: float = 0.5
+    aux_loss_weight: float = 0.01
+    jitter_noise: float = 0.0
+    max_seq_len: int = 2048
+    warmup_steps: int = 100
+    
+    def __post_init__(self) -> None:
+        """Validate configuration values."""
+        if self.dim <= 0:
+            raise ValueError(f"dim must be positive, got {self.dim}")
+        if not 0.0 < self.capacity_ratio <= 1.0:
+            raise ValueError(f"capacity_ratio must be in (0, 1], got {self.capacity_ratio}")
+        if self.aux_loss_weight < 0:
+            raise ValueError(f"aux_loss_weight must be >= 0, got {self.aux_loss_weight}")
 
 
 class MoDRouter(nn.Module):
@@ -47,8 +96,10 @@ class MoDRouter(nn.Module):
     Scores each token and selects top-k for processing.
     Uses straight-through estimator for gradient flow.
     
-    NOTE: k is computed statically from max_seq_len to avoid torch.compile
-    recompilation from data-dependent shapes.
+        NOTE: k is computed from the *actual* sequence length L so that capacity
+        behaves as expected during stepped-sequence training (e.g., 512/1024).
+        For fixed L (typical training), torch.compile will still specialize once
+        per sequence length.
     """
 
     def __init__(
@@ -72,9 +123,10 @@ class MoDRouter(nn.Module):
         self.capacity_ratio = capacity_ratio
         self.aux_loss_weight = aux_loss_weight
         self.jitter_noise = jitter_noise
-        # Static k computation for torch.compile compatibility
-        # This avoids recompilation from data-dependent k = int(L * capacity_ratio)
+        # Keep max_seq_len as a config field for backward compatibility / diagnostics.
         self.max_seq_len = max_seq_len
+        # Historical: used to compute a static k. We keep the attribute for compatibility,
+        # but routing now uses k derived from the runtime sequence length.
         self.static_k = max(1, int(max_seq_len * capacity_ratio))
 
         # Simple linear router (cheap)
@@ -89,6 +141,24 @@ class MoDRouter(nn.Module):
 
         # Track load for auxiliary loss
         self.register_buffer("_aux_loss", torch.tensor(0.0))
+    
+    @classmethod
+    def from_config(cls, config: MoDConfig) -> "MoDRouter":
+        """Create MoDRouter from config object.
+        
+        Args:
+            config: MoDConfig with router parameters
+        
+        Returns:
+            Initialized MoDRouter
+        """
+        return cls(
+            dim=config.dim,
+            capacity_ratio=config.capacity_ratio,
+            aux_loss_weight=config.aux_loss_weight,
+            jitter_noise=config.jitter_noise,
+            max_seq_len=config.max_seq_len,
+        )
 
     def forward(
         self,
@@ -108,9 +178,11 @@ class MoDRouter(nn.Module):
             scores: Router scores if return_scores=True
         """
         B, L, D = x.shape
-        # Use static k for torch.compile compatibility (no data-dependent shapes)
-        # Clamp to actual sequence length to handle shorter sequences
-        k = min(self.static_k, L)
+        # Compute k from the runtime sequence length so capacity_ratio is respected
+        # for stepped-sequence training (e.g., L=512/1024).
+        cap = float(min(max(self.capacity_ratio, 1e-4), 1.0))
+        k = int(L * cap)
+        k = max(1, min(L, k))
 
         # Get router scores
         scores = self.router(x).squeeze(-1)  # [B, L]
@@ -214,7 +286,8 @@ class MixtureOfDepthsBlock(nn.Module):
         out_selected = self.block(x_selected, **kwargs)  # [B, k, D]
 
         # Scatter back to full sequence (with identity for skipped)
-        output = x.clone()  # Start with identity (residual)
+        # Ensure output dtype matches out_selected (for mixed precision)
+        output = x.clone().to(out_selected.dtype)  # Start with identity (residual)
         output.scatter_(1, indices_expanded, out_selected)
 
         return output

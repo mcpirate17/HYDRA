@@ -91,18 +91,116 @@ Input Tokens
 
 ## 📊 Model Variants
 
-HYDRA supports multiple scales with validated compliance:
+HYDRA supports multiple scales optimized for different GPU memory budgets:
 
-| Variant | Parameters | Dim | Layers | MoR Blocks × Recursions | Status |
-|---------|------------|-----|--------|-------------------------|--------|
-| **100M** | ~100M | 768 | 32 | 8 × 4 | ✅ Validated |
-| **250M** | ~216M | 1024 | 48 | 12 × 4 | ✅ Validated |
-| **500M** | ~570M | 1536 | 64 | 16 × 4 | ✅ Validated |
-| **750M** | ~927M | 1792 | 80 | 20 × 4 | ✅ Validated |
-| **900M** | ~1.2B | 2048 | 80 | 20 × 4 | ✅ Validated |
-| **1B** | ~1.4B | 2048 | 96 | 24 × 4 | ✅ Validated |
-| **1.5B** | ~2.2B | 2560 | 120 | 24 × 5 | ✅ Validated |
-| **4B** | ~4B | 4096 | 160 | 40 × 4 | 📈 Predicted |
+| Variant | Parameters | Dim | MoR Blocks × Rec | Eff Layers | GPU Memory | Status |
+|---------|------------|-----|------------------|------------|------------|--------|
+| **100M** | ~104M | 768 | 8 × 4 | 32 | ~14GB | ✅ Validated |
+| **250M** | ~198M | 1024 | 10 × 4 | 40 | ~18GB | ✅ Validated |
+| **500M** | ~426M | 1280 | 16 × 4 | 64 | ~22GB | ✅ Validated |
+| **750M** | ~665M | 1536 | 18 × 4 | 72 | ~26GB | ✅ Validated |
+| **1B** | ~973M | 1792 | 20 × 4 | 80 | ~29GB | ✅ Validated |
+| **1.5B** | ~1,369M | 2048 | 22 × 4 | 88 | ~36GB | ⚠️ 48GB+ GPU |
+
+> **Note:** GPU memory is peak usage during training with 8-bit Adam + gradient checkpointing on RTX 5090 32GB.
+
+### Block Architecture
+
+Each **MoR Block** contains the following layers:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  MoR Block (repeated n_mor_blocks times)                        │
+├─────────────────────────────────────────────────────────────────┤
+│  1. CCGQA Attention                                             │
+│     ├── RMSNorm (pre-norm)                                      │
+│     ├── Q/K/V Linear projections (dim → n_heads × head_dim)    │
+│     ├── RoPE positional embeddings                              │
+│     ├── Grouped Query Attention (4:1 to 8:1 GQA ratio)         │
+│     ├── Context Compression (for long sequences)                │
+│     └── Output Linear projection                                │
+│                                                                 │
+│  2. SwiGLU MLP                                                  │
+│     ├── RMSNorm (pre-norm)                                      │
+│     ├── Gate Linear (dim → hidden_dim)                         │
+│     ├── Up Linear (dim → hidden_dim)                           │
+│     ├── SiLU activation × gate                                  │
+│     └── Down Linear (hidden_dim → dim)                         │
+│                                                                 │
+│  3. MoD Router (Mixture of Depths)                              │
+│     └── Token-level routing (75% capacity, skip unimportant)    │
+│                                                                 │
+│  4. MoR Router (Mixture of Recursions)                          │
+│     ├── Recursion embedding (one per recursion depth)           │
+│     └── Decides which tokens need more processing               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Effective Layers** = `n_mor_blocks × recursions` (weights are shared across recursions within each block)
+
+---
+
+## 🚀 Training on RTX 5090 (32GB)
+
+### Memory Requirements by Model Size
+
+Benchmarked on RTX 5090 32GB with 8-bit Adam + gradient checkpointing (every layer):
+
+| Model | Actual Params | Dim | Blocks × Rec | Eff Layers | Batch | Accum | Peak Mem | Throughput |
+|-------|---------------|-----|--------------|------------|-------|-------|----------|------------|
+| **100M** | ~104M | 768 | 8 × 4 | 32 | 32 | 4 | ~14GB | ~30K tok/s |
+| **250M** | ~198M | 1024 | 10 × 4 | 40 | 24 | 5 | ~18GB | ~20K tok/s |
+| **500M** | ~426M | 1280 | 16 × 4 | 64 | 8 | 8 | ~22GB | ~12K tok/s |
+| **750M** | ~665M | 1536 | 18 × 4 | 72 | 4 | 16 | ~26GB | ~8K tok/s |
+| **1B** | ~973M | 1792 | 20 × 4 | 80 | 2 | 30 | ~29GB | ~5K tok/s |
+| **1.5B** | ~1,369M | 2048 | 22 × 4 | 88 | 1 | 60 | ~36GB | ⚠️ 48GB+ |
+
+> ⚠️ **1B Model Warning:** `batch_size=3` peaks at ~32GB (borderline on 32GB GPU), `batch_size=4+` will OOM!
+> 
+> ⚠️ **1.5B Model:** Requires 48GB+ VRAM (A6000, RTX 6000, or multi-GPU setup)
+
+### Required Flags for Large Models (750M+)
+
+```bash
+--8bit_adam              # Essential - saves ~75% optimizer memory
+--checkpoint_every 1     # Gradient checkpointing on every layer
+```
+
+### Training Commands
+
+**100M Model (quick testing):**
+```bash
+python trainer.py \
+  --model_size 100M \
+  --mode testing \
+  --max_steps 1000
+```
+
+**1B Model (production):**
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python trainer.py \
+    --model_size 1B \
+    --mode production \
+    --8bit_adam \
+    --checkpoint_every 1 \
+    --adaptive_lr \
+    --triton_kernels \
+    --chunked_ce \
+    --dataset finefineweb-sequential \
+    --seed 42
+```
+
+> **Note:** Batch size and gradient accumulation are automatically set based on `--model_size`. Override with `--batch_size` and `--grad_accum` if needed.
+
+### Stepped Sequence Training (Advanced)
+
+For 1B model with longer context, use stepped sequence scheduling:
+
+| Phase | Seq Len | Batch | Accum | Memory | Tokens/Step |
+|-------|---------|-------|-------|--------|-------------|
+| **1** | 512 | 2 | 30 | 28.5GB | 30,720 |
+| **2** | 1024 | 1 | 32 | ~25GB | 32,768 |
+| **3** | 2048 | 1 | 32 | ~28GB | 65,536 |
 
 ---
 
@@ -244,6 +342,27 @@ python diagnostics/scaling_analysis.py \
     --output reports/scaling_analysis_results.json
 ```
 
+### Attention Architecture (MoR blocks)
+
+HYDRA uses **Lightning-Attention 2** (lla2) for efficient scaled-dot-product attention combined with **CCGQA** (Compressed Convolutional Grouped Query Attention).
+
+**Default pattern**: 3× Lightning-Attention blocks + 1× CCGQA block per MoR macro-block
+
+```bash
+# This is the default (no env var needed):
+python diagnostics/tall_skinny_bench.py --device cuda --preset 100m --steps 1
+
+# Explicitly set the named pattern:
+HYDRA_MOR_ATTENTION_PATTERN_NAME='lla2x3+ccqa' python diagnostics/tall_skinny_bench.py --device cuda --preset 100m --steps 1
+
+# Or define as literal token sequence:
+HYDRA_MOR_ATTENTION_PATTERN='lla2,lla2,lla2,ccqa' python diagnostics/tall_skinny_bench.py --device cuda --preset 100m --steps 1
+```
+
+**Requirements**:
+- `lla2` requires CUDA (the external lightning-attention kernels are Triton/CUDA based).
+- HYDRA_MOR_ATTENTION_OVERRIDE still exists and overrides all blocks if set.
+
 ---
 
 ## 📈 Scaling Analysis
@@ -279,6 +398,66 @@ HYDRA follows a rigorous testing philosophy:
 2. **Scale Invariance**: Tests run at multiple scales (100M → 1.5B)
 3. **Repeatability**: All tests use fixed seeds and are deterministic
 4. **Regression Prevention**: Scaling analysis detects drift in hyperparameters
+
+---
+
+## ⚙️ Performance Optimizations
+
+### Kernel-Level Optimizations
+
+**Liger Kernels (BF16 fused operations, auto-enabled)**
+- **LigerRMSNorm**: ~30% memory savings, 1.5-2× faster
+- **LigerSwiGLU**: ~1.3× faster, avoids intermediate materialization
+- **LigerCrossEntropy**: ~60% memory savings, 2× faster
+- **LigerFusedLinearCrossEntropy**: ~80% output layer savings, never materializes full logits
+
+**Triton Custom Kernels (opt-in via `--triton_kernels`)**
+- **fused_qk_norm**: Fused L2 normalization for Q/K (1.5-2× faster, autograd-compatible)
+- **fused_swiglu**: Fused SiLU activation (1.3× faster, autograd-compatible)
+- **fused_rope**: Fused RoPE (2-3× faster, opt-in via `HYDRA_ENABLE_FUSED_ROPE=1`)
+- **fused_rms_norm**: Fused RMSNorm (opt-in via `HYDRA_ENABLE_FUSED_RMS_NORM=1`)
+
+**Flash Attention**
+- Flash Attention 2/3 auto-detected and enabled
+- Memory-efficient attention (no QK^T materialization)
+- FP8 support on Flash Attention 3
+
+### Training Infrastructure
+
+**torch.compile**: Graph optimization with `max-autotune-no-cudagraphs` mode
+**Mixed Precision**: BF16 forward/backward with FP32 master weights
+**Memory Optimization**:
+- Gradient checkpointing (every N layers, default N=2)
+- 8-bit Adam (~75% optimizer memory savings, essential for 750M+)
+- Chunked cross-entropy (4096 tokens per chunk)
+
+**Data Loading**:
+- Multi-worker parallel loading (4-8× faster)
+- Background prefetching (2× prefetch factor)
+- Rust-based fast tokenizers (3-10× faster)
+- HF Transfer protocol (5-10× faster downloads)
+
+**Learning Rate**:
+- WSD (Warmup-Stable-Decay) scheduler with adaptive LR
+- Auto-trigger cooldown on loss spikes
+- Stochastic Weight Averaging (last 25% of training)
+- Batch filtering (skip corrupted/noisy batches)
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HYDRA_ENABLE_FUSED_ROPE` | `0` | Enable fused RoPE kernel (opt-in due to GPU compatibility) |
+| `HYDRA_ENABLE_FUSED_RMS_NORM` | `0` | Enable fused RMSNorm kernel (opt-in due to gradient concerns) |
+| `HF_HUB_ENABLE_HF_TRANSFER` | `1` | Enable fast HuggingFace transfers (auto-enabled) |
+| `HYDRA_MOR_ATTENTION_PATTERN_NAME` | `lla2x3+ccqa` | Attention pattern for MoR blocks (CUDA only) |
+
+```bash
+# Enable all fused kernels (experimental)
+export HYDRA_ENABLE_FUSED_ROPE=1
+export HYDRA_ENABLE_FUSED_RMS_NORM=1
+python trainer.py --triton_kernels ...
+```
 
 ---
 

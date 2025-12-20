@@ -20,7 +20,7 @@ Usage:
     python diagnostics/scaling_analysis.py --predict-4b
 
     # Profile training performance
-    python -m torch.utils.bottleneck train_100m_optimized.py --max_steps 50
+    python -m torch.utils.bottleneck trainer.py --max_steps 50
 """
 
 import sys
@@ -61,11 +61,11 @@ def print_external_tools():
     print("\n🛠️  External Tools (install separately):")
     print("   pip install memory-profiler matplotlib")
     print("   # Memory profiling:")
-    print("   mprof run python train_100m_optimized.py --max_steps 50")
+    print("   mprof run python trainer.py --max_steps 50")
     print("   mprof plot")
     print("   ")
     print("   # PyTorch bottleneck analysis:")
-    print("   python -m torch.utils.bottleneck train_100m_optimized.py --max_steps 10")
+    print("   python -m torch.utils.bottleneck trainer.py --max_steps 10")
     print("   ")
     print("   # TensorBoard profiling (add to training script):")
     print("   from torch.profiler import profile, ProfilerActivity, schedule")

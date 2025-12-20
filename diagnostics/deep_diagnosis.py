@@ -10,6 +10,7 @@ Optional: Install memory-profiler for detailed analysis:
     mprof plot
 """
 
+import os
 import torch
 import torch.nn as nn
 from pathlib import Path
@@ -20,7 +21,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hydra.model.ccgqa import create_ccgqa_mod_mor_model
 
-device = "cuda"
+# Device selection with CPU fallback
+if torch.cuda.is_available():
+    device = "cuda"
+    # Default attention pattern (per MoR block): 3:1 macro-block [LLA2, LLA2, LLA2, CCQA].
+    # Users can override via HYDRA_MOR_ATTENTION_PATTERN / HYDRA_MOR_ATTENTION_PATTERN_NAME.
+    os.environ.setdefault("HYDRA_MOR_ATTENTION_PATTERN_NAME", "lla2x3+ccqa")
+else:
+    device = "cpu"
+    print("⚠️  WARNING: CUDA not available, running on CPU.")
+    print("   Results may differ from GPU due to numerical precision differences.")
+    print("   For accurate diagnostics, run on a CUDA-enabled system.\n")
 
 # Create model
 config = {

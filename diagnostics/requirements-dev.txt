@@ -14,7 +14,7 @@ pytest-benchmark>=3.4.0
 pytest-cov>=3.0.0
 
 # Performance profiling
-py-spy>=0.3.0      # CPU profiler: py-spy top -- python train_100m_optimized.py
+py-spy>=0.3.0      # CPU profiler: py-spy top -- python trainer.py
 line_profiler>=3.5.0  # Line-by-line profiler
 
 # Optional: Advanced profiling

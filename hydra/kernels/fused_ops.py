@@ -73,10 +73,10 @@ USE_TRITON_KERNELS = TRITON_AVAILABLE and os.environ.get("HYDRA_DISABLE_TRITON",
 # NOTE: Fused RMSNorm is currently DISABLED by default because its backward has been observed
 #       to produce massively incorrect gradients on some stacks. Opt in explicitly via
 #       HYDRA_ENABLE_FUSED_RMS_NORM=1.
-USE_FUSED_ROPE = False  # Disabled until Triton fixes Blackwell support
+USE_FUSED_ROPE = USE_TRITON_KERNELS and os.environ.get("HYDRA_ENABLE_FUSED_ROPE", "0") == "1"
 USE_FUSED_QK_NORM = USE_TRITON_KERNELS  # Now autograd-compatible!
 USE_FUSED_SWIGLU = USE_TRITON_KERNELS  # Now autograd-compatible!
-USE_FUSED_RMS_NORM = False  # Opt-in only (see HYDRA_ENABLE_FUSED_RMS_NORM)
+USE_FUSED_RMS_NORM = USE_TRITON_KERNELS and os.environ.get("HYDRA_ENABLE_FUSED_RMS_NORM", "0") == "1"
 
 
 def set_use_triton_kernels(enabled: bool):
@@ -227,7 +227,7 @@ def _fused_rope_triton(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) ->
         out,
         S,
         half_head_dim,
-        x.stride(0) * x.stride(1),  # Treat batch*head as single dim
+        x.stride(1),  # Treat batch*head as single dim (x is contiguous)
         1,  # Not used directly
         x.stride(2),
         x.stride(3),

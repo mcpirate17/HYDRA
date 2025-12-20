@@ -35,14 +35,14 @@ variants:
     aux_loss_weight: 0.0173
 
   500M:
-    dim: 1536
-    n_mor_blocks: 16
+    dim: 1792
+    n_mor_blocks: 14
     recursions: 4
-    n_heads: 24
+    n_heads: 28
     n_kv_heads: 4
-    effective_layers: 64
-    expected_params_m: 570
-    aux_loss_weight: 0.0283
+    effective_layers: 56
+    expected_params_m: 502
+    aux_loss_weight: 0.0250
 
   750M:
     dim: 1792

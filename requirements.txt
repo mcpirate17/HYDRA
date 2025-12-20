@@ -30,15 +30,42 @@ pytest>=7.0.0
 # Triton 3.0+ recommended for best autotuning
 triton>=2.0.0
 
-# Flash Attention 2 - RECOMMENDED for long sequences
+# -----------------------------------------------------------------------------
+# PERFORMANCE TIER 1: Flash Attention (Recommended for ALL users)
+# -----------------------------------------------------------------------------
+# Flash Attention 2/3 - HIGHLY RECOMMENDED for long sequences
 # Requires CUDA 11.6+ and compute capability 8.0+ (Ampere+)
 # Install with: pip install flash-attn --no-build-isolation
 # flash-attn>=2.5.0
 
+# -----------------------------------------------------------------------------
+# PERFORMANCE TIER 2: Liger Kernels (Best for memory savings)
+# -----------------------------------------------------------------------------
+# LinkedIn's fused BF16 kernels - BEST FOR OOM ISSUES
+# Provides 50-60% memory reduction, 20% speedup
+# pip install liger-kernel
+# liger-kernel>=0.2.0
+
+# -----------------------------------------------------------------------------
+# PERFORMANCE TIER 3: Transformer Engine (Maximum TFLOPS on Hopper+)
+# -----------------------------------------------------------------------------
+# NVIDIA's FP8 training library - BEST THROUGHPUT on H100/H200
+# Requires Hopper+ GPU (sm_90) and CUDA 12.0+
+# pip install transformer-engine[pytorch]
+# transformer-engine>=1.0.0
+
+# -----------------------------------------------------------------------------
+# ALTERNATIVE: xFormers (if Flash Attention doesn't work)
+# -----------------------------------------------------------------------------
 # xFormers - Alternative memory-efficient attention
 # Good fallback if Flash Attention doesn't work
 # pip install xformers
 # xformers>=0.0.22
+
+# bitsandbytes - 8-bit Adam optimizer for 1B+ models
+# Reduces optimizer memory by 75% (~6GB saved for 1B model)
+# Install with: pip install bitsandbytes
+# bitsandbytes>=0.41.0
 
 # =============================================================================
 # OPTIONAL DEVELOPMENT DEPENDENCIES
@@ -55,3 +82,4 @@ triton>=2.0.0
 # Profiling
 # memory_profiler>=0.60.0
 # line_profiler>=4.0.0
+
