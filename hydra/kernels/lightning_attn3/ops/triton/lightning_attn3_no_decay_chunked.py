@@ -6,6 +6,7 @@
 import torch
 import triton
 import triton.language as tl
+import os
 
 # ============================================================================
 # BLACKWELL CONSTRAINTS (SM 12.x: max 101KB shared memory)
@@ -25,6 +26,111 @@ SRAM_BUDGET = 96_000
 # Debug/benchmark visibility: populated during backward
 # Format: (CBLOCK_INTER, INTER_STAGES, INTER_WARPS)
 _LAST_INTER_CONFIG: tuple[int, int, int] | None = None
+
+# Cache best measured inter-kernel configs per shape/device.
+# Key: (device_idx, n, d, e, dtype)
+_INTER_CONFIG_CACHE: dict[tuple[int, int, int, int, torch.dtype], tuple[int, int, int]] = {}
+
+
+def _autotune_inter_config(
+    *,
+    device_idx: int,
+    n: int,
+    d: int,
+    e: int,
+    dtype: torch.dtype,
+) -> tuple[int, int, int]:
+    """Pick (CBLOCK_INTER, num_stages, num_warps) by timing a small safe grid once.
+
+    This avoids brittle heuristics on new architectures while still respecting the
+    Blackwell SRAM budget via validate_inter_config().
+    """
+    key = (device_idx, n, d, e, dtype)
+    cached = _INTER_CONFIG_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    # Keep candidate grid small to limit compile+benchmark overhead.
+    # Note: CBLOCK must remain power-of-two due to tl.arange constraints used in other kernels.
+    cblock_candidates = (64, 32, 16)
+    stage_candidates = (3, 2, 1)
+    warp_candidates = (8, 4)
+
+    candidates: list[tuple[int, int, int]] = []
+    for cblock in cblock_candidates:
+        for stages in stage_candidates:
+            is_valid, _ = validate_inter_config(cblock, d, e, num_stages=stages)
+            if not is_valid:
+                continue
+            for warps in warp_candidates:
+                # Conservative: avoid 8-warps for tiny tiles.
+                if warps == 8 and cblock < 32:
+                    continue
+                candidates.append((cblock, stages, warps))
+
+    # Fallback to the prior heuristic if nothing fits.
+    if not candidates:
+        fallback = (32 if d <= 64 else 16, 1, 4)
+        _INTER_CONFIG_CACHE[key] = fallback
+        return fallback
+
+    # Allocate representative tensors for timing.
+    # Use multiple heads to better approximate real occupancy.
+    bh = 128
+    q = torch.randn((1, bh, n, d), device='cuda', dtype=dtype)
+    k = torch.randn((1, bh, n, d), device='cuda', dtype=dtype)
+    v = torch.randn((1, bh, n, e), device='cuda', dtype=dtype)
+    do = torch.randn((1, bh, n, e), device='cuda', dtype=dtype)
+    dq = torch.zeros_like(q)
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
+
+    stride_qb, stride_qh, stride_qn, stride_qd = q.stride()
+    stride_kb, stride_kh, stride_kn, stride_kd = k.stride()
+    stride_vb, stride_vh, stride_vn, stride_ve = v.stride()
+    stride_dob, stride_doh, stride_don, stride_doe = do.stride()
+
+    grid = (bh,)
+
+    def _run(cfg: tuple[int, int, int]):
+        cblock, stages, warps = cfg
+        num_cblocks = triton.cdiv(n, cblock)
+        _bwd_inter_chunked_kernel[grid](
+            q, k, v, do,
+            dq, dk, dv,
+            stride_qb, stride_qh, stride_qn, stride_qd,
+            stride_kb, stride_kh, stride_kn, stride_kd,
+            stride_vb, stride_vh, stride_vn, stride_ve,
+            stride_dob, stride_doh, stride_don, stride_doe,
+            n=n, d=d, e=e,
+            CBLOCK=cblock,
+            NUM_CBLOCK=num_cblocks,
+            num_warps=warps,
+            num_stages=stages,
+        )
+
+    best_cfg: tuple[int, int, int] | None = None
+    best_ms: float = float('inf')
+
+    # We intentionally include kernel work in the measurement; compile happens on first use.
+    for cfg in candidates:
+        dq.zero_()
+        dk.zero_()
+        dv.zero_()
+        _run(cfg)  # compile + warm
+        torch.cuda.synchronize()
+
+        dq.zero_()
+        dk.zero_()
+        dv.zero_()
+        ms = triton.testing.do_bench(lambda: _run(cfg), warmup=1, rep=20)
+        if ms < best_ms:
+            best_ms = ms
+            best_cfg = cfg
+
+    assert best_cfg is not None
+    _INTER_CONFIG_CACHE[key] = best_cfg
+    return best_cfg
 
 
 def validate_config(CBLOCK: int, d: int, num_stages: int = 1) -> tuple[bool, int]:
@@ -106,6 +212,12 @@ def _bwd_intra_chunked_kernel(
     # Pre-compute pointer offsets for d and e dimensions
     d_range = tl.arange(0, d)[None, :] * stride_qd
     e_range = tl.arange(0, e)[None, :] * stride_ve
+
+    # Alignment/contiguity hints (improves vectorization/coalescing on recent GPUs).
+    tl.multiple_of(stride_qn, 8)
+    tl.multiple_of(stride_kn, 8)
+    tl.multiple_of(stride_vn, 8)
+    tl.multiple_of(stride_don, 8)
     
     # ========================================================================
     # PASS 1: Compute dQ[i] for each i
@@ -251,6 +363,12 @@ def _bwd_inter_chunked_kernel(
     dv_base = DV + off_bh * stride_vh
     
     cblock_range = tl.arange(0, CBLOCK)
+
+    # Alignment/contiguity hints.
+    tl.multiple_of(stride_qn, 8)
+    tl.multiple_of(stride_kn, 8)
+    tl.multiple_of(stride_vn, 8)
+    tl.multiple_of(stride_don, 8)
     
     # ========================================================================
     # Forward pass to build kv_state at each chunk boundary
@@ -468,29 +586,33 @@ class LightningAttention3NoDecayChunked(torch.autograd.Function):
         CBLOCK_INTRA = 32  # Fixed - must divide BLOCK
         BLOCK = 64
 
-        # Adaptive inter-kernel config: prefer larger CBLOCK (fewer iterations)
-        # while staying within SRAM_BUDGET.
-        if d <= 64:
-            cblock_candidates = (64, 32, 16)
-        elif d <= 128:
-            cblock_candidates = (32, 16)
+        # Adaptive inter-kernel config.
+        # Default: time a small safe grid once per (device,n,d,e,dtype) and cache the best.
+        # Opt-out via env HYDRA_LA3_AUTOTUNE_INTER=0.
+        device_idx = q.device.index if q.device.index is not None else torch.cuda.current_device()
+        if os.getenv('HYDRA_LA3_AUTOTUNE_INTER', '1') != '0':
+            CBLOCK_INTER, INTER_STAGES, INTER_WARPS = _autotune_inter_config(
+                device_idx=device_idx,
+                n=n,
+                d=d,
+                e=e,
+                dtype=q.dtype,
+            )
         else:
-            cblock_candidates = (32, 16)
-
-        CBLOCK_INTER = 16
-        INTER_STAGES = 1
-        INTER_WARPS = 4
-        for cblock in cblock_candidates:
-            for stages in (2, 1):
-                is_valid, _ = validate_inter_config(cblock, d, e, num_stages=stages)
-                if is_valid:
-                    CBLOCK_INTER = cblock
-                    INTER_STAGES = stages
-                    INTER_WARPS = 8 if (cblock >= 64 and d <= 64) else 4
-                    break
-            else:
-                continue
-            break
+            # Heuristic fallback
+            cblock_candidates = (64, 32, 16) if d <= 64 else (32, 16)
+            CBLOCK_INTER, INTER_STAGES, INTER_WARPS = (16, 1, 4)
+            for cblock in cblock_candidates:
+                for stages in (2, 1):
+                    is_valid, _ = validate_inter_config(cblock, d, e, num_stages=stages)
+                    if is_valid:
+                        CBLOCK_INTER = cblock
+                        INTER_STAGES = stages
+                        INTER_WARPS = 8 if (cblock >= 64 and d <= 64) else 4
+                        break
+                else:
+                    continue
+                break
 
         global _LAST_INTER_CONFIG
         _LAST_INTER_CONFIG = (CBLOCK_INTER, INTER_STAGES, INTER_WARPS)

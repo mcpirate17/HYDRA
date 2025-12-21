@@ -35,18 +35,18 @@
 
 | Kernel | SeqLen | Fwd (ms) | Bwd (ms) | Total (ms) | Throughput | Memory |
 |--------|--------|----------|----------|------------|------------|--------|
-| LA3-Original | 1024 | 0.07 | 0.26 | 0.32 | 3080.7 iter/s | 185 MB |
-| LA3-Chunked | 1024 | 0.07 | 0.26 | 0.32 | 3088.7 iter/s | 185 MB |
-| FlashAttn-2 | 1024 | 0.12 | 0.35 | 0.47 | 2141.6 iter/s | 186 MB |
-| PyTorch-SDPA | 1024 | 0.11 | 0.37 | 0.49 | 2052.8 iter/s | 186 MB |
-| LA3-Original | 2048 | 0.13 | 0.61 | 0.75 | 1342.3 iter/s | 369 MB |
-| LA3-Chunked | 2048 | 0.14 | 0.58 | 0.72 | 1384.4 iter/s | 369 MB |
-| FlashAttn-2 | 2048 | 0.40 | 1.07 | 1.47 | 680.7 iter/s | 371 MB |
-| PyTorch-SDPA | 2048 | 0.40 | 1.11 | 1.50 | 665.0 iter/s | 371 MB |
-| LA3-Original | 4096 | 0.26 | 1.23 | 1.49 | 672.2 iter/s | 738 MB |
-| LA3-Chunked | 4096 | 0.27 | 1.24 | 1.51 | 660.8 iter/s | 738 MB |
-| FlashAttn-2 | 4096 | 1.41 | 3.84 | 5.26 | 190.2 iter/s | 742 MB |
-| PyTorch-SDPA | 4096 | 1.42 | 4.00 | 5.42 | 184.4 iter/s | 742 MB |
+| LA3-Original | 1024 | 0.08 | 0.25 | 0.33 | 3027.0 iter/s | 185 MB |
+| LA3-Chunked | 1024 | 0.07 | 0.26 | 0.33 | 3051.1 iter/s | 185 MB |
+| FlashAttn-2 | 1024 | 0.12 | 0.34 | 0.46 | 2182.5 iter/s | 186 MB |
+| PyTorch-SDPA | 1024 | 0.11 | 0.37 | 0.48 | 2070.1 iter/s | 186 MB |
+| LA3-Original | 2048 | 0.13 | 0.62 | 0.75 | 1341.1 iter/s | 369 MB |
+| LA3-Chunked | 2048 | 0.15 | 0.58 | 0.73 | 1368.2 iter/s | 369 MB |
+| FlashAttn-2 | 2048 | 0.40 | 1.07 | 1.47 | 681.5 iter/s | 371 MB |
+| PyTorch-SDPA | 2048 | 0.40 | 1.11 | 1.51 | 661.7 iter/s | 371 MB |
+| LA3-Original | 4096 | 0.27 | 1.22 | 1.49 | 672.9 iter/s | 738 MB |
+| LA3-Chunked | 4096 | 0.27 | 1.22 | 1.49 | 670.2 iter/s | 738 MB |
+| FlashAttn-2 | 4096 | 1.41 | 3.77 | 5.18 | 192.9 iter/s | 742 MB |
+| PyTorch-SDPA | 4096 | 1.40 | 4.00 | 5.40 | 185.2 iter/s | 742 MB |
 
 ### Memory Breakdown
 
@@ -78,18 +78,18 @@ Speedup vs PyTorch-SDPA baseline (higher = better):
 
 | Kernel | N=1024 | N=2048 | N=4096 |
 |--------|-----|-----|-----|
-| FlashAttn-2 | 1.04x | 1.02x | 1.03x |
-| LA3-Chunked | 1.50x | 2.08x | 3.58x |
-| LA3-Original | 1.50x | 2.02x | 3.64x |
+| FlashAttn-2 | 1.05x | 1.03x | 1.04x |
+| LA3-Chunked | 1.47x | 2.07x | 3.62x |
+| LA3-Original | 1.46x | 2.03x | 3.63x |
 | PyTorch-SDPA | 1.00x | 1.00x | 1.00x |
 
 ## Analysis
 
 ### Key Findings
 
-- **SeqLen 1024**: Best kernel is **LA3-Chunked** (0.32ms, 3088.7 iter/s)
-- **SeqLen 2048**: Best kernel is **LA3-Chunked** (0.72ms, 1384.4 iter/s)
-- **SeqLen 4096**: Best kernel is **LA3-Original** (1.49ms, 672.2 iter/s)
+- **SeqLen 1024**: Best kernel is **LA3-Chunked** (0.33ms, 3051.1 iter/s)
+- **SeqLen 2048**: Best kernel is **LA3-Chunked** (0.73ms, 1368.2 iter/s)
+- **SeqLen 4096**: Best kernel is **LA3-Original** (1.49ms, 672.9 iter/s)
 
 ### Tradeoff Summary
 
