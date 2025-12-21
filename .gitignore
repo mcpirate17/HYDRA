@@ -84,3 +84,9 @@ tmp/
 temp/
 *.tmp
 *.log
+
+# Local working-copy backups (do not commit)
+hydra/kernels/lightning_attn3/ops/triton/*_working_*.py
+
+# LA3 benchmark snapshots (keep canonical benchmark_results.json only)
+hydra/kernels/lightning_attn3/docs/benchmark_results_*.json

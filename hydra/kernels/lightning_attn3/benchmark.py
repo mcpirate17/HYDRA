@@ -21,6 +21,7 @@ import argparse
 import json
 import sys
 from datetime import datetime
+import importlib
 from pathlib import Path
 
 import torch
@@ -155,6 +156,8 @@ def run_benchmark(
         # ===== LA3-Original (with decay) =====
         q, k, v = make_tensors()
         s = torch.ones(n_heads, device='cuda', dtype=dtype)  # decay parameter
+
+        _printed_la3_orig_cfg = False
         
         def fwd_la3_orig():
             return lightning_attn3(q, k, v, s)
@@ -163,6 +166,19 @@ def run_benchmark(
             q.grad = k.grad = v.grad = None
             out = lightning_attn3(q, k, v, s)
             out.sum().backward()
+            nonlocal _printed_la3_orig_cfg
+            if not _printed_la3_orig_cfg:
+                _printed_la3_orig_cfg = True
+                try:
+                    decay_mod = importlib.import_module(
+                        'hydra.kernels.lightning_attn3.ops.triton.lightning_attn3'
+                    )
+                    device_idx = torch.cuda.current_device()
+                    cfg = decay_mod._BWD_TILE_CACHE.get(device_idx)
+                    if cfg is not None:
+                        print(f"    [cfg] LA3-Original bwd tiles: BLOCK={cfg[0]}, CBLOCK={cfg[1]}")
+                except Exception:
+                    pass
         
         result = benchmark_kernel("LA3-Original", fwd_la3_orig, bwd_la3_orig, warmup, rep)
         result["seq_len"] = seq_len
@@ -173,6 +189,8 @@ def run_benchmark(
         
         # ===== LA3-NoDecay (original non-chunked) =====
         q, k, v = make_tensors()
+
+        _printed_la3_nodecay_cfg = False
         
         def fwd_la3_nodecay():
             return lightning_attn3_no_decay(q, k, v)
@@ -181,6 +199,19 @@ def run_benchmark(
             q.grad = k.grad = v.grad = None
             out = lightning_attn3_no_decay(q, k, v)
             out.sum().backward()
+            nonlocal _printed_la3_nodecay_cfg
+            if not _printed_la3_nodecay_cfg:
+                _printed_la3_nodecay_cfg = True
+                try:
+                    nodecay_mod = importlib.import_module(
+                        'hydra.kernels.lightning_attn3.ops.triton.lightning_attn3_no_decay'
+                    )
+                    device_idx = torch.cuda.current_device()
+                    cfg = nodecay_mod._BWD_KERNEL_CACHE.get(device_idx)
+                    if cfg is not None:
+                        print(f"    [cfg] LA3-NoDecay bwd kernel: {cfg}")
+                except Exception:
+                    pass
         
         result = benchmark_kernel("LA3-NoDecay", fwd_la3_nodecay, bwd_la3_nodecay, warmup, rep)
         result["seq_len"] = seq_len
@@ -191,6 +222,8 @@ def run_benchmark(
         
         # ===== LA3-Chunked (Blackwell-optimized) =====
         q, k, v = make_tensors()
+
+        _printed_la3_chunked_cfg = False
         
         def fwd_la3_chunked():
             return lightning_attn3_no_decay_chunked(q, k, v)
@@ -199,6 +232,18 @@ def run_benchmark(
             q.grad = k.grad = v.grad = None
             out = lightning_attn3_no_decay_chunked(q, k, v)
             out.sum().backward()
+            nonlocal _printed_la3_chunked_cfg
+            if not _printed_la3_chunked_cfg:
+                _printed_la3_chunked_cfg = True
+                try:
+                    chunked_mod = importlib.import_module(
+                        'hydra.kernels.lightning_attn3.ops.triton.lightning_attn3_no_decay_chunked'
+                    )
+                    cfg = getattr(chunked_mod, '_LAST_INTER_CONFIG', None)
+                    if cfg is not None:
+                        print(f"    [cfg] LA3-Chunked inter: CBLOCK={cfg[0]}, stages={cfg[1]}, warps={cfg[2]}")
+                except Exception:
+                    pass
         
         result = benchmark_kernel("LA3-Chunked", fwd_la3_chunked, bwd_la3_chunked, warmup, rep)
         result["seq_len"] = seq_len
@@ -209,13 +254,14 @@ def run_benchmark(
         
         # ===== LA3-Parallel =====
         q, k, v = make_tensors()
+        s = torch.ones(n_heads, device='cuda', dtype=dtype)
         
         def fwd_la3_parallel():
-            return lightning_attn3_parallel(q, k, v)
+            return lightning_attn3_parallel(q, k, v, s)
         
         def bwd_la3_parallel():
             q.grad = k.grad = v.grad = None
-            out = lightning_attn3_parallel(q, k, v)
+            out = lightning_attn3_parallel(q, k, v, s)
             out.sum().backward()
         
         result = benchmark_kernel("LA3-Parallel", fwd_la3_parallel, bwd_la3_parallel, warmup, rep)
@@ -516,9 +562,11 @@ def main():
     docs_dir.mkdir(exist_ok=True)
     
     if args.save:
-        with open(docs_dir / "benchmark_results.json", "w") as f:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = docs_dir / f"benchmark_results_{ts}.json"
+        with open(out_path, "w") as f:
             json.dump(data, f, indent=2)
-        print(f"\nSaved results to {docs_dir / 'benchmark_results.json'}")
+        print(f"\nSaved results to {out_path}")
     
     if args.plot:
         generate_plots(data, docs_dir)

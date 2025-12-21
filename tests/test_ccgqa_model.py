@@ -27,9 +27,13 @@ from hydra.model.ccgqa import (
 # =============================================================================
 
 @pytest.fixture
-def small_ccgqa_model():
+def device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+@pytest.fixture
+def small_ccgqa_model(device):
     """Small CCGQA model for testing."""
-    return CCGQAModel(
+    model = CCGQAModel(
         vocab_size=1000,
         dim=128,
         n_layers=4,
@@ -38,10 +42,11 @@ def small_ccgqa_model():
         compression_factor=2,
         max_seq_len=512,
     )
+    return model.to(device)
 
 
 @pytest.fixture
-def small_mod_mor_model():
+def small_mod_mor_model(device):
     """Small MoD+MoR model for testing."""
     model = CCGQAMoDMoRModel(
         vocab_size=1000,
@@ -55,7 +60,7 @@ def small_mod_mor_model():
     )
     model.train()
     model.set_global_step(200)  # Enable hard routing
-    return model
+    return model.to(device)
 
 
 # =============================================================================
@@ -73,7 +78,8 @@ class TestCCGQAModel:
     
     def test_forward_shape(self, small_ccgqa_model):
         """Test forward pass shape."""
-        x = torch.randint(0, 1000, (2, 32))
+        device = small_ccgqa_model.tok_emb.weight.device
+        x = torch.randint(0, 1000, (2, 32), device=device)
         out = small_ccgqa_model(x)
         
         assert out.shape == (2, 32, 1000)
@@ -122,10 +128,11 @@ class TestCCGQAMoDMoRModel:
     def test_shape_invariants(self, small_mod_mor_model):
         """Test output shapes for various batch/seq combinations."""
         model = small_mod_mor_model
+        device = model.tok_emb.weight.device
         
         test_shapes = [(1, 16), (2, 32), (4, 64), (1, 128)]
         for batch, seq in test_shapes:
-            x = torch.randint(0, 1000, (batch, seq))
+            x = torch.randint(0, 1000, (batch, seq), device=device)
             out, losses = model(x, return_losses=True)
             
             expected_shape = (batch, seq, 1000)
@@ -139,11 +146,12 @@ class TestCCGQAMoDMoRModel:
     def test_no_cross_batch_mixing(self, small_mod_mor_model):
         """Test that batching doesn't cause cross-sequence contamination."""
         model = small_mod_mor_model
+        device = model.tok_emb.weight.device
         model.eval()
         
         torch.manual_seed(42)
-        seq_a = torch.randint(0, 1000, (1, 32))
-        seq_b = torch.randint(0, 1000, (1, 32))
+        seq_a = torch.randint(0, 1000, (1, 32), device=device)
+        seq_b = torch.randint(0, 1000, (1, 32), device=device)
         
         # Run separately
         with torch.no_grad():
@@ -161,9 +169,10 @@ class TestCCGQAMoDMoRModel:
     def test_routing_modes(self, small_mod_mor_model):
         """Test soft vs hard routing modes."""
         model = small_mod_mor_model
+        device = model.tok_emb.weight.device
         model.train()
         
-        x = torch.randint(0, 1000, (2, 32))
+        x = torch.randint(0, 1000, (2, 32), device=device)
         
         # Soft routing (warmup)
         model.set_global_step(50)
@@ -181,11 +190,12 @@ class TestCCGQAMoDMoRModel:
     def test_gradient_flow(self, small_mod_mor_model):
         """Test gradients flow through all components."""
         model = small_mod_mor_model
+        device = model.tok_emb.weight.device
         model.train()
         model.zero_grad()
         
-        x = torch.randint(0, 1000, (2, 32))
-        targets = torch.randint(0, 1000, (2, 32))
+        x = torch.randint(0, 1000, (2, 32), device=device)
+        targets = torch.randint(0, 1000, (2, 32), device=device)
         
         out, losses = model(x, return_losses=True)
         total_loss = (
@@ -210,11 +220,12 @@ class TestCCGQAMoDMoRModel:
     def test_bf16_stability(self, small_mod_mor_model):
         """Test numerical stability in BF16."""
         model = small_mod_mor_model.bfloat16()
+        device = model.tok_emb.weight.device
         model.train()
         model.zero_grad()
         
-        x = torch.randint(0, 1000, (2, 32))
-        targets = torch.randint(0, 1000, (2, 32))
+        x = torch.randint(0, 1000, (2, 32), device=device)
+        targets = torch.randint(0, 1000, (2, 32), device=device)
         
         out, losses = model(x, return_losses=True)
         
@@ -242,10 +253,11 @@ class TestCCGQAMoDMoRModel:
     def test_loss_baseline_update(self, small_mod_mor_model):
         """Test loss baseline tracking."""
         model = small_mod_mor_model
+        device = model.tok_emb.weight.device
         model.train()
         
-        x = torch.randint(0, 1000, (2, 32))
-        targets = torch.randint(0, 1000, (2, 32))
+        x = torch.randint(0, 1000, (2, 32), device=device)
+        targets = torch.randint(0, 1000, (2, 32), device=device)
         
         out, _ = model(x, return_losses=True)
         
@@ -301,9 +313,10 @@ class TestModelIntegration:
     def test_efficient_inference(self, small_mod_mor_model):
         """Test inference mode (no losses)."""
         model = small_mod_mor_model
+        device = model.tok_emb.weight.device
         model.eval()
         
-        x = torch.randint(0, 1000, (2, 32))
+        x = torch.randint(0, 1000, (2, 32), device=device)
         
         with torch.no_grad():
             out = model(x, return_losses=False)
@@ -314,9 +327,10 @@ class TestModelIntegration:
     def test_training_mode(self, small_mod_mor_model):
         """Test training mode (with losses)."""
         model = small_mod_mor_model
+        device = model.tok_emb.weight.device
         model.train()
         
-        x = torch.randint(0, 1000, (2, 32))
+        x = torch.randint(0, 1000, (2, 32), device=device)
         out, losses = model(x, return_losses=True)
         
         assert "aux_loss" in losses
@@ -329,11 +343,12 @@ class TestModelIntegration:
     def test_gradient_checkpointing(self, small_mod_mor_model):
         """Test gradient checkpointing doesn't break forward/backward."""
         model = small_mod_mor_model
+        device = model.tok_emb.weight.device
         model.enable_gradient_checkpointing()
         model.train()
         
-        x = torch.randint(0, 1000, (2, 32))
-        targets = torch.randint(0, 1000, (2, 32))
+        x = torch.randint(0, 1000, (2, 32), device=device)
+        targets = torch.randint(0, 1000, (2, 32), device=device)
         
         out, losses = model(x, return_losses=True)
         loss = F.cross_entropy(out.view(-1, 1000), targets.view(-1))
@@ -347,13 +362,14 @@ class TestModelIntegration:
     def test_rope_cache_resize(self, small_mod_mor_model):
         """Test RoPE cache resizing."""
         model = small_mod_mor_model
+        device = model.tok_emb.weight.device
         
         # Resize to larger
         model.resize_rope_cache(1024)
         assert model.max_seq_len == 1024
         
         # Should still work
-        x = torch.randint(0, 1000, (2, 128))
+        x = torch.randint(0, 1000, (2, 128), device=device)
         with torch.no_grad():
             out = model(x)
         assert out.shape == (2, 128, 1000)

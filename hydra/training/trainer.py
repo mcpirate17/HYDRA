@@ -4,6 +4,7 @@ import math
 import os
 import time
 import json
+import contextlib
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
+import torch.profiler
 
 from hydra.model.ccgqa import CCGQAMoDMoRModel
 from hydra.kernels import chunked_cross_entropy, fused_chunked_cross_entropy
@@ -23,6 +25,7 @@ from .config import TrainingConfig
 from .metrics import TrainingMetrics
 from .lr import get_lr, ProgressAwareLRManager
 from .runtime import configure_runtime
+from hydra.logging import HydraLogger
 
 _RUNTIME_STATUS = configure_runtime()
 
@@ -33,6 +36,7 @@ class Trainer:
     __slots__ = (
         "config",
         "device",
+        "logger",
         "model",
         "optimizer",
         "scaler",
@@ -71,11 +75,9 @@ class Trainer:
 
     def __init__(self, config: TrainingConfig):
         self.config = config
+        self.logger = HydraLogger(config)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.metrics = TrainingMetrics()
-
-        if self.device == "cuda":
-            os.environ.setdefault("HYDRA_MOR_ATTENTION_PATTERN_NAME", "lla2x3+ccqa")
 
         self._seed_set = False
         if config.seed is not None:
@@ -124,7 +126,7 @@ class Trainer:
             set_use_triton_kernels(bool(getattr(config, "use_triton_kernels", False)))
             self._kernel_status = get_kernel_status()
         except Exception as e:
-            print(f"WARNING: Failed to configure Triton kernels ({e})")
+            self.logger.warning(f"Failed to configure Triton kernels ({e})")
 
         self._checkpoint_seq_len = None
         self._checkpoint_config = {}
@@ -136,7 +138,7 @@ class Trainer:
             if "architecture" in self._checkpoint_config:
                 ckpt_arch = self._checkpoint_config["architecture"]
                 if ckpt_arch != config.architecture:
-                    print(f"Overriding architecture: {config.architecture} -> {ckpt_arch} (from checkpoint)")
+                    self.logger.warning(f"Overriding architecture: {config.architecture} -> {ckpt_arch} (from checkpoint)")
                     config.architecture = ckpt_arch
             if "mod_mor_dim" in self._checkpoint_config:
                 config.mod_mor_dim = self._checkpoint_config["mod_mor_dim"]
@@ -152,7 +154,7 @@ class Trainer:
                 ckpt_full = torch.load(config.resume_from, weights_only=False, map_location="cpu")
                 if "optimizer" in ckpt_full and "param_groups" in ckpt_full["optimizer"]:
                     last_lr = ckpt_full["optimizer"]["param_groups"][0].get("lr", config.max_lr)
-                    print(f"Checkpoint final LR: {last_lr:.6f}")
+                    self.logger.info(f"Checkpoint final LR: {last_lr:.6f}")
                     self._checkpoint_lr = last_lr
 
         self._setup_model()
@@ -162,47 +164,47 @@ class Trainer:
         if config.resume_from:
             self._load_checkpoint(config.resume_from)
 
-        print(f"\n{'='*70}")
-        print("HYDRA 100M Optimized Trainer")
-        print(f"{'='*70}")
-        print(f"Device: {self.device}")
-        print(f"Model: {self._count_params()/1e6:.1f}M parameters")
-        print(f"Batch: {config.batch_size} micro × {config.grad_accum_steps} accum = {config.effective_batch_size} effective")
-        print(f"Sequence length: {config.max_seq_len}")
-        print(f"Tokens/step: {self._tokens_per_step:,} ({self._tokens_per_step/1e6:.2f}M per optimizer step)")
-        print(f"Dataset: {config.dataset_name}")
-        print(f"torch.compile: {config.use_compile} (mode={config.compile_mode})")
+        self.logger.info(f"\n{'='*70}")
+        self.logger.info("HYDRA 100M Optimized Trainer")
+        self.logger.info(f"{'='*70}")
+        self.logger.info(f"Device: {self.device}")
+        self.logger.info(f"Model: {self._count_params()/1e6:.1f}M parameters")
+        self.logger.info(f"Batch: {config.batch_size} micro × {config.grad_accum_steps} accum = {config.effective_batch_size} effective")
+        self.logger.info(f"Sequence length: {config.max_seq_len}")
+        self.logger.info(f"Tokens/step: {self._tokens_per_step:,} ({self._tokens_per_step/1e6:.2f}M per optimizer step)")
+        self.logger.info(f"Dataset: {config.dataset_name}")
+        self.logger.info(f"torch.compile: {config.use_compile} (mode={config.compile_mode})")
         if self._kernel_status is not None:
             ks = self._kernel_status
             triton_enabled = ks.get("use_triton_kernels", False)
-            print(f"Triton kernels: {triton_enabled}" + (f" (v{ks.get('triton_version', 'N/A')})" if triton_enabled else ""))
+            self.logger.info(f"Triton kernels: {triton_enabled}" + (f" (v{ks.get('triton_version', 'N/A')})" if triton_enabled else ""))
             if triton_enabled:
-                print(f"  ├─ fused_swiglu:  {ks.get('fused_swiglu', False)}")
-                print(f"  ├─ fused_qk_norm: {ks.get('fused_qk_norm', False)}")
-                print(f"  ├─ fused_rope:    {ks.get('fused_rope', False)}" + ("" if ks.get('fused_rope', False) else " (opt-in: HYDRA_ENABLE_FUSED_ROPE=1)"))
-                print(f"  └─ fused_rms_norm:{ks.get('fused_rms_norm', False)}" + ("" if ks.get('fused_rms_norm', False) else " (opt-in: HYDRA_ENABLE_FUSED_RMS_NORM=1)"))
+                self.logger.info(f"  ├─ fused_swiglu:  {ks.get('fused_swiglu', False)}")
+                self.logger.info(f"  ├─ fused_qk_norm: {ks.get('fused_qk_norm', False)}")
+                self.logger.info(f"  ├─ fused_rope:    {ks.get('fused_rope', False)}" + ("" if ks.get('fused_rope', False) else " (opt-in: HYDRA_ENABLE_FUSED_ROPE=1)"))
+                self.logger.info(f"  └─ fused_rms_norm:{ks.get('fused_rms_norm', False)}" + ("" if ks.get('fused_rms_norm', False) else " (opt-in: HYDRA_ENABLE_FUSED_RMS_NORM=1)"))
         _chunked_ce_active = config.use_chunked_ce and hasattr(self.model, "forward_hidden")
-        print(f"Chunked CE: {_chunked_ce_active}" + (" (model supports forward_hidden)" if _chunked_ce_active else f" (disabled: use_chunked_ce={config.use_chunked_ce}, has forward_hidden={hasattr(self.model, 'forward_hidden')})"))
-        print(f"AMP dtype: {config.dtype}")
+        self.logger.info(f"Chunked CE: {_chunked_ce_active}" + (" (model supports forward_hidden)" if _chunked_ce_active else f" (disabled: use_chunked_ce={config.use_chunked_ce}, has forward_hidden={hasattr(self.model, 'forward_hidden')})"))
+        self.logger.info(f"AMP dtype: {config.dtype}")
         if self._seed_set:
-            print(f"Seed: {config.seed} (reproducible training enabled)")
+            self.logger.info(f"Seed: {config.seed} (reproducible training enabled)")
 
         if config.lr_schedule in ("wsd", "wsd_adaptive"):
             stable_steps = config.decay_start_step - config.warmup_steps
-            print("LR Schedule: WSD (Warmup-Stable-Decay)")
-            print(f"  Warmup: {config.warmup_steps} steps ({config.warmup_steps/config.max_steps*100:.1f}%)")
-            print(f"  Stable: {stable_steps} steps ({stable_steps/config.max_steps*100:.1f}%) at LR={config.max_lr}")
-            print(f"  Decay:  {config.decay_steps} steps ({config.decay_steps/config.max_steps*100:.1f}%) -> LR={config.min_lr}")
+            self.logger.info("LR Schedule: WSD (Warmup-Stable-Decay)")
+            self.logger.info(f"  Warmup: {config.warmup_steps} steps ({config.warmup_steps/config.max_steps*100:.1f}%)")
+            self.logger.info(f"  Stable: {stable_steps} steps ({stable_steps/config.max_steps*100:.1f}%) at LR={config.max_lr}")
+            self.logger.info(f"  Decay:  {config.decay_steps} steps ({config.decay_steps/config.max_steps*100:.1f}%) -> LR={config.min_lr}")
             if config.adaptive_lr:
-                print(f"  Adaptive: ENABLED (patience={config.adaptive_patience}, threshold={config.adaptive_threshold:.0%})")
+                self.logger.info(f"  Adaptive: ENABLED (patience={config.adaptive_patience}, threshold={config.adaptive_threshold:.0%})")
             if config.use_swa:
-                print(f"  SWA: ENABLED (starts at {config.swa_start_pct:.0%} of training)")
+                self.logger.info(f"  SWA: ENABLED (starts at {config.swa_start_pct:.0%} of training)")
         else:
-            print("LR Schedule: Cosine with warmup")
-            print(f"  Warmup: {config.warmup_steps} steps, Max LR: {config.max_lr}, Min LR: {config.min_lr}")
+            self.logger.info("LR Schedule: Cosine with warmup")
+            self.logger.info(f"  Warmup: {config.warmup_steps} steps, Max LR: {config.max_lr}, Min LR: {config.min_lr}")
         if config.batch_filter:
-            print(f"Batch Filter: ENABLED (threshold={config.batch_filter_threshold}x, max_skip={config.batch_filter_max_skip:.0%})")
-        print(f"{'='*70}\n")
+            self.logger.info(f"Batch Filter: ENABLED (threshold={config.batch_filter_threshold}x, max_skip={config.batch_filter_max_skip:.0%})")
+        self.logger.info(f"{'='*70}\n")
 
     def _peek_checkpoint_config(self, checkpoint_path: str) -> dict:
         checkpoint = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
@@ -211,7 +213,7 @@ class Trainer:
         for key, tensor in checkpoint["model"].items():
             if "cos_cached" in key:
                 result["max_seq_len"] = tensor.shape[2]
-                print(f"Checkpoint RoPE cache seq_len: {result['max_seq_len']}")
+                self.logger.info(f"Checkpoint RoPE cache seq_len: {result['max_seq_len']}")
                 break
         arch_keys = [
             "architecture",
@@ -228,7 +230,7 @@ class Trainer:
             if key in ckpt_config:
                 result[key] = ckpt_config[key]
         if result:
-            print(
+            self.logger.info(
                 f"Checkpoint architecture: dim={result.get('mod_mor_dim')}, "
                 f"blocks={result.get('n_mor_blocks')}, "
                 f"recursions={result.get('mor_recursions')}, "
@@ -241,7 +243,7 @@ class Trainer:
         for key, tensor in checkpoint["model"].items():
             if "cos_cached" in key:
                 seq_len = tensor.shape[2]
-                print(f"Checkpoint RoPE cache seq_len: {seq_len}")
+                self.logger.info(f"Checkpoint RoPE cache seq_len: {seq_len}")
                 return seq_len
         return self.config.max_seq_len
 
@@ -251,9 +253,13 @@ class Trainer:
         for _, seq_len in config.seq_steps:
             max_needed_seq_len = max(max_needed_seq_len, seq_len)
         model_seq_len = max_needed_seq_len
-        print(f"Creating model with max_seq_len={model_seq_len} (covers all training phases)")
+        self.logger.info(f"Creating model with max_seq_len={model_seq_len} (covers all training phases)")
         if config.architecture != "mod_mor":
             raise ValueError(f"Unsupported architecture '{config.architecture}'. Only 'mod_mor' is supported.")
+        
+        # MoR warmup defaults to 30% of training (ponder loss ramps up to this point)
+        mor_warmup = int(config.max_steps * 0.30)
+        
         self.model = CCGQAMoDMoRModel(
             vocab_size=config.vocab_size,
             dim=config.mod_mor_dim,
@@ -267,17 +273,19 @@ class Trainer:
             mod_capacity=config.mod_capacity,
             adaptive=config.mor_adaptive,
             tie_weights=True,
+            mod_mlp_warmup=int(config.max_steps * config.mod_enable_pct),
+            mor_warmup=mor_warmup,
         ).to(self.device)
         self._use_mod_mor = True
         mod_status = "OFF (capacity=1.0)" if config.mod_capacity >= 1.0 else f"{config.mod_capacity:.0%} capacity"
         mor_status = "adaptive" if config.mor_adaptive else "fixed-depth (no routing)"
-        print(f"MoD: {mod_status}")
-        print(f"MoR: {mor_status}, {config.mor_recursions} recursions/block")
+        self.logger.info(f"MoD: {mod_status}")
+        self.logger.info(f"MoR: {mor_status}, {config.mor_recursions} recursions/block")
         if config.mor_adaptive:
             mor_enable_step = int(config.max_steps * config.mor_enable_pct)
             if config.mor_already_enabled:
                 mor_enable_step = 0
-                print("MoR RESTART MODE: Adaptive routing enabled from start (resumed after enable point)")
+                self.logger.info("MoR RESTART MODE: Adaptive routing enabled from start (resumed after enable point)")
             remaining_steps = config.max_steps - mor_enable_step
             default_rampup = min(config.mor_rampup_steps, 2 * mor_enable_step)
             actual_rampup = min(default_rampup, remaining_steps)
@@ -285,27 +293,27 @@ class Trainer:
             self.model.set_mor_curriculum(enable_step=mor_enable_step, rampup_steps=actual_rampup)
             self._mor_enable_step = mor_enable_step
             if mor_enable_step > 0:
-                print(f"MoR CURRICULUM: Fixed-depth until step {mor_enable_step:,} ({config.mor_enable_pct:.0%}), then {actual_rampup:,} step rampup")
+                self.logger.info(f"MoR CURRICULUM: Fixed-depth until step {mor_enable_step:,} ({config.mor_enable_pct:.0%}), then {actual_rampup:,} step rampup")
         else:
             self._mor_enable_step = 0
-            print("MoR CURRICULUM: Disabled (adaptive=False, running pure fixed-depth)")
+            self.logger.info("MoR CURRICULUM: Disabled (adaptive=False, running pure fixed-depth)")
         if config.gradient_checkpointing:
             if hasattr(self.model, "enable_gradient_checkpointing"):
                 every_n = getattr(config, "checkpoint_every_n", 1)
                 self.model.enable_gradient_checkpointing(every_n=every_n)
                 if every_n == 1:
-                    print("Gradient checkpointing: ENABLED (all layers, ~50% memory, ~30% overhead)")
+                    self.logger.info("Gradient checkpointing: ENABLED (all layers, ~50% memory, ~30% overhead)")
                 else:
-                    print(f"Gradient checkpointing: ENABLED (every {every_n} layers, ~35% memory, ~15% overhead)")
+                    self.logger.info(f"Gradient checkpointing: ENABLED (every {every_n} layers, ~35% memory, ~15% overhead)")
             else:
-                print("WARNING: Model doesn't support gradient checkpointing")
+                self.logger.warning("WARNING: Model doesn't support gradient checkpointing")
         if config.use_compile and self.device == "cuda":
             mode = config.compile_mode
-            if mode == "max-autotune":
-                mode = "max-autotune-no-cudagraphs"
-            print(f"Compiling model with mode='{mode}'...")
+            # if mode == "max-autotune":
+            #     mode = "max-autotune-no-cudagraphs"
+            self.logger.info(f"Compiling model with mode='{mode}'...")
             self.model = torch.compile(self.model, mode=mode, fullgraph=False, dynamic=False)
-            print("Model compiled successfully!")
+            self.logger.info("Model compiled successfully!")
 
     def _setup_optimizer(self) -> None:
         config = self.config
@@ -318,23 +326,18 @@ class Trainer:
                 else:
                     no_decay_params.append(param)
         if config.use_8bit_adam:
-            try:
-                import bitsandbytes as bnb
+            import bitsandbytes as bnb
 
-                self.optimizer = bnb.optim.AdamW8bit(
-                    [
-                        {"params": decay_params, "weight_decay": config.weight_decay},
-                        {"params": no_decay_params, "weight_decay": 0.0},
-                    ],
-                    lr=config.max_lr,
-                    betas=(0.9, 0.95),
-                )
-                print("Using 8-bit AdamW (bitsandbytes) - ~75% optimizer memory savings")
-            except ImportError:
-                print("WARNING: bitsandbytes not installed, falling back to standard AdamW")
-                print("Install with: pip install bitsandbytes")
-                config.use_8bit_adam = False
-        if not config.use_8bit_adam:
+            self.optimizer = bnb.optim.AdamW8bit(
+                [
+                    {"params": decay_params, "weight_decay": config.weight_decay},
+                    {"params": no_decay_params, "weight_decay": 0.0},
+                ],
+                lr=config.max_lr,
+                betas=(0.9, 0.95),
+            )
+            self.logger.info("Using 8-bit AdamW (bitsandbytes) - ~75% optimizer memory savings")
+        else:
             self.optimizer = torch.optim.AdamW(
                 [
                     {"params": decay_params, "weight_decay": config.weight_decay},
@@ -353,9 +356,9 @@ class Trainer:
         config = self.config
         initial_seq_len = config.seq_steps[0][1] if config.seq_steps else config.max_seq_len
         self._current_seq_len = initial_seq_len
-        print(f"Loading {config.dataset_name} dataset...")
-        print(f"Stepped sequence schedule: {config.seq_steps} + final @ {config.max_seq_len}")
-        print(f"Starting with seq_len={initial_seq_len}")
+        self.logger.info(f"Loading {config.dataset_name} dataset...")
+        self.logger.info(f"Stepped sequence schedule: {config.seq_steps} + final @ {config.max_seq_len}")
+        self.logger.info(f"Starting with seq_len={initial_seq_len}")
         self.train_loader = create_universal_loader(
             dataset=config.dataset_name,
             batch_size=config.batch_size,
@@ -368,13 +371,13 @@ class Trainer:
         if hasattr(self.train_loader, "set_max_steps"):
             self.train_loader.set_max_steps(config.max_steps)
         self._tokens_per_step = config.batch_size * config.grad_accum_steps * initial_seq_len
-        print(f"Tokens per step: {self._tokens_per_step:,}")
-        print("Dataset ready!")
+        self.logger.info(f"Tokens per step: {self._tokens_per_step:,}")
+        self.logger.info("Dataset ready!")
 
     def _load_checkpoint(self, checkpoint_path: str) -> None:
-        print(f"\n{'='*70}")
-        print(f"RESUMING FROM CHECKPOINT: {checkpoint_path}")
-        print(f"{'='*70}")
+        self.logger.info(f"\n{'='*70}")
+        self.logger.info(f"RESUMING FROM CHECKPOINT: {checkpoint_path}")
+        self.logger.info(f"{'='*70}")
         checkpoint = torch.load(checkpoint_path, weights_only=False, map_location=self.device)
         model = self.model
         if hasattr(model, "_orig_mod"):
@@ -385,8 +388,8 @@ class Trainer:
         ckpt_config = checkpoint.get("config", {})
         ckpt_max_steps = ckpt_config.get("max_steps", 0)
         if ckpt_max_steps > 0 and ckpt_max_steps != self.config.max_steps:
-            print(f"  ⚠️  max_steps changed: {ckpt_max_steps} → {self.config.max_steps}")
-            print("  LR schedule will be recalculated for new training length")
+            self.logger.warning(f"  ⚠️  max_steps changed: {ckpt_max_steps} → {self.config.max_steps}")
+            self.logger.warning("  LR schedule will be recalculated for new training length")
             self._resume_lr_scale = 1.0
         else:
             try:
@@ -395,7 +398,7 @@ class Trainer:
                 if ckpt_lr > 0.0 and sched_lr_at_resume > 0.0:
                     self._resume_lr_scale = ckpt_lr / sched_lr_at_resume
                     if abs(self._resume_lr_scale - 1.0) > 1e-6:
-                        print(
+                        self.logger.info(
                             f"  Resume LR alignment: ckpt_lr={ckpt_lr:.6f}, "
                             f"sched_lr(step={checkpoint['step']})={sched_lr_at_resume:.6f}, "
                             f"scale={self._resume_lr_scale:.4f}"
@@ -406,11 +409,11 @@ class Trainer:
         if hasattr(self.train_loader, "set_step"):
             self.train_loader.set_step(self._start_step)
         ckpt_metrics = checkpoint.get("metrics", {})
-        print(f"  Loaded step: {self._start_step}")
-        print(f"  Previous best loss: {ckpt_metrics.get('best_loss', 'N/A')}")
-        print(f"  Previous total tokens: {ckpt_metrics.get('total_tokens', 'N/A'):,}")
-        print(f"  Will continue to step: {self.config.max_steps}")
-        print(f"  Remaining steps: {self.config.max_steps - self._start_step:,}")
+        self.logger.info(f"  Loaded step: {self._start_step}")
+        self.logger.info(f"  Previous best loss: {ckpt_metrics.get('best_loss', 'N/A')}")
+        self.logger.info(f"  Previous total tokens: {ckpt_metrics.get('total_tokens', 'N/A'):,}")
+        self.logger.info(f"  Will continue to step: {self.config.max_steps}")
+        self.logger.info(f"  Remaining steps: {self.config.max_steps - self._start_step:,}")
         if ckpt_metrics:
             self.metrics.best_loss = ckpt_metrics.get("best_loss", float("inf"))
             self.metrics.best_loss_step = ckpt_metrics.get("best_loss_step", 0)
@@ -418,8 +421,8 @@ class Trainer:
         self._checkpoint_adaptive_state = None
         if "adaptive_lr_state" in checkpoint:
             self._checkpoint_adaptive_state = checkpoint["adaptive_lr_state"]
-            print("  Found adaptive LR state in checkpoint (will apply after manager init)")
-        print(f"{'='*70}\n")
+            self.logger.info("  Found adaptive LR state in checkpoint (will apply after manager init)")
+        self.logger.info(f"{'='*70}\n")
 
     def _count_params(self) -> int:
         return sum(p.numel() for p in self.model.parameters())
@@ -437,9 +440,9 @@ class Trainer:
         config = self.config
         if hasattr(self, "train_loader") and self.train_loader:
             self.train_loader.close()
-        print(f"\n{'='*70}")
-        print(f"SEQUENCE LENGTH TRANSITION: {self._current_seq_len} -> {seq_len}")
-        print(f"{'='*70}")
+        self.logger.info(f"\n{'='*70}")
+        self.logger.info(f"SEQUENCE LENGTH TRANSITION: {self._current_seq_len} -> {seq_len}")
+        self.logger.info(f"{'='*70}")
         model = self.model
         if hasattr(model, "_orig_mod"):
             model = model._orig_mod
@@ -458,8 +461,8 @@ class Trainer:
             self.train_loader.set_max_steps(config.max_steps)
         self._current_seq_len = seq_len
         self._tokens_per_step = config.batch_size * config.grad_accum_steps * seq_len
-        print(f"New tokens/step: {self._tokens_per_step:,}")
-        print(f"{'='*70}\n")
+        self.logger.info(f"New tokens/step: {self._tokens_per_step:,}")
+        self.logger.info(f"{'='*70}\n")
 
     def _get_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
         batch = self.train_loader.get_batch()
@@ -496,10 +499,10 @@ class Trainer:
                 self._adaptive_lr.load_state(self._checkpoint_adaptive_state)
 
         if start_step > 0:
-            print(f"Resuming training from step {start_step}...")
+            self.logger.info(f"Resuming training from step {start_step}...")
         else:
-            print("Starting training...")
-        print("-" * 70)
+            self.logger.info("Starting training...")
+        self.logger.info("-" * 70)
 
         model.train()
         metrics.start_time = time.time()
@@ -517,7 +520,7 @@ class Trainer:
         eval_dataset = config.dataset_name
         if config.dataset_name.startswith("pretrain_") or config.dataset_name in ["sft_chat"]:
             eval_dataset = "wikitext2"
-            print(f"📊 Using wikitext2 for evaluation (mixed dataset: {config.dataset_name})")
+            self.logger.info(f"📊 Using wikitext2 for evaluation (mixed dataset: {config.dataset_name})")
         eval_loader = create_universal_loader(
             dataset=eval_dataset,
             batch_size=config.batch_size,
@@ -529,25 +532,38 @@ class Trainer:
         fixed_eval_batches = [eval_loader.get_batch() for _ in range(eval_batches)]
 
         if start_step >= max_steps:
-            print(f"⚠️  No steps to run: start_step={start_step} >= max_steps={max_steps}")
-            print("   Increase --max_steps to continue training from this checkpoint.")
+            self.logger.warning(f"⚠️  No steps to run: start_step={start_step} >= max_steps={max_steps}")
+            self.logger.warning("   Increase --max_steps to continue training from this checkpoint.")
             metrics.end_time = time.time()
             return metrics
+
+        # Profiler setup
+        profiler = None
+        if config.use_profiler:
+            self.logger.info(f"🔍 Profiling enabled. Traces will be saved to {config.profiler_dir}")
+            profiler = torch.profiler.profile(
+                schedule=torch.profiler.schedule(wait=10, warmup=5, active=5, repeat=1),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(config.profiler_dir),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True
+            )
+            profiler.start()
 
         while step < max_steps:
             step_start = time.time()
             optimizer.zero_grad(set_to_none=True)
-            accum_loss = 0.0
+            accum_loss = torch.zeros((), device=self.device)
             micro_diag: List[dict] = []
             collect_micro_diag = os.environ.get("HYDRA_ENABLE_MICRO_DIAG", "0") == "1"
             if collect_micro_diag and step == start_step:
-                print("\n" + "⚠" * 35)
-                print("  WARNING: HYDRA_ENABLE_MICRO_DIAG=1 is active.")
-                print("  This adds ~20 .item() calls per micro-batch, causing")
-                print("  significant CPU-GPU sync overhead. Use for debugging only.")
-                print("⚠" * 35 + "\n")
+                self.logger.warning("\n" + "⚠" * 35)
+                self.logger.warning("  WARNING: HYDRA_ENABLE_MICRO_DIAG=1 is active.")
+                self.logger.warning("  This adds ~20 .item() calls per micro-batch, causing")
+                self.logger.warning("  significant CPU-GPU sync overhead. Use for debugging only.")
+                self.logger.warning("⚠" * 35 + "\n")
             next_step = step + 1
-            track_loss_scalars = collect_micro_diag or ((log_interval > 0 and next_step % log_interval == 0) or (next_step % 500 == 0))
+            track_loss_scalars = collect_micro_diag or ((log_interval > 0 and step % log_interval == 0) or (step % 500 == 0))
 
             grad_spike_threshold = 1e6
             grad_spike_lr_factor = 0.1
@@ -598,10 +614,11 @@ class Trainer:
                             advantage_loss = advantage_loss.clamp(max=10.0)
                         loss = ce_loss + self.config.aux_scale * aux_loss + self.config.ponder_scale * ponder_loss + advantage_loss
                         if track_loss_scalars:
-                            self._last_ce_loss = ce_loss.item() if hasattr(ce_loss, "item") else float(ce_loss)
-                            self._last_aux_loss = aux_loss.item() if hasattr(aux_loss, "item") else float(aux_loss)
-                            self._last_ponder_loss = ponder_loss.item() if hasattr(ponder_loss, "item") else float(ponder_loss)
-                            self._last_advantage_loss = advantage_loss.item() if hasattr(advantage_loss, "item") else float(advantage_loss)
+                            # Store detached tensors to avoid sync; resolve to float only when logging
+                            self._last_ce_loss = ce_loss.detach()
+                            self._last_aux_loss = aux_loss.detach() if isinstance(aux_loss, torch.Tensor) else torch.tensor(aux_loss, device=self.device)
+                            self._last_ponder_loss = ponder_loss.detach() if isinstance(ponder_loss, torch.Tensor) else torch.tensor(ponder_loss, device=self.device)
+                            self._last_advantage_loss = advantage_loss.detach() if isinstance(advantage_loss, torch.Tensor) else torch.tensor(advantage_loss, device=self.device)
                     else:
                         if self.config.use_chunked_ce and hasattr(model, "forward_hidden"):
                             hidden = model.forward_hidden(x)
@@ -623,52 +640,53 @@ class Trainer:
                                 ignore_index=-100,
                             )
                         if track_loss_scalars:
-                            self._last_ce_loss = loss.item() if hasattr(loss, "item") else float(loss)
-                            self._last_aux_loss = 0.0
-                            self._last_ponder_loss = 0.0
+                            self._last_ce_loss = loss.detach()
+                            self._last_aux_loss = torch.tensor(0.0, device=self.device)
+                            self._last_ponder_loss = torch.tensor(0.0, device=self.device)
                 if collect_micro_diag:
                     try:
                         with torch.no_grad():
                             y_flat = y.view(-1)
                             y_is_ignore = y_flat == -100
                             y_valid = ~y_is_ignore
-                            y_oob = (y_valid & ((y_flat < 0) | (y_flat >= vocab_size))).sum().item()
-                            y_ignore = y_is_ignore.sum().item()
-                            y_min = int(y_flat.min().item()) if y_flat.numel() else 0
-                            y_max = int(y_flat.max().item()) if y_flat.numel() else 0
+                            # Store tensors directly to avoid sync
+                            y_oob = (y_valid & ((y_flat < 0) | (y_flat >= vocab_size))).sum()
+                            y_ignore = y_is_ignore.sum()
+                            y_min = y_flat.min() if y_flat.numel() else torch.tensor(0, device=self.device)
+                            y_max = y_flat.max() if y_flat.numel() else torch.tensor(0, device=self.device)
                             x_flat = x.view(-1)
-                            x_oob = ((x_flat < 0) | (x_flat >= vocab_size)).sum().item()
-                            x_min = int(x_flat.min().item()) if x_flat.numel() else 0
-                            x_max = int(x_flat.max().item()) if x_flat.numel() else 0
+                            x_oob = ((x_flat < 0) | (x_flat >= vocab_size)).sum()
+                            x_min = x_flat.min() if x_flat.numel() else torch.tensor(0, device=self.device)
+                            x_max = x_flat.max() if x_flat.numel() else torch.tensor(0, device=self.device)
                             if logits is None:
-                                logits_isfinite = True
-                                logits_absmax = 0.0
-                                logits_mean = 0.0
-                                logits_std = 0.0
+                                logits_isfinite = torch.tensor(True, device=self.device)
+                                logits_absmax = torch.tensor(0.0, device=self.device)
+                                logits_mean = torch.tensor(0.0, device=self.device)
+                                logits_std = torch.tensor(0.0, device=self.device)
                             else:
                                 logits_f = logits.detach()
                                 logits_f32 = logits_f.float()
-                                logits_isfinite = torch.isfinite(logits_f32).all().item()
-                                logits_absmax = logits_f32.abs().max().item() if logits_f32.numel() else 0.0
-                                logits_mean = logits_f32.mean().item() if logits_f32.numel() else 0.0
-                                logits_std = logits_f32.std(unbiased=False).item() if logits_f32.numel() else 0.0
+                                logits_isfinite = torch.isfinite(logits_f32).all()
+                                logits_absmax = logits_f32.abs().max() if logits_f32.numel() else torch.tensor(0.0, device=self.device)
+                                logits_mean = logits_f32.mean() if logits_f32.numel() else torch.tensor(0.0, device=self.device)
+                                logits_std = logits_f32.std(unbiased=False) if logits_f32.numel() else torch.tensor(0.0, device=self.device)
                             micro_diag.append(
                                 {
                                     "micro_step": micro_step,
-                                    "loss": float(loss.item()) if hasattr(loss, "item") else float(loss),
+                                    "loss": loss.detach(),
                                     "accum_enabled": True,
                                     "x_min": x_min,
                                     "x_max": x_max,
-                                    "x_oob": int(x_oob),
+                                    "x_oob": x_oob,
                                     "y_min": y_min,
                                     "y_max": y_max,
-                                    "y_oob": int(y_oob),
-                                    "y_ignore": int(y_ignore),
-                                    "y_valid": int(y_flat.numel() - y_ignore),
-                                    "logits_isfinite": bool(logits_isfinite),
-                                    "logits_absmax": float(logits_absmax),
-                                    "logits_mean": float(logits_mean),
-                                    "logits_std": float(logits_std),
+                                    "y_oob": y_oob,
+                                    "y_ignore": y_ignore,
+                                    "y_valid": int(y_flat.numel()) - y_ignore,
+                                    "logits_isfinite": logits_isfinite,
+                                    "logits_absmax": logits_absmax,
+                                    "logits_mean": logits_mean,
+                                    "logits_std": logits_std,
                                 }
                             )
                     except Exception:
@@ -681,25 +699,39 @@ class Trainer:
                             micro_diag[-1]["skip_reason"] = str(skip_reason)
                         if step % 500 == 0:
                             stats = self._batch_filter.get_stats()
-                            print(
+                            self.logger.info(
                                 f"  [BatchFilter] Skipped batch: {skip_reason}, "
                                 f"total skipped: {stats['n_skipped']}/{stats['n_total']} "
                                 f"({stats['skip_ratio']*100:.1f}%)"
                             )
                         continue
-                loss_val = loss.item()
-                if not math.isfinite(loss_val):
-                    print(f"  ⚠️  Step {step}: NaN/Inf loss detected, skipping batch")
-                    if micro_diag:
-                        micro_diag[-1]["accum_enabled"] = False
-                        micro_diag[-1]["skip_reason"] = "non_finite_loss"
-                    continue
+                
+                # In testing mode, check for NaN/Inf immediately (causes sync)
+                if self.config.mode == "testing":
+                    loss_val = loss.item()
+                    if not math.isfinite(loss_val):
+                        self.logger.warning(f"  ⚠️  Step {step}: NaN/Inf loss detected, skipping batch")
+                        if micro_diag:
+                            micro_diag[-1]["accum_enabled"] = False
+                            micro_diag[-1]["skip_reason"] = "non_finite_loss"
+                        continue
+                
                 scaled_loss = loss * loss_scale
                 if use_scaler:
                     scaler.scale(scaled_loss).backward()
                 else:
                     scaled_loss.backward()
-                accum_loss += loss_val * loss_scale
+                accum_loss += loss.detach() * loss_scale
+
+            # Resolve accumulated loss (sync point)
+            accum_loss = accum_loss.item()
+
+            # Resolve micro_diag tensors if collected
+            if micro_diag:
+                for md in micro_diag:
+                    for k, v in md.items():
+                        if isinstance(v, torch.Tensor):
+                            md[k] = v.item()
 
             if use_scaler:
                 scaler.unscale_(optimizer)
@@ -740,26 +772,26 @@ class Trainer:
                     grad_info_pre_clip = []
                 clip_coef = grad_clip / (pre_clip_norm + 1e-12)
                 clip_scale = min(1.0, clip_coef) if math.isfinite(clip_coef) else 0.0
-                print(f"\n{'='*60}")
-                print(f"  🔍 GRADIENT EXPLOSION DIAGNOSTIC - Step {step}")
-                print(f"{'='*60}")
-                print(f"  Pre-clip grad_norm:  {pre_clip_norm:.2e}")
-                print(f"  Post-clip grad_norm: {grad_norm:.2e}")
-                print(f"  Clip coefficient:    {clip_coef:.2e}")
-                print(f"  Clip scale applied:  {clip_scale:.2e}")
-                print(f"  LR (scheduled):      {lr:.2e}")
+                self.logger.warning(f"\n{'='*60}")
+                self.logger.warning(f"  🔍 GRADIENT EXPLOSION DIAGNOSTIC - Step {step}")
+                self.logger.warning(f"{'='*60}")
+                self.logger.warning(f"  Pre-clip grad_norm:  {pre_clip_norm:.2e}")
+                self.logger.warning(f"  Post-clip grad_norm: {grad_norm:.2e}")
+                self.logger.warning(f"  Clip coefficient:    {clip_coef:.2e}")
+                self.logger.warning(f"  Clip scale applied:  {clip_scale:.2e}")
+                self.logger.warning(f"  LR (scheduled):      {lr:.2e}")
                 if spike_detected:
-                    print(f"  LR (effective):      {lr_effective:.2e} (cooldown x{grad_spike_lr_factor})")
-                print(f"  Accumulated loss this step: {accum_loss:.4f}")
+                    self.logger.warning(f"  LR (effective):      {lr_effective:.2e} (cooldown x{grad_spike_lr_factor})")
+                self.logger.warning(f"  Accumulated loss this step: {accum_loss:.4f}")
                 ce = getattr(self, "_last_ce_loss", 0.0)
                 aux = getattr(self, "_last_aux_loss", 0.0)
                 ponder = getattr(self, "_last_ponder_loss", 0.0)
-                print(f"  Last micro-batch losses: CE={ce:.4f}, aux={aux:.4f}, ponder={ponder:.4f}")
+                self.logger.warning(f"  Last micro-batch losses: CE={ce:.4f}, aux={aux:.4f}, ponder={ponder:.4f}")
                 if micro_diag:
-                    print("\n  Micro-batch sanity (this step):")
+                    self.logger.warning("\n  Micro-batch sanity (this step):")
                     for md in micro_diag:
                         skip_note = "" if md.get("accum_enabled", True) else f" SKIPPED({md.get('skip_reason', 'unknown')})"
-                        print(
+                        self.logger.warning(
                             f"    micro={md.get('micro_step')} loss={md.get('loss', 0.0):.4f}{skip_note} | "
                             f"x[min,max]=[{md.get('x_min')},{md.get('x_max')}] x_oob={md.get('x_oob')} | "
                             f"y[min,max]=[{md.get('y_min')},{md.get('y_max')}] y_oob={md.get('y_oob')} "
@@ -772,7 +804,7 @@ class Trainer:
                         return float("inf")
                     return x[1]
                 grad_info_pre_clip.sort(key=sort_key, reverse=True)
-                print("  Top 15 gradients by norm (post-clip; est pre-clip in parentheses):")
+                self.logger.warning("  Top 15 gradients by norm (post-clip; est pre-clip in parentheses):")
                 for name, g_norm, g_max, has_nan, has_inf in grad_info_pre_clip[:15]:
                     flag = ""
                     if has_nan:
@@ -785,7 +817,7 @@ class Trainer:
                     else:
                         g_norm_pre = g_norm
                         g_max_pre = g_max
-                    print(
+                    self.logger.warning(
                         f"    {name}: norm={g_norm:.2e} (pre~{g_norm_pre:.2e}), "
                         f"max={g_max:.2e} (pre~{g_max_pre:.2e}){flag}"
                     )
@@ -808,31 +840,31 @@ class Trainer:
                             ratios.append((name, ratio_l2, ratio_max, w_norm, g_norm_post))
                     ratios.sort(key=lambda t: t[1], reverse=True)
                     if ratios:
-                        print("\n  Update/weight ratios (clipped grads, effective LR):")
+                        self.logger.warning("\n  Update/weight ratios (clipped grads, effective LR):")
                         for name, r_l2, r_max, w_norm, g_norm_post in ratios[:8]:
-                            print(
+                            self.logger.warning(
                                 f"    {name}: (lr*||g||/||w||)={r_l2:.2e}, (lr*gmax/wmax)={r_max:.2e} | "
                                 f"||w||={w_norm:.2e}, ||g||_post={g_norm_post:.2e}"
                             )
                 except Exception:
                     pass
                 if hasattr(base, "layers"):
-                    print("\n  Router diagnostics (first 5 layers):")
+                    self.logger.warning("\n  Router diagnostics (first 5 layers):")
                     for i, layer in enumerate(base.layers[:5]):
                         if hasattr(layer, "router"):
                             w = layer.router.weight
                             b = layer.router.bias if hasattr(layer.router, "bias") and layer.router.bias is not None else None
-                            print(f"    Layer {i} router.weight: mean={w.mean():.4f}, std={w.std():.4f}, max={w.abs().max():.4f}")
+                            self.logger.warning(f"    Layer {i} router.weight: mean={w.mean():.4f}, std={w.std():.4f}, max={w.abs().max():.4f}")
                             if b is not None:
-                                print(f"    Layer {i} router.bias: {b.item():.4f}")
+                                self.logger.warning(f"    Layer {i} router.bias: {b.item():.4f}")
                             if w.grad is not None:
-                                print(f"    Layer {i} router.weight.grad: norm={w.grad.norm():.2e}, max={w.grad.abs().max():.2e}")
-                print(f"{'='*60}\n")
+                                self.logger.warning(f"    Layer {i} router.weight.grad: norm={w.grad.norm():.2e}, max={w.grad.abs().max():.2e}")
+                self.logger.warning(f"{'='*60}\n")
                 if nonfinite_grads:
                     optimizer.zero_grad(set_to_none=True)
                     if use_scaler:
                         scaler.update()
-                    print(f"  ⚠️  Step {step}: Skipping update - non-finite gradients")
+                    self.logger.warning(f"  ⚠️  Step {step}: Skipping update - non-finite gradients")
                     step += 1
                     continue
                 if spike_detected and grad_spike_reset_moments:
@@ -855,9 +887,9 @@ class Trainer:
                                 st["exp_avg_sq"].zero_()
                             if "max_exp_avg_sq" in st and torch.is_tensor(st["max_exp_avg_sq"]):
                                 st["max_exp_avg_sq"].zero_()
-                        print(f"  🔧 Spike response: reset Adam moments for top {len(offenders)} params")
+                        self.logger.warning(f"  🔧 Spike response: reset Adam moments for top {len(offenders)} params")
                     except Exception as e:
-                        print(f"  ⚠️  Spike response: moment reset failed ({e})")
+                        self.logger.warning(f"  ⚠️  Spike response: moment reset failed ({e})")
                 if (spike_detected or nonfinite_grads) and getattr(self.config, "halt_on_spike", False):
                     try:
                         halt_step_time = max(1e-9, time.time() - step_start)
@@ -867,13 +899,15 @@ class Trainer:
                         metrics.final_loss = accum_loss
                         self._save_checkpoint(step)
                     except Exception as e:
-                        print(f"  ⚠️  Halt-on-spike: failed to record/save state ({e})")
-                    print(f"  🛑 Halt-on-spike enabled: stopping at step {step}")
+                        self.logger.warning(f"  ⚠️  Halt-on-spike: failed to record/save state ({e})")
+                    self.logger.warning(f"  🛑 Halt-on-spike enabled: stopping at step {step}")
+                    if profiler:
+                        profiler.stop()
                     metrics.end_time = time.time()
                     return metrics
             if spike_detected:
                 lr = lr_effective
-                print(f"  🔻 Spike response: LR cooldown applied (factor={grad_spike_lr_factor})")
+                self.logger.warning(f"  🔻 Spike response: LR cooldown applied (factor={grad_spike_lr_factor})")
             for pg in param_groups:
                 pg["lr"] = lr
             if use_scaler:
@@ -885,6 +919,9 @@ class Trainer:
                 base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
                 self._adaptive_lr.update_swa(base_model)
             step += 1
+            if profiler:
+                profiler.step()
+
             if hasattr(self.train_loader, "set_step"):
                 self.train_loader.set_step(step)
             step_time = time.time() - step_start
@@ -896,9 +933,9 @@ class Trainer:
             if step == start_step + 1:
                 metrics.initial_loss = accum_loss
                 if start_step == 0:
-                    print(f"Initial loss: {accum_loss:.4f}")
+                    self.logger.info(f"Initial loss: {accum_loss:.4f}")
                 else:
-                    print(f"Resume loss: {accum_loss:.4f} (previous best: {metrics.best_loss:.4f})")
+                    self.logger.info(f"Resume loss: {accum_loss:.4f} (previous best: {metrics.best_loss:.4f})")
             prev_best = metrics.best_loss
             metrics.update(step, accum_loss, lr, grad_norm, tps, step_time)
             metrics.total_tokens += tokens_per_step
@@ -940,14 +977,17 @@ class Trainer:
                         eval_loss += loss_eval.item()
                 base_model.train()
                 eval_loss /= len(fixed_eval_batches)
-                print(f"[EVAL] step={step}  eval_loss={eval_loss:.4f}  train_loss={accum_loss:.4f}")
+                self.logger.info(f"[EVAL] step={step}  eval_loss={eval_loss:.4f}  train_loss={accum_loss:.4f}")
+                if self.config.use_wandb:
+                    import wandb
+                    wandb.log({"eval_loss": eval_loss, "step": step})
             if step % log_interval == 0:
                 elapsed = time.time() - metrics.start_time
                 steps_this_session = step - start_step
                 tokens_this_session = steps_this_session * tokens_per_step
                 avg_tps = tokens_this_session / elapsed if elapsed > 0 else 0
                 steps_per_sec = steps_this_session / elapsed if elapsed > 0 else 0
-                print(
+                self.logger.info(
                     f"Step {step:5d}/{max_steps} | "
                     f"Loss: {accum_loss:.4f} (EMA: {metrics.ema_loss:.4f}) | "
                     f"LR: {lr:.2e} | "
@@ -955,22 +995,37 @@ class Trainer:
                     f"{tps/1000:.1f}K tok/s | "
                     f"Avg: {avg_tps/1000:.1f}K tok/s ({steps_per_sec:.2f} steps/s)"
                 )
+                
+                if self.config.use_wandb:
+                    import wandb
+                    wandb.log({
+                        "train_loss": accum_loss,
+                        "ema_loss": metrics.ema_loss,
+                        "lr": lr,
+                        "grad_norm": grad_norm,
+                        "tps": tps,
+                        "avg_tps": avg_tps,
+                        "step": step
+                    })
                 if use_mod_mor and step % 100 == 0:
                     self._log_layer_diagnostics(step, accum_loss, lr, grad_norm)
             if step % save_interval == 0:
                 self._save_checkpoint(step)
                 if self._should_early_stop(accum_loss if accum_loss > 0 else metrics.losses[-1], step, self._count_params()):
-                    print(f"\n⚠️  EARLY STOPPING at step {step}")
-                    print(f"   Loss has increased for {config.early_stop_patience} consecutive checkpoints")
-                    print(f"   Checkpoint losses: {self._checkpoint_losses[-4:]}")
+                    self.logger.warning(f"\n⚠️  EARLY STOPPING at step {step}")
+                    self.logger.warning(f"   Loss has increased for {config.early_stop_patience} consecutive checkpoints")
+                    self.logger.warning(f"   Checkpoint losses: {self._checkpoint_losses[-4:]}")
                     break
             accum_loss = 0.0
+
+        if profiler:
+            profiler.stop()
 
         metrics.end_time = time.time()
         metrics.final_loss = metrics.losses[-1] if metrics.losses else 0.0
 
-        print("-" * 70)
-        print("Training complete!")
+        self.logger.info("-" * 70)
+        self.logger.info("Training complete!")
 
         if self._adaptive_lr is not None and self._adaptive_lr.swa_n > 0:
             base_model = self.model
@@ -995,11 +1050,11 @@ class Trainer:
             "step": step,
             "timestamp": datetime.now().isoformat(),
             "losses": {
-                "total": loss,
-                "ce": self._last_ce_loss,
-                "aux": self._last_aux_loss,
-                "ponder": self._last_ponder_loss,
-                "advantage": self._last_advantage_loss,
+                "total": float(loss) if hasattr(loss, "item") else float(loss),
+                "ce": float(self._last_ce_loss.item()) if hasattr(self._last_ce_loss, "item") else float(self._last_ce_loss),
+                "aux": float(self._last_aux_loss.item()) if hasattr(self._last_aux_loss, "item") else float(self._last_aux_loss),
+                "ponder": float(self._last_ponder_loss.item()) if hasattr(self._last_ponder_loss, "item") else float(self._last_ponder_loss),
+                "advantage": float(self._last_advantage_loss.item()) if hasattr(self._last_advantage_loss, "item") else float(self._last_advantage_loss),
             },
             "lr": lr,
             "grad_norm": grad_norm,
@@ -1031,15 +1086,22 @@ class Trainer:
             warmup_steps = layer_stat.get("warmup_steps", 100)
             deviation = abs(probs_mean - target)
             status = "OK"
+            # MoD can be intentionally disabled before its curriculum enable step.
+            # In that phase, probs_mean may be 0.0 by design and should not be
+            # reported as router collapse.
+            mod_active = (routing_mode != "disabled") and (global_step >= warmup_steps)
             if probs_mean < 0.1:
-                status = "COLLAPSED_LOW"
-                mod_issues.append(f"Layer {layer_idx}: probs={probs_mean:.3f} (collapsed to skip)")
+                status = "DISABLED_PRE_ENABLE" if not mod_active else "COLLAPSED_LOW"
+                if mod_active:
+                    mod_issues.append(f"Layer {layer_idx}: probs={probs_mean:.3f} (collapsed to skip)")
             elif probs_mean > 0.9:
-                status = "COLLAPSED_HIGH"
-                mod_issues.append(f"Layer {layer_idx}: probs={probs_mean:.3f} (collapsed to process all)")
+                status = "DISABLED_PRE_ENABLE" if not mod_active else "COLLAPSED_HIGH"
+                if mod_active:
+                    mod_issues.append(f"Layer {layer_idx}: probs={probs_mean:.3f} (collapsed to process all)")
             elif deviation > 0.2:
-                status = "DRIFTING"
-                mod_issues.append(f"Layer {layer_idx}: probs={probs_mean:.3f} vs target={target:.2f}")
+                status = "DISABLED_PRE_ENABLE" if not mod_active else "DRIFTING"
+                if mod_active:
+                    mod_issues.append(f"Layer {layer_idx}: probs={probs_mean:.3f} vs target={target:.2f}")
             record["mod_layers"].append(
                 {
                     "layer": layer_idx,
@@ -1056,6 +1118,12 @@ class Trainer:
                     "status": status,
                 }
             )
+        mor_phase_raw = "unknown"
+        mor_status = {}
+        if hasattr(model, "get_mor_status"):
+            mor_status = model.get_mor_status()
+            mor_phase_raw = mor_status.get("phase", "unknown")
+
         mor_stats = stats.get("mor_layers", [])
         mor_issues = []
         for layer_stat in mor_stats:
@@ -1065,15 +1133,19 @@ class Trainer:
             router_probs = layer_stat.get("router_probs_mean", 0.5)
             depth_hist = layer_stat.get("depth_histogram", [])
             status = "OK"
-            if router_probs < 0.1:
-                status = "ROUTER_COLLAPSED"
-                mor_issues.append(f"Layer {layer_idx}: router_probs={router_probs:.3f} (always early exit)")
-            elif router_probs > 0.9:
-                status = "ROUTER_SATURATED"
-                mor_issues.append(f"Layer {layer_idx}: router_probs={router_probs:.3f} (always max depth)")
-            elif depth_hist and max(depth_hist) > 0.9 * sum(depth_hist):
-                status = "DEPTH_COLLAPSED"
-                mor_issues.append(f"Layer {layer_idx}: all tokens at same depth")
+            
+            # Only flag router collapse if we are in adaptive phase
+            if mor_phase_raw in ["full-adaptive", "rampup"]:
+                if router_probs < 0.1:
+                    status = "ROUTER_COLLAPSED"
+                    mor_issues.append(f"Layer {layer_idx}: router_probs={router_probs:.3f} (always early exit)")
+                elif router_probs > 0.9:
+                    status = "ROUTER_SATURATED"
+                    mor_issues.append(f"Layer {layer_idx}: router_probs={router_probs:.3f} (always max depth)")
+                elif depth_hist and max(depth_hist) > 0.9 * sum(depth_hist):
+                    status = "DEPTH_COLLAPSED"
+                    mor_issues.append(f"Layer {layer_idx}: all tokens at same depth")
+            
             record["mor_layers"].append(
                 {
                     "layer": layer_idx,
@@ -1085,16 +1157,13 @@ class Trainer:
                 }
             )
         self._diagnostics_data.append(record)
-        mor_phase = "N/A"
-        if hasattr(model, "get_mor_status"):
-            mor_status = model.get_mor_status()
-            phase = mor_status.get("phase", "unknown")
-            if phase == "fixed-depth":
-                mor_phase = f"FIXED ({mor_status.get('rampup_progress', 0)*100:.0f}%)"
-            elif phase == "rampup":
-                mor_phase = f"RAMP ({mor_status.get('rampup_progress', 0)*100:.0f}%)"
-            else:
-                mor_phase = "FULL"
+        
+        if mor_phase_raw == "fixed-depth":
+            mor_phase = f"FIXED ({mor_status.get('rampup_progress', 0)*100:.0f}%)"
+        elif mor_phase_raw == "rampup":
+            mor_phase = f"RAMP ({mor_status.get('rampup_progress', 0)*100:.0f}%)"
+        else:
+            mor_phase = "FULL"
         mod_mode = "N/A"
         mod_savings = 0.0
         if mod_stats:
@@ -1115,7 +1184,11 @@ class Trainer:
                 total = sum(agg_hist) or 1
                 depth_dist = "/".join([f"{100*v/total:.0f}" for v in agg_hist])
         if mod_issues or mor_issues:
-            print(f"  ⚠️  Issues: MoD={len(mod_issues)}, MoR={len(mor_issues)}")
+            self.logger.warning(f"  ⚠️  Issues: MoD={len(mod_issues)}, MoR={len(mor_issues)}")
+            if mod_issues:
+                self.logger.warning(f"      MoD Issues: {mod_issues[:3]}...")
+            if mor_issues:
+                self.logger.warning(f"      MoR Issues: {mor_issues[:3]}...")
         if step % 500 == 0:
             adaptive_info = ""
             if self._adaptive_lr is not None:
@@ -1125,7 +1198,7 @@ class Trainer:
                 trend = "↑" if ema_s > ema_l * 1.02 else ("↓" if ema_s < ema_l * 0.98 else "→")
                 adaptive_info = f" | EMA: {ema_s:.3f}/{ema_l:.3f} {trend}"
             adv_str = f" adv={self._last_advantage_loss:.4f}" if self._last_advantage_loss != 0 else ""
-            print(
+            self.logger.info(
                 f"  [DIAG] MoD:{mod_mode} save={mod_savings:.0f}% | MoR:{mor_phase} d={mor_depth:.2f} [{depth_dist}%] | "
                 f"CE={self._last_ce_loss:.3f} aux={self._last_aux_loss:.4f} ponder={self._last_ponder_loss:.3f}{adv_str}{adaptive_info}"
             )
@@ -1140,9 +1213,9 @@ class Trainer:
         try:
             with open(diag_path, "w") as f:
                 json.dump(self._diagnostics_data, f, indent=2)
-            print(f"📊 Diagnostics saved to {diag_path}")
+            self.logger.info(f"📊 Diagnostics saved to {diag_path}")
         except Exception as e:
-            print(f"⚠️  Failed to save diagnostics: {e}")
+            self.logger.warning(f"⚠️  Failed to save diagnostics: {e}")
 
     def _save_checkpoint(self, step: int, final: bool = False, best: bool = False) -> None:
         config = self.config
@@ -1181,11 +1254,11 @@ class Trainer:
                 checkpoint["swa_model"] = self._adaptive_lr._swa_model.state_dict()
         torch.save(checkpoint, ckpt_path)
         if best:
-            print(f"🏆 New best! Loss: {self.metrics.best_loss:.4f} → {ckpt_path}")
+            self.logger.info(f"🏆 New best! Loss: {self.metrics.best_loss:.4f} → {ckpt_path}")
         elif final:
-            print(f"Checkpoint saved: {ckpt_path}")
+            self.logger.info(f"Checkpoint saved: {ckpt_path}")
         else:
-            print(f"Checkpoint saved: {ckpt_path}")
+            self.logger.info(f"Checkpoint saved: {ckpt_path}")
             self._checkpoint_history.append(ckpt_path)
             self._cleanup_old_checkpoints()
 
@@ -1195,7 +1268,7 @@ class Trainer:
             old_ckpt = self._checkpoint_history.pop(0)
             if old_ckpt.exists():
                 old_ckpt.unlink()
-                print(f"   Removed old checkpoint: {old_ckpt.name}")
+                self.logger.info(f"   Removed old checkpoint: {old_ckpt.name}")
 
     def _should_early_stop(self, current_loss: float, current_step: int, total_params: int) -> bool:
         config = self.config
@@ -1211,11 +1284,11 @@ class Trainer:
         relative_increase = (current_loss - prev_loss) / prev_loss if prev_loss > 0 else 0
         if relative_increase > config.early_stop_threshold:
             self._early_stop_counter += 1
-            print(
+            self.logger.warning(
                 f"   ⚠️  Loss increased: {prev_loss:.4f} → {current_loss:.4f} (+{relative_increase*100:.1f}%) "
                 f"[{self._early_stop_counter}/{config.early_stop_patience}]"
             )
-            print(f"       (Chinchilla progress: {progress*100:.1f}%, early stop active)")
+            self.logger.warning(f"       (Chinchilla progress: {progress*100:.1f}%, early stop active)")
         else:
             self._early_stop_counter = 0
         return self._early_stop_counter >= config.early_stop_patience
@@ -1302,27 +1375,27 @@ class Trainer:
         report_path = report_dir / f"training_report_{timestamp}.json"
         with open(report_path, "w") as f:
             json.dump(report, f, indent=2)
-        print("\n" + "=" * 70)
-        print("TRAINING REPORT")
-        print("=" * 70)
-        print(f"\n📊 Loss Analysis:")
-        print(f"   Initial: {metrics.initial_loss:.4f}")
-        print(f"   Final:   {metrics.final_loss:.4f}")
-        print(f"   Best:    {metrics.best_loss:.4f} (step {metrics.best_loss_step})")
-        print(f"   Reduction: {loss_reduction:.1f}%")
-        print(f"\n⚡ Performance:")
-        print(f"   Training time: {self._format_time(training_time)}")
-        print(f"   Total tokens: {metrics.total_tokens:,}")
-        print(f"   Avg throughput: {avg_tps/1000:.1f}K tok/s")
-        print(f"   Peak throughput: {peak_tps/1000:.1f}K tok/s")
-        print(f"\n📈 Model Assessment:")
+        self.logger.info("\n" + "=" * 70)
+        self.logger.info("TRAINING REPORT")
+        self.logger.info("=" * 70)
+        self.logger.info(f"\n📊 Loss Analysis:")
+        self.logger.info(f"   Initial: {metrics.initial_loss:.4f}")
+        self.logger.info(f"   Final:   {metrics.final_loss:.4f}")
+        self.logger.info(f"   Best:    {metrics.best_loss:.4f} (step {metrics.best_loss_step})")
+        self.logger.info(f"   Reduction: {loss_reduction:.1f}%")
+        self.logger.info(f"\n⚡ Performance:")
+        self.logger.info(f"   Training time: {self._format_time(training_time)}")
+        self.logger.info(f"   Total tokens: {metrics.total_tokens:,}")
+        self.logger.info(f"   Avg throughput: {avg_tps/1000:.1f}K tok/s")
+        self.logger.info(f"   Peak throughput: {peak_tps/1000:.1f}K tok/s")
+        self.logger.info(f"\n📈 Model Assessment:")
         for key, value in report["model_assessment"].items():
-            print(f"   {key}: {value}")
-        print(f"\n✅ Training Assessment:")
+            self.logger.info(f"   {key}: {value}")
+        self.logger.info(f"\n✅ Training Assessment:")
         for key, value in report["training_assessment"].items():
-            print(f"   {key}: {value}")
-        print(f"\n📁 Report saved: {report_path}")
-        print("=" * 70)
+            self.logger.info(f"   {key}: {value}")
+        self.logger.info(f"\n📁 Report saved: {report_path}")
+        self.logger.info("=" * 70)
 
     def _assess_model_performance(self, metrics: TrainingMetrics) -> Dict[str, str]:
         assessment: Dict[str, str] = {}

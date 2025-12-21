@@ -13,14 +13,11 @@ at various model scales: 100M, 500M, 750M, 1.5B.
 Run: pytest tests/test_paper_compliance.py -v
 """
 
-import json
 import math
-import os
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import pytest
 import torch
@@ -158,7 +155,11 @@ def get_device() -> str:
 
 
 def create_model_from_variant(
-    variant: ModelVariant, vocab_size: int = 50257
+    variant: ModelVariant,
+    vocab_size: int = 50257,
+    *,
+    mod_mlp_warmup: int = 100,
+    mor_warmup: int = 1000,
 ) -> CCGQAMoDMoRModel:
     """Create a model from a variant configuration."""
     return create_ccgqa_mod_mor_model(
@@ -171,6 +172,8 @@ def create_model_from_variant(
         compression_factor=variant.compression_factor,
         mod_capacity=0.75,
         adaptive=True,
+        mod_mlp_warmup=mod_mlp_warmup,
+        mor_warmup=mor_warmup,
     )
 
 
@@ -775,7 +778,13 @@ def run_variant_diagnostic(variant: ModelVariant, steps: int = 100) -> Dict[str,
     device = get_device()
 
     # Create model
-    model = create_model_from_variant(variant, vocab_size=1000)
+    # MoD curriculum must not start at step 0; match project default of 10%.
+    mod_mlp_warmup = max(1, steps // 10)
+    model = create_model_from_variant(
+        variant,
+        vocab_size=1000,
+        mod_mlp_warmup=mod_mlp_warmup,
+    )
     model = model.to(device)
     param_count = sum(p.numel() for p in model.parameters())
 
@@ -798,6 +807,7 @@ def run_variant_diagnostic(variant: ModelVariant, steps: int = 100) -> Dict[str,
     mor_depths = []
 
     for step in range(1, steps + 1):
+        model.set_global_step(step)
         x = torch.randint(0, 1000, (2, 64), device=device)
         logits, losses = model(x, return_losses=True)
 
@@ -1093,7 +1103,9 @@ class TestScalingPredictions:
         """Verify smaller models converge to target capacity quickly."""
         variant = MODEL_VARIANTS[variant_name]
 
-        model = create_model_from_variant(variant)
+        # MoD curriculum must not start at step 0; match project default of 10%.
+        mod_mlp_warmup = max(1, 30 // 10)
+        model = create_model_from_variant(variant, mod_mlp_warmup=mod_mlp_warmup)
         device = get_device()
         model = model.to(device)
         model.train()
@@ -1104,6 +1116,8 @@ class TestScalingPredictions:
         for step in range(30):
             input_ids = torch.randint(0, 50257, (2, 128), device=device)
             optimizer.zero_grad()
+
+            model.set_global_step(step + 1)
 
             # Model returns (logits, losses_dict) or (logits, aux_loss, ponder_loss)
             output = model(input_ids)

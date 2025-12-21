@@ -19,12 +19,18 @@ References:
 
 import os
 from typing import Optional
+import importlib.util
+import warnings
 
 # Feature flag for Liger
 LIGER_AVAILABLE = False
 LIGER_ENABLED = os.environ.get("HYDRA_USE_LIGER", "1") == "1"
 
-try:
+# Check if installed without importing
+_liger_spec = importlib.util.find_spec("liger_kernel")
+LIGER_AVAILABLE = _liger_spec is not None
+
+if LIGER_AVAILABLE:
     import liger_kernel
     # Liger 0.5+ uses liger_kernel.transformers API
     from liger_kernel.transformers import (
@@ -43,8 +49,12 @@ try:
         from liger_kernel.ops.rope import liger_rotary_pos_emb
     except ImportError:
         liger_rotary_pos_emb = None
-    LIGER_AVAILABLE = True
-except ImportError:
+else:
+    warnings.warn(
+        "Liger Kernel not found. Liger optimizations will be disabled. "
+        "Install with: pip install liger-kernel",
+        UserWarning
+    )
     LigerRMSNorm = None
     LigerSwiGLUMLP = None
     LigerSiLUMulFunction = None

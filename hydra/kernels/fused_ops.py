@@ -54,16 +54,10 @@ except ImportError:
 # Triton Import and Feature Detection
 # =============================================================================
 
-try:
-    import triton
-    import triton.language as tl
-    TRITON_AVAILABLE = True
-    TRITON_VERSION = tuple(int(x) for x in triton.__version__.split(".")[:2])
-except ImportError:
-    TRITON_AVAILABLE = False
-    TRITON_VERSION = (0, 0)
-    triton = None
-    tl = None
+import triton
+import triton.language as tl
+TRITON_AVAILABLE = True
+TRITON_VERSION = tuple(int(x) for x in triton.__version__.split(".")[:2])
 
 # Global enable switch (can be overridden)
 USE_TRITON_KERNELS = TRITON_AVAILABLE and os.environ.get("HYDRA_DISABLE_TRITON", "0") != "1"
@@ -239,7 +233,7 @@ def _fused_rope_triton(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) ->
 
 
 def _rope_pytorch(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """PyTorch fallback for RoPE."""
+    """PyTorch reference implementation for RoPE."""
     S = x.shape[2]
     cos = cos[:, :, :S, :]
     sin = sin[:, :, :S, :]
@@ -458,7 +452,7 @@ def _qk_norm_pytorch(
     scale: float,
     temperature: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """PyTorch fallback for QK normalization."""
+    """PyTorch reference implementation for QK normalization."""
     q_norm = F.normalize(q, p=2, dim=-1) * scale
     k_norm = F.normalize(k, p=2, dim=-1) * scale * temperature
     return q_norm, k_norm
@@ -592,7 +586,7 @@ def _fused_swiglu_triton(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 
 
 def _swiglu_pytorch(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-    """PyTorch fallback for SwiGLU."""
+    """PyTorch reference implementation for SwiGLU."""
     return F.silu(gate) * up
 
 
@@ -766,7 +760,7 @@ def _fused_rms_norm_triton(x: torch.Tensor, weight: torch.Tensor, eps: float) ->
 
 
 def _rms_norm_pytorch(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """PyTorch fallback for RMSNorm."""
+    """PyTorch reference implementation for RMSNorm."""
     # Prefer native PyTorch RMSNorm when available (fast + stable).
     if hasattr(F, "rms_norm"):
         return F.rms_norm(x, [x.shape[-1]], weight=weight, eps=eps)
@@ -894,9 +888,9 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
     ) -> torch.Tensor:
         batch_size, seq_len, dim = hidden_states.shape
         
-        # Flatten for computation
-        hidden_flat = hidden_states.view(-1, dim)
-        targets_flat = targets.view(-1)
+        # Flatten for computation - use reshape() to handle non-contiguous tensors
+        hidden_flat = hidden_states.reshape(-1, dim)
+        targets_flat = targets.reshape(-1)
         total_tokens = hidden_flat.shape[0]
         
         # Save for backward (recompute logits to save memory)
@@ -948,8 +942,8 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
             )
         
         batch_size, seq_len, dim = hidden_states.shape
-        hidden_flat = hidden_states.view(-1, dim)
-        targets_flat = targets.view(-1)
+        hidden_flat = hidden_states.reshape(-1, dim)
+        targets_flat = targets.reshape(-1)
         total_tokens = hidden_flat.shape[0]
         
         # Accumulate gradients in chunks (use float32 for stability)

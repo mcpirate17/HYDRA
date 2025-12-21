@@ -22,6 +22,10 @@ import triton.language as tl
 BLACKWELL_SRAM_LIMIT = 101_376
 SRAM_BUDGET = 96_000
 
+# Debug/benchmark visibility: populated during backward
+# Format: (CBLOCK_INTER, INTER_STAGES, INTER_WARPS)
+_LAST_INTER_CONFIG: tuple[int, int, int] | None = None
+
 
 def validate_config(CBLOCK: int, d: int, num_stages: int = 1) -> tuple[bool, int]:
     """Validate kernel config fits Blackwell shared memory."""
@@ -30,6 +34,16 @@ def validate_config(CBLOCK: int, d: int, num_stages: int = 1) -> tuple[bool, int
     attention = 2 * CBLOCK * CBLOCK * 4  # fp32
     overhead = 4096
     total = input_tiles + accumulators + attention + overhead
+    return (total <= SRAM_BUDGET, total)
+
+
+def validate_inter_config(CBLOCK: int, d: int, e: int, num_stages: int = 1) -> tuple[bool, int]:
+    """Conservative SRAM estimate for the inter-chunk backward kernel."""
+    kv_states = 2 * d * e * 4  # kv_state_trans + dkv_state, fp32
+    input_tiles = num_stages * 4 * CBLOCK * (d + e)  # q/k/v/do, fp16
+    accumulators = 3 * CBLOCK * d * 4  # fp32
+    overhead = 4096
+    total = kv_states + input_tiles + accumulators + overhead
     return (total <= SRAM_BUDGET, total)
 
 
@@ -440,20 +454,53 @@ class LightningAttention3NoDecayChunked(torch.autograd.Function):
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
 
-        # Optimal configs tuned for Blackwell RTX 5090:
-        # - Intra: CBLOCK=32 is fastest (O(n²) within block benefits from smaller chunks)
-        # - Inter: CBLOCK=128 is fastest (fewer iterations, better tensor core utilization)
-        #          CBLOCK=256 exceeds SRAM limit (101KB)
-        # - Inter stages=3 provides best software pipelining
-        CBLOCK_INTRA = 32
-        CBLOCK_INTER = 128
+        # Blackwell RTX 5090 SRAM limit: 101KB
+        # Config selection based on head_dim to fit within SRAM budget
+        # 
+        # Inter kernel SRAM ≈ 2×d×e×4 (kv states) + stages×4×CBLOCK×d×2 (inputs) + 3×CBLOCK×d×4 (accum)
+        # For d=64:  CBLOCK=128, stages=3 → ~210KB (FAIL)
+        #            CBLOCK=64, stages=2 → ~144KB (FAIL) 
+        #            CBLOCK=32, stages=1 → ~72KB (OK)
+        # For d=128: CBLOCK=64, stages=2 → ~280KB (FAIL)
+        #            CBLOCK=32, stages=1 → ~120KB (FAIL)
+        #            CBLOCK=16, stages=1 → ~72KB (OK)
+        
+        CBLOCK_INTRA = 32  # Fixed - must divide BLOCK
         BLOCK = 64
+
+        # Adaptive inter-kernel config: prefer larger CBLOCK (fewer iterations)
+        # while staying within SRAM_BUDGET.
+        if d <= 64:
+            cblock_candidates = (64, 32, 16)
+        elif d <= 128:
+            cblock_candidates = (32, 16)
+        else:
+            cblock_candidates = (32, 16)
+
+        CBLOCK_INTER = 16
+        INTER_STAGES = 1
+        INTER_WARPS = 4
+        for cblock in cblock_candidates:
+            for stages in (2, 1):
+                is_valid, _ = validate_inter_config(cblock, d, e, num_stages=stages)
+                if is_valid:
+                    CBLOCK_INTER = cblock
+                    INTER_STAGES = stages
+                    INTER_WARPS = 8 if (cblock >= 64 and d <= 64) else 4
+                    break
+            else:
+                continue
+            break
+
+        global _LAST_INTER_CONFIG
+        _LAST_INTER_CONFIG = (CBLOCK_INTER, INTER_STAGES, INTER_WARPS)
+        
         NUM_BLOCK = triton.cdiv(n, BLOCK)
         NUM_CBLOCK_PER_BLOCK = BLOCK // CBLOCK_INTRA
         
-        # Validate config
+        # Validate intra config
         is_valid, sram = validate_config(CBLOCK_INTRA, d, num_stages=1)
-        assert is_valid, f"Config requires {sram} bytes, exceeds {SRAM_BUDGET}"
+        assert is_valid, f"Intra config requires {sram} bytes, exceeds {SRAM_BUDGET}"
 
         # Strides
         stride_qb, stride_qh, stride_qn, stride_qd = q.stride()
@@ -479,7 +526,7 @@ class LightningAttention3NoDecayChunked(torch.autograd.Function):
         )
 
         # Inter-chunk backward: sequential over chunks
-        # CBLOCK=128 reduces iterations by 2x vs CBLOCK=64
+        # Config adapts to head_dim to stay within Blackwell SRAM budget
         NUM_CBLOCK_TOTAL = triton.cdiv(n, CBLOCK_INTER)
         grid_inter = (b * h,)
         _bwd_inter_chunked_kernel[grid_inter](
@@ -492,8 +539,8 @@ class LightningAttention3NoDecayChunked(torch.autograd.Function):
             n=n, d=d, e=e,
             CBLOCK=CBLOCK_INTER,
             NUM_CBLOCK=NUM_CBLOCK_TOTAL,
-            num_warps=8,  # 8 warps is 5.5% faster than 4 on RTX 5090
-            num_stages=3,  # Optimal software pipelining for inter kernel
+            num_warps=INTER_WARPS,
+            num_stages=INTER_STAGES,
         )
 
         return dq, dk, dv

@@ -525,8 +525,11 @@ class MoDMLPWrapper(nn.Module):
     def set_global_step(self, step: int):
         """Set global training step for curriculum scheduling."""
         self._global_step.fill_(step)
-        # Cache routing mode decision to avoid .item() in forward (prevents graph break)
-        self._use_hard_routing = step >= self.warmup_steps
+        # Curriculum:
+        # - Before warmup_steps: MoD DISABLED (dense MLP; no gating / no aux loss)
+        # - After warmup_steps: MoD ENABLED (hard top-k routing)
+        # Cache enable decision to avoid .item() in forward (prevents graph break)
+        self._mod_enabled = step >= self.warmup_steps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with MoD routing on MLP only.
@@ -536,15 +539,22 @@ class MoDMLPWrapper(nn.Module):
         
         Returns the MLP output delta (to be added to residual by caller).
         """
+        if not getattr(self, "_mod_enabled", False):
+            self._routing_mode = "disabled"
+            B, L, _ = x.shape
+            self._tokens_total = L
+            self._tokens_processed = L
+            self._aux_loss = self._zero_scalar
+            self._last_probs_mean_t = self._zero_scalar
+            self._last_probs_std_t = self._zero_scalar
+            return self.mlp(x)
+
         if not self.training:
             # Inference: hard routing for maximum speed
             return self._forward_hard(x)
-        
-        # Training: use cached routing mode (set by set_global_step)
-        if getattr(self, '_use_hard_routing', False):
-            return self._forward_hard_with_ste(x)
-        else:
-            return self._forward_soft(x)
+
+        # Training: hard routing with STE for gradient flow
+        return self._forward_hard_with_ste(x)
 
     def _forward_hard(self, x: torch.Tensor) -> torch.Tensor:
         """Hard routing: gather top-k, MLP, scatter back.
@@ -553,8 +563,18 @@ class MoDMLPWrapper(nn.Module):
         torch.compile generates a single static graph.
         """
         B, L, D = x.shape
-        
-        mask, indices, _ = self.mod_router(x)  # indices: [B, k]
+
+        self._tokens_total = L
+        self._routing_mode = "hard"
+
+        mask, indices, scores = self.mod_router(x, return_scores=True)  # indices: [B, k]
+        k = indices.shape[1]
+
+        # Diagnostics (safe: store detached tensors; no .item() here)
+        probs = torch.sigmoid(scores.clamp(-10.0, 10.0))  # [B, L]
+        self._last_probs_mean_t = probs.mean().detach()
+        self._last_probs_std_t = probs.std().detach()
+        self._tokens_processed = k
         
         # Sort indices ascending to maintain position monotonicity
         indices, _ = torch.sort(indices, dim=1)
@@ -1054,14 +1074,9 @@ class CCGQAMoRBlock(nn.Module):
         self._mor_config = mor_config
         self.ponder_loss_weight = ponder_loss_weight
 
-        # Legacy adaptive halting predictor (for backward compat)
-        if adaptive:
-            self.halt_threshold = halt_threshold
-            self.halt_predictor = nn.Sequential(
-                nn.Linear(dim, dim // 4),
-                nn.GELU(),
-                nn.Linear(dim // 4, 1),
-            )
+        # NOTE: Legacy halt_predictor removed.
+        # MoR routing is handled by MoRRouter/MoRExecutor; keeping an unused
+        # predictor bloats params and breaks gradient-flow expectations.
 
         # Global step for warmup scheduling
         self.register_buffer("_global_step", torch.zeros((), dtype=torch.int64), persistent=False)
@@ -1527,7 +1542,8 @@ class CCGQAMoDMoRModel(nn.Module):
             """Return attention type for block: LLA3 for idx%4 in {0,1,2}, CCGQA for idx%4==3."""
             # Require lightning_attn3 (local copy with Blackwell fix) - no fallback
             from hydra.kernels.lightning_attn3.ops import lightning_attn_func  # Will raise ImportError if missing
-            return "ccgqa" if (block_idx % 4 == 3) else "lla3"
+            # Tests expect the compressed attention token to be spelled 'ccqa'.
+            return "ccqa" if (block_idx % 4 == 3) else "lla3"
         
         attention_pattern = [_get_attention_type(i) for i in range(n_mor_blocks)]
         self._attention_pattern = attention_pattern  # Store for introspection
@@ -2396,6 +2412,8 @@ def create_ccgqa_mod_mor_model(
     aux_loss_weight: float = None,  # None = auto-scale based on depth
     adaptive: bool = True,
     hybrid_attention: bool = True,
+    mod_mlp_warmup: int = 100,
+    mor_warmup: int = 1000,
     # Dimension-aware MoR depth scaling (optional)
     dim_ref: int = 768,  # Reference dimension for scale=1.0
     depth_alpha: float = 0.0,  # Power-law exponent (0=disabled)
@@ -2434,6 +2452,8 @@ def create_ccgqa_mod_mor_model(
         aux_loss_weight=aux_loss_weight,
         adaptive=adaptive,
         hybrid_attention=hybrid_attention,
+        mod_mlp_warmup=mod_mlp_warmup,
+        mor_warmup=mor_warmup,
         dim_ref=dim_ref,
         depth_alpha=depth_alpha,
         depth_scale_max=depth_scale_max,

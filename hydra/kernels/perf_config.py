@@ -191,12 +191,8 @@ def configure_max_performance(profile: str = "auto") -> PerfConfig:
     
     # Apply Liger patches if enabled
     if config.use_liger:
-        try:
-            from hydra.kernels.liger_integration import patch_hydra_with_liger, LIGER_AVAILABLE
-            if LIGER_AVAILABLE:
-                patch_hydra_with_liger()
-        except ImportError:
-            pass
+        from hydra.kernels.liger_integration import patch_hydra_with_liger
+        patch_hydra_with_liger()
     
     return config
 

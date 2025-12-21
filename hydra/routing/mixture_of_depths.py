@@ -45,6 +45,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
+from .base import BaseRouter
 
 __all__ = [
     "MoDConfig",
@@ -89,7 +90,7 @@ class MoDConfig:
             raise ValueError(f"aux_loss_weight must be >= 0, got {self.aux_loss_weight}")
 
 
-class MoDRouter(nn.Module):
+class MoDRouter(BaseRouter):
     """
     Mixture-of-Depths Router.
 
@@ -118,26 +119,22 @@ class MoDRouter(nn.Module):
             jitter_noise: Noise for exploration during training
             max_seq_len: Maximum sequence length (used to compute static k)
         """
-        super().__init__()
-        self.dim = dim
+        super().__init__(dim, jitter_noise)
         self.capacity_ratio = capacity_ratio
         self.aux_loss_weight = aux_loss_weight
-        self.jitter_noise = jitter_noise
         # Keep max_seq_len as a config field for backward compatibility / diagnostics.
         self.max_seq_len = max_seq_len
         # Historical: used to compute a static k. We keep the attribute for compatibility,
         # but routing now uses k derived from the runtime sequence length.
         self.static_k = max(1, int(max_seq_len * capacity_ratio))
 
-        # Simple linear router (cheap)
-        self.router = nn.Linear(dim, 1, bias=True)
-
+        # Initialize router weights with small std to prevent early collapse
+        # (MoR does this, MoD was missing it - causes gradient instability)
+        nn.init.normal_(self.router.weight, mean=0.0, std=0.02)
+        
         # Initialize so sigmoid(scores) starts near the target capacity.
         # This makes early diagnostics stable and reduces router collapse.
-        with torch.no_grad():
-            nn.init.zeros_(self.router.weight)
-            cap = float(min(max(self.capacity_ratio, 1e-4), 1.0 - 1e-4))
-            self.router.bias.fill_(math.log(cap / (1.0 - cap)))
+        self._init_bias(self.capacity_ratio)
 
         # Track load for auxiliary loss
         self.register_buffer("_aux_loss", torch.tensor(0.0))
@@ -185,12 +182,7 @@ class MoDRouter(nn.Module):
         k = max(1, min(L, k))
 
         # Get router scores
-        scores = self.router(x).squeeze(-1)  # [B, L]
-
-        # Add noise during training for exploration
-        if self.training and self.jitter_noise > 0:
-            noise = torch.randn_like(scores) * self.jitter_noise
-            scores = scores + noise
+        scores = self.forward_logits(x)  # [B, L]
 
         # Select top-k tokens
         top_scores, top_indices = torch.topk(scores, k, dim=-1)  # [B, k]
@@ -205,7 +197,20 @@ class MoDRouter(nn.Module):
             probs = torch.sigmoid(scores.clamp(-10.0, 10.0))
             mean_prob = probs.mean()
             target_prob = self.capacity_ratio
-            self._aux_loss = self.aux_loss_weight * (mean_prob - target_prob).pow(2)
+            
+            # Base loss: push mean toward target capacity
+            capacity_loss = (mean_prob - target_prob).pow(2)
+            
+            # Collapse prevention: penalize low variance (all probs near 0 or 1)
+            # When router collapses, variance → 0, so we penalize low variance heavily
+            prob_variance = probs.var()
+            # Target variance for uniform-ish distribution around target capacity
+            # For target=0.5, max variance is 0.25; scale by capacity
+            expected_var = target_prob * (1 - target_prob) * 0.5  # ~0.125 for target=0.5
+            collapse_loss = torch.exp(-prob_variance / max(expected_var, 0.01) * 5.0)
+            
+            # Combined: capacity matching + strong collapse prevention
+            self._aux_loss = self.aux_loss_weight * (capacity_loss + 0.5 * collapse_loss)
 
         if return_scores:
             return mask, top_indices, scores

@@ -52,7 +52,6 @@ from collections import deque
 
 logger = logging.getLogger("dmta.universal_data")
 
-# Check dependencies
 try:
     from datasets import (
         load_dataset,
@@ -63,7 +62,9 @@ try:
     HAS_DATASETS = True
 except ImportError:
     HAS_DATASETS = False
-    logger.warning("datasets library not available. Install with: pip install datasets")
+    load_dataset = None
+    interleave_datasets = None
+    HFIterableDataset = None
 
 try:
     from transformers import AutoTokenizer
@@ -71,14 +72,15 @@ try:
     HAS_TRANSFORMERS = True
 except ImportError:
     HAS_TRANSFORMERS = False
-    logger.warning("transformers not available. Install with: pip install transformers")
+    AutoTokenizer = None
 
 try:
     from huggingface_hub import snapshot_download
-    HAS_HF_HUB = True
+
+    HAS_HUGGINGFACE_HUB = True
 except ImportError:
-    HAS_HF_HUB = False
-    logger.warning("huggingface_hub not available. Install with: pip install huggingface_hub")
+    HAS_HUGGINGFACE_HUB = False
+    snapshot_download = None
 
 
 # ============================================
@@ -91,9 +93,6 @@ def get_tokenizer(name: str = "gpt2"):
     """Get or create a cached tokenizer instance."""
     if name in _TOKENIZER_CACHE:
         return _TOKENIZER_CACHE[name]
-
-    if not HAS_TRANSFORMERS:
-        return None
 
     try:
         # use_fast=True for Rust-based tokenizer (3-10x faster)
@@ -167,9 +166,6 @@ def download_finefineweb_subset(
     Returns:
         Path to local directory containing downloaded files
     """
-    if not HAS_HF_HUB:
-        raise ImportError("huggingface_hub required. Install with: pip install huggingface_hub")
-    
     from huggingface_hub import hf_hub_download
     
     if domains is None:
@@ -324,22 +320,16 @@ def load_finefineweb_hybrid(
     
     # 2. Stream from HuggingFace (more diversity, may have occasional errors)
     # Use FineWeb-Edu (smaller, better API support) instead of FineFineWeb
-    try:
-        logger.info(f"Hybrid: connecting to remote FineWeb-Edu (weight={1-local_weight})")
-        remote_ds = load_dataset(
-            "HuggingFaceFW/fineweb-edu",
-            name="sample-10BT",  # 10B token sample, manageable size
-            split="train",
-            streaming=True,
-        )
-        datasets_to_interleave.append(remote_ds)
-        weights.append(1 - local_weight)
-        logger.info("Remote FineWeb-Edu connected successfully")
-    except Exception as e:
-        logger.warning(f"Remote streaming failed: {e}. Using local only.")
-        # Fall back to local only
-        if not local_files:
-            raise FileNotFoundError("No local cache and remote failed")
+    logger.info(f"Hybrid: connecting to remote FineWeb-Edu (weight={1-local_weight})")
+    remote_ds = load_dataset(
+        "HuggingFaceFW/fineweb-edu",
+        name="sample-10BT",  # 10B token sample, manageable size
+        split="train",
+        streaming=True,
+    )
+    datasets_to_interleave.append(remote_ds)
+    weights.append(1 - local_weight)
+    logger.info("Remote FineWeb-Edu connected successfully")
     
     if len(datasets_to_interleave) == 1:
         return datasets_to_interleave[0]
@@ -614,22 +604,17 @@ def _dict_to_list_of_dicts(batch_dict):
 
 # Configure PyArrow for optimized streaming (per HF blog Oct 2025)
 # https://huggingface.co/blog/streaming-datasets
-try:
-    import pyarrow
-    import pyarrow.dataset
+import pyarrow
+import pyarrow.dataset
 
-    # Increase prefetch and buffer size for better throughput
-    # Default is 32MiB, increasing to 128MiB for better performance
-    PARQUET_FRAGMENT_SCAN_OPTIONS = pyarrow.dataset.ParquetFragmentScanOptions(
-        cache_options=pyarrow.CacheOptions(
-            prefetch_limit=2,  # Prefetch 2 chunks ahead
-            range_size_limit=128 << 20,  # 128MiB chunks (vs 32MiB default)
-        ),
-    )
-    HAS_PYARROW_CACHE = True
-except (ImportError, AttributeError):
-    PARQUET_FRAGMENT_SCAN_OPTIONS = None
-    HAS_PYARROW_CACHE = False
+# Increase prefetch and buffer size for better throughput
+# Default is 32MiB, increasing to 128MiB for better performance
+PARQUET_FRAGMENT_SCAN_OPTIONS = pyarrow.dataset.ParquetFragmentScanOptions(
+    cache_options=pyarrow.CacheOptions(
+        prefetch_limit=2,  # Prefetch 2 chunks ahead
+        range_size_limit=128 << 20,  # 128MiB chunks (vs 32MiB default)
+    ),
+)
 
 
 class HFStreamingDataLoader:
@@ -710,10 +695,6 @@ class HFStreamingDataLoader:
 
     def _init_dataset(self):
         """Initialize streaming dataset with optimized PyArrow settings."""
-        if not HAS_DATASETS:
-            logger.error("datasets library not available")
-            return
-
         config = DATASET_CONFIGS.get(self.dataset_name)
         if not config:
             logger.error(f"Unknown dataset: {self.dataset_name}")
@@ -737,11 +718,7 @@ class HFStreamingDataLoader:
                 # Per HF blog: https://huggingface.co/blog/streaming-datasets
                 # Note: Only works with Parquet, not JSONL files
                 is_parquet = config.get("format", "").lower() == "parquet"
-                if (
-                    is_parquet
-                    and HAS_PYARROW_CACHE
-                    and PARQUET_FRAGMENT_SCAN_OPTIONS is not None
-                ):
+                if is_parquet:
                     load_kwargs["fragment_scan_options"] = PARQUET_FRAGMENT_SCAN_OPTIONS
                     logger.info("Using optimized PyArrow prefetch (128MiB chunks)")
 
@@ -1226,10 +1203,6 @@ class InterleavedDataLoader:
 
     def _init_datasets(self):
         """Initialize all component datasets."""
-        if not HAS_DATASETS:
-            logger.error("datasets library not available")
-            return
-
         logger.info("Loading interleaved datasets...")
 
         # Cache append methods to minimize attribute lookups in loop
@@ -1554,6 +1527,7 @@ class LocalDataLoader(BaseDataLoader):
 
     def get_batch(self) -> Dict[str, torch.Tensor]:
         sequences = []
+        pad_masks = []  # Track which positions are padding
 
         while len(sequences) < self.batch_size:
             if self.current_idx >= len(self.current_chunk):
@@ -1574,14 +1548,25 @@ class LocalDataLoader(BaseDataLoader):
 
             if len(tokens) >= self.seq_len + 1:
                 sequences.append(tokens[: self.seq_len + 1])
+                pad_masks.append([False] * (self.seq_len + 1))  # No padding
             elif len(tokens) > 64:
-                padded = tokens + [0] * (self.seq_len + 1 - len(tokens))
+                n_pad = self.seq_len + 1 - len(tokens)
+                padded = tokens + [0] * n_pad
                 sequences.append(padded[: self.seq_len + 1])
+                # Mask: False for real tokens, True for padding
+                pad_masks.append([False] * len(tokens) + [True] * n_pad)
 
         batch = torch.tensor(sequences[: self.batch_size], dtype=torch.long)
+        input_ids = batch[:, :-1]
+        labels = batch[:, 1:].clone()
+        
+        # Set labels to -100 for padded positions (CE ignore_index)
+        pad_mask_tensor = torch.tensor(pad_masks[:self.batch_size], dtype=torch.bool)[:, 1:]
+        labels[pad_mask_tensor] = -100
+        
         return {
-            "input_ids": batch[:, :-1],
-            "labels": batch[:, 1:],
+            "input_ids": input_ids,
+            "labels": labels,
         }
 
     def stats(self) -> Dict[str, Any]:
@@ -1672,6 +1657,7 @@ class LocalJSONLDataLoader(BaseDataLoader):
     
     def get_batch(self) -> Dict[str, torch.Tensor]:
         sequences = []
+        pad_masks = []  # Track which positions are padding
         
         while len(sequences) < self.batch_size:
             text = self._get_next_text()
@@ -1689,15 +1675,28 @@ class LocalJSONLDataLoader(BaseDataLoader):
                     start = random.randint(0, len(tokens) - self.seq_len - 1)
                     tokens = tokens[start:start + self.seq_len + 1]
                 sequences.append(tokens[:self.seq_len + 1])
+                pad_masks.append([False] * (self.seq_len + 1))  # No padding
             elif len(tokens) > 64:
-                # Pad shorter sequences
-                padded = tokens + [self.tokenizer.eos_token_id or 0] * (self.seq_len + 1 - len(tokens))
+                # Pad shorter sequences - track padding positions
+                n_pad = self.seq_len + 1 - len(tokens)
+                pad_token = self.tokenizer.eos_token_id or 0
+                padded = tokens + [pad_token] * n_pad
                 sequences.append(padded[:self.seq_len + 1])
+                # Mask: False for real tokens, True for padding
+                pad_masks.append([False] * len(tokens) + [True] * n_pad)
         
         batch = torch.tensor(sequences[:self.batch_size], dtype=torch.long)
+        input_ids = batch[:, :-1]
+        labels = batch[:, 1:].clone()
+        
+        # Set labels to -100 for padded positions (CE ignore_index)
+        # This prevents the model from learning to predict EOS at padding
+        pad_mask_tensor = torch.tensor(pad_masks[:self.batch_size], dtype=torch.bool)[:, 1:]
+        labels[pad_mask_tensor] = -100
+        
         return {
-            "input_ids": batch[:, :-1],
-            "labels": batch[:, 1:],
+            "input_ids": input_ids,
+            "labels": labels,
         }
     
     def stats(self) -> Dict[str, Any]:
@@ -1925,6 +1924,5 @@ if __name__ == "__main__":
     # Test synthetic first (always works)
     test_loader("synthetic")
 
-    # Test streaming if datasets available
-    if HAS_DATASETS:
-        test_loader("finefineweb")
+    # Test streaming
+    test_loader("finefineweb")

@@ -46,6 +46,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .base import BaseRouter
+
 if TYPE_CHECKING:
     from .loss_tracker import MovingAverageBaseline
 
@@ -87,6 +89,7 @@ class MoRConfig:
     dim_ref: int = 768
     depth_alpha: float = 0.0
     depth_scale_max: float = 2.0
+    advantage_loss_scale: float = 0.1
     
     def __post_init__(self) -> None:
         """Validate configuration values."""
@@ -184,7 +187,7 @@ def compute_layer_target_prob(
 # Router
 # =============================================================================
 
-class MoRRouter(nn.Module):
+class MoRRouter(BaseRouter):
     """Mixture-of-Recursions Router.
     
     Predicts per-token recursion depth using a learned linear projection.
@@ -197,11 +200,11 @@ class MoRRouter(nn.Module):
     
     __slots__ = (
         'config', '_depth_scale', '_target_prob', '_warmup_steps',
-        '_global_step', '_cached_global_step',
+        '_global_step', '_cached_global_step', '_zero_scalar',
     )
     
     def __init__(self, config: MoRConfig) -> None:
-        super().__init__()
+        super().__init__(config.dim, config.router_jitter)
         self.config = config
         
         # Compute depth scale once (compile-safe constant)
@@ -214,15 +217,11 @@ class MoRRouter(nn.Module):
             config.layer_idx, config.total_layers, self._depth_scale
         )
         
-        # Router: Linear(dim, 1) with bias for target distribution
-        self.router = nn.Linear(config.dim, 1, bias=True)
+        # Initialize bias to target probability (this sets weights to zero)
+        self._init_bias(self._target_prob)
         
-        # Initialize weights
+        # Re-initialize weights to normal as per original implementation
         nn.init.normal_(self.router.weight, mean=0.0, std=0.02)
-        
-        # Initialize bias to target probability
-        bias_value = math.log(self._target_prob / (1 - self._target_prob + 1e-8))
-        nn.init.constant_(self.router.bias, bias_value)
         
         # Warmup tracking
         self._warmup_steps = config.warmup_steps
@@ -231,6 +230,8 @@ class MoRRouter(nn.Module):
             torch.zeros((), dtype=torch.int64), 
             persistent=False
         )
+        # OPTIMIZATION: Persistent zero scalar to avoid graph breaks and allocations
+        self.register_buffer("_zero_scalar", torch.tensor(0.0), persistent=False)
         self._cached_global_step: int = 0
     
     def set_global_step(self, step: int) -> None:
@@ -260,12 +261,7 @@ class MoRRouter(nn.Module):
             logits: Raw router logits [batch, seq]
         """
         # Get router scores
-        logits = self.router(x).squeeze(-1)  # [B, L]
-        
-        # Add jitter during training for exploration
-        if self.training and self.config.router_jitter > 0:
-            noise = torch.randn_like(logits) * self.config.router_jitter
-            logits = logits + noise
+        logits = self.forward_logits(x)  # [B, L]
         
         # Soft clamp with tanh (preserves gradients at boundaries)
         logits = torch.tanh(logits / 2.0) * 3.0
@@ -331,7 +327,7 @@ class MoRRouter(nn.Module):
             # Negative advantage = easier than average -> penalize depth
             advantage_loss = -(advantage * depth_continuous).mean() * 0.1
         else:
-            advantage_loss = torch.tensor(0.0, device=device, dtype=dtype)
+            advantage_loss = self._zero_scalar
         
         # Combine losses (light touch - CE loss dominates)
         ponder_loss = (

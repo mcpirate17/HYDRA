@@ -7,7 +7,6 @@ Run with: pytest tests/test_optimizations.py -v
 import pytest
 import torch
 import torch.nn as nn
-import math
 
 
 # =============================================================================

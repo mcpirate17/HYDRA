@@ -35,23 +35,44 @@ from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
+import importlib.util
+import warnings
+import ctypes
+
+# Load shim library to fix missing symbols in Transformer Engine on PyTorch 2.7+
+try:
+    shim_path = os.path.join(os.path.dirname(__file__), "libshim_te.so")
+    if os.path.exists(shim_path):
+        # Ensure torch libs are loaded first (should be by import torch)
+        ctypes.CDLL(shim_path, mode=ctypes.RTLD_GLOBAL)
+except Exception as e:
+    warnings.warn(f"Failed to load TE shim library: {e}")
 
 # Feature flags
 TE_AVAILABLE = False
 FP8_AVAILABLE = False
 TE_VERSION = "N/A"
 
-try:
+# Check if installed without importing (to avoid startup crash)
+_te_spec = importlib.util.find_spec("transformer_engine")
+TE_AVAILABLE = _te_spec is not None
+
+if TE_AVAILABLE:
     import transformer_engine.pytorch as te
     from transformer_engine.common.recipe import Format, DelayedScaling
-    TE_AVAILABLE = True
     TE_VERSION = getattr(te, "__version__", "unknown")
     
     # Check if FP8 is supported on this GPU
     if torch.cuda.is_available():
         cc = torch.cuda.get_device_capability()
         FP8_AVAILABLE = cc[0] >= 9  # Hopper (sm_90) or newer
-except ImportError:
+else:
+    # Explicitly warn the user, satisfying "not silent"
+    warnings.warn(
+        "Transformer Engine not found. FP8 training will be disabled. "
+        "Install with: pip install transformer-engine[pytorch]",
+        UserWarning
+    )
     te = None
     Format = None
     DelayedScaling = None
@@ -161,20 +182,15 @@ class TERMSNorm(nn.Module):
     
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
-        if TE_AVAILABLE:
-            self.norm = te.RMSNorm(hidden_size, eps=eps)
-        else:
-            # Fallback to PyTorch
-            self.eps = eps
-            self.weight = nn.Parameter(torch.ones(hidden_size))
+        if not TE_AVAILABLE:
+            raise ImportError(
+                "TERMSNorm requires Transformer Engine. "
+                "Install with: pip install transformer-engine"
+            )
+        self.norm = te.RMSNorm(hidden_size, eps=eps)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if TE_AVAILABLE:
-            return self.norm(x)
-        # PyTorch fallback
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return self.weight * x
+        return self.norm(x)
 
 
 class TETransformerLayer(nn.Module):

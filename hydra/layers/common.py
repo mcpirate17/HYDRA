@@ -22,15 +22,8 @@ from typing import Any, Optional, Tuple, Callable
 # FEATURE FLAGS: Detect available backends at import time
 # =============================================================================
 
-FUSED_KERNELS_AVAILABLE = False
-try:
-    from hydra.kernels import fused_rms_norm, fused_swiglu, fused_rope, fused_qk_norm
-    FUSED_KERNELS_AVAILABLE = True
-except ImportError:
-    fused_rms_norm = None
-    fused_swiglu = None
-    fused_rope = None
-    fused_qk_norm = None
+from hydra.kernels import fused_rms_norm, fused_swiglu, fused_rope, fused_qk_norm
+FUSED_KERNELS_AVAILABLE = True
 
 FLASH_ATTN_AVAILABLE = False
 FLASH_ATTN_VERSION = (0, 0, 0)
@@ -113,11 +106,11 @@ class RMSNorm(nn.Module):
         if hasattr(F, "rms_norm"):
             return F.rms_norm(x, [x.shape[-1]], weight=self.weight, eps=self.eps)
 
-        # Fallback to fused kernel only if native rms_norm is unavailable.
+        # Use fused kernel if available
         if FUSED_KERNELS_AVAILABLE and fused_rms_norm is not None:
             return fused_rms_norm(x, self.weight, self.eps)
         
-        # PyTorch implementation
+        # PyTorch reference implementation (explicit, not a fallback)
         dtype = x.dtype
         x = x.float()
         variance = x.pow(2).mean(-1, keepdim=True)

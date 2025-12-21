@@ -26,6 +26,9 @@ class TrainingConfig:
     mor_rampup_steps: int = 5000
     mor_already_enabled: bool = False
 
+    # MoD Curriculum
+    mod_enable_pct: float = 0.10
+
     # Auxiliary loss scales
     aux_scale: float = 0.1
     ponder_scale: float = 0.01
@@ -98,6 +101,25 @@ class TrainingConfig:
     chunked_ce_size: int = 4096
     use_liger_ce: bool = True
     gradient_checkpointing: bool = True
+
+    # Logging & Observability
+    log_interval: int = 10
+    seed: Optional[int] = 1337
+    
+    # Experiment Tracking
+    use_wandb: bool = False
+    wandb_project: str = "hydra-llm"
+    wandb_entity: Optional[str] = None
+    run_name: Optional[str] = None
+    
+    use_tensorboard: bool = False
+    tensorboard_dir: str = "runs"
+    log_dir: str = "logs"
+    
+    # Profiling
+    use_profiler: bool = False
+    profiler_dir: str = "profiler_traces"
+
     checkpoint_every_n: int = 2
     use_8bit_adam: bool = False
 
@@ -188,6 +210,13 @@ class TrainingConfig:
             print(f"                  dim={self.mod_mor_dim}, {self.n_mor_blocks} MoR blocks × {self.mor_recursions} recursions = {effective_layers} effective layers")
             print(f"                  ~{est_params}M params ({self.model_size} preset)")
             print(f"                  MoD capacity: {self.mod_capacity:.0%} (~{(1-self.mod_capacity)*100:.0f}% compute savings)")
+            mod_enable_step = int(self.max_steps * self.mod_enable_pct)
+            if self.mod_capacity >= 1.0:
+                print("  MoD Curriculum: OFF (capacity=1.0)")
+            elif self.mod_enable_pct > 0:
+                print(f"  MoD Curriculum: Disabled until step {mod_enable_step:,} ({self.mod_enable_pct:.0%})")
+            else:
+                print("  MoD Curriculum: Enabled from start (no delay)")
             mor_enable_step = int(self.max_steps * self.mor_enable_pct)
             remaining_steps = self.max_steps - mor_enable_step
             actual_rampup = min(min(self.mor_rampup_steps, 2 * mor_enable_step), remaining_steps)
@@ -221,6 +250,15 @@ MODEL_SIZE_CONFIGS: Dict[str, Dict[str, Any]] = {
         "mod_mor_n_kv_heads": 3,
         "default_batch_size": 16,
         "default_grad_accum": 4,
+    },
+    "debug_tall_skinny": {
+        "mod_mor_dim": 384,
+        "n_mor_blocks": 12,
+        "mor_recursions": 2,
+        "mod_mor_n_heads": 6,
+        "mod_mor_n_kv_heads": 2,
+        "default_batch_size": 32,
+        "default_grad_accum": 1,
     },
     "DIAG": {
         "mod_mor_dim": 768,

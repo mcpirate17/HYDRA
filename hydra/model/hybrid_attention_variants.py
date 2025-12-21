@@ -137,6 +137,10 @@ class LightningAttn3Attention(nn.Module):
         return self.o_proj(out)
 
 
+# Backwards-compat alias: older code/tests used LightningAttn2Attention.
+LightningAttn2Attention = LightningAttn3Attention
+
+
 def build_hybrid_attention_module(
     choice: HybridAttentionChoice,
     *,

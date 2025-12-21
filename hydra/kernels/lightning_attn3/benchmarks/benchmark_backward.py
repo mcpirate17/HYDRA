@@ -15,12 +15,19 @@ import gc
 import time
 import json
 import argparse
+import sys
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Callable
 
 import torch
 import torch.nn.functional as F
+
+# Ensure repo root is on sys.path when executing this file directly.
+# (Running `python hydra/.../benchmark_backward.py` sets sys.path[0] to the script dir.)
+REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # Benchmark configuration
 SEQ_LENGTHS = [1024, 2048, 4096]
@@ -447,7 +454,7 @@ def generate_plots(results: list[BenchmarkResult], output_dir: Path):
     ax3.grid(axis='y', alpha=0.3)
     
     plt.tight_layout()
-    plot_path = output_dir / 'benchmark_comparison.png'
+    plot_path = output_dir / 'backward_benchmark_comparison.png'
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"\n✓ Saved plot: {plot_path}")
@@ -524,7 +531,7 @@ def generate_plots(results: list[BenchmarkResult], output_dir: Path):
     ax7.grid(axis='y', alpha=0.3)
     
     plt.tight_layout()
-    mem_plot_path = output_dir / 'memory_breakdown.png'
+    mem_plot_path = output_dir / 'backward_memory_breakdown.png'
     plt.savefig(mem_plot_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"✓ Saved plot: {mem_plot_path}")
@@ -654,11 +661,11 @@ def generate_report(results: list[BenchmarkResult], output_dir: Path) -> str:
 
 ## Plots
 
-![Benchmark Comparison](benchmark_comparison.png)
+![Benchmark Comparison](backward_benchmark_comparison.png)
 
 ![Backward Time Comparison](backward_time_comparison.png)
 
-![Memory Breakdown](memory_breakdown.png)
+![Memory Breakdown](backward_memory_breakdown.png)
 """
     
     return report
@@ -695,7 +702,8 @@ def main():
     
     # Save JSON if requested
     if args.json:
-        json_path = output_dir / "benchmark_results.json"
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        json_path = output_dir / f"benchmark_results_{ts}.json"
         json_data = {
             "gpu_info": get_gpu_info(),
             "config": {

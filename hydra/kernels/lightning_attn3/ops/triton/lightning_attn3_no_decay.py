@@ -49,6 +49,18 @@ def _estimate_original_bwd_sram(block: int, cblock: int, d: int, e: int) -> int:
     return max(intra, inter)
 
 
+def _estimate_chunked_inter_sram(cblock: int, d: int, e: int, num_stages: int) -> int:
+    """Conservative SRAM estimate for the chunked inter-chunk backward kernel."""
+    # kv_state_trans[e,d] + dkv_state[d,e] in fp32
+    kv_states = 2 * d * e * 4
+    # q/k/v/do tiles staged from fp16
+    input_tiles = num_stages * 4 * cblock * (d + e)
+    # fp32 accumulators (approx)
+    accumulators = 3 * cblock * d * 4
+    overhead = 4096
+    return kv_states + input_tiles + accumulators + overhead
+
+
 def _select_backward_kernel(device: torch.device, d: int, e: int) -> tuple[str, int, int]:
     """
     Select the appropriate backward kernel based on GPU architecture.
@@ -67,14 +79,21 @@ def _select_backward_kernel(device: torch.device, d: int, e: int) -> tuple[str, 
     max_sram = props.shared_memory_per_block_optin
     
     if cc_major >= 12:
-        # Blackwell (SM 12.x): Use chunked recompute-heavy kernel
-        # Try larger CBLOCK first for better performance
-        from .lightning_attn3_no_decay_chunked import validate_config
-        
-        for cblock in [32, 16]:  # Prefer larger tiles for better occupancy
-            is_valid, sram = validate_config(cblock, d, num_stages=1)
-            if is_valid and sram < max_sram:
-                return ("chunked", cblock, 0)
+        # Blackwell (SM 12.x): use recompute-heavy chunked kernels.
+        # The cached int is the *inter-chunk* CBLOCK; intra-chunk CBLOCK stays fixed
+        # at a divisor of BLOCK=64.
+        if d <= 64:
+            cblock_candidates = (64, 32, 16)
+        elif d <= 128:
+            cblock_candidates = (32, 16)
+        else:
+            cblock_candidates = (32, 16)
+
+        for cblock in cblock_candidates:
+            for num_stages in (2, 1):
+                sram = _estimate_chunked_inter_sram(cblock, d, e, num_stages=num_stages)
+                if sram < _BLACKWELL_SRAM_LIMIT and sram < max_sram:
+                    return ("chunked", cblock, 0)
         
         raise RuntimeError(
             f"Lightning Attention-3 backward: No safe kernel config for Blackwell "
@@ -522,14 +541,17 @@ class LightningAttention3NoDecay(torch.autograd.Function):
                 _bwd_inter_chunked_kernel,
             )
             
-            # Optimal configs tuned for Blackwell:
-            # - Intra: CBLOCK=32 is fastest (O(n²) within block benefits from smaller chunks)
-            # - Inter: CBLOCK=64 is fastest (fewer iterations, better tensor core utilization)
-            CBLOCK_INTRA = block_or_cblock  # Usually 32
-            CBLOCK_INTER = 64  # Fixed at 64 for better performance
+            # Blackwell chunked backward:
+            # - Intra CBLOCK must divide BLOCK=64 (kernel assumes exact partition)
+            # - Inter CBLOCK is selected per-(device, d, e) to reduce recompute iterations
+            CBLOCK_INTRA = 32
+            CBLOCK_INTER = block_or_cblock
             BLOCK = 64
             NUM_BLOCK = triton.cdiv(n, BLOCK)
             NUM_CBLOCK_PER_BLOCK = BLOCK // CBLOCK_INTRA
+
+            inter_stages = 2 if _estimate_chunked_inter_sram(CBLOCK_INTER, d, e, num_stages=2) < _BLACKWELL_SRAM_LIMIT else 1
+            inter_warps = 8 if CBLOCK_INTER >= 64 and d <= 64 else 4
 
             # Intra-chunk backward: parallel over blocks
             grid_intra = (b * h, NUM_BLOCK)
@@ -561,8 +583,8 @@ class LightningAttention3NoDecay(torch.autograd.Function):
                 n=n, d=d, e=e,
                 CBLOCK=CBLOCK_INTER,
                 NUM_CBLOCK=NUM_CBLOCK_TOTAL,
-                num_warps=4,
-                num_stages=2,  # Software pipelining for inter kernel
+                num_warps=inter_warps,
+                num_stages=inter_stages,
             )
         else:
             # Pre-Blackwell: Use original LA3 kernels

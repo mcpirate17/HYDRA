@@ -89,7 +89,7 @@ class TestBlackwellTileSelection:
             assert block_or_cblock in (32, 64)  # BLOCK
             assert cblock_or_zero in (16, 32)   # CBLOCK
         else:
-            assert block_or_cblock in (16, 32)  # CBLOCK for chunked
+            assert block_or_cblock in (16, 32, 48, 64)  # CBLOCK for chunked
     
     def test_blackwell_kernel_selection(self):
         """Test that Blackwell GPUs get chunked kernel after backward pass."""
@@ -115,7 +115,9 @@ class TestBlackwellTileSelection:
         
         if props.major >= 12:  # Blackwell
             assert kernel_type == "chunked", f"Expected 'chunked' for Blackwell, got {kernel_type}"
-            assert block_or_cblock == 16, f"Expected CBLOCK=16 for Blackwell chunked, got {block_or_cblock}"
+            assert block_or_cblock in (16, 32, 48, 64), (
+                f"Expected CBLOCK in (16, 32, 48, 64) for Blackwell chunked, got {block_or_cblock}"
+            )
         else:
             assert kernel_type == "original", f"Expected 'original' for non-Blackwell, got {kernel_type}"
             assert block_or_cblock == 64, f"Expected BLOCK=64 for non-Blackwell, got {block_or_cblock}"
