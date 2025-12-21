@@ -47,7 +47,7 @@ from hydra.routing.mixture_of_recursions import (
 from hydra.routing.loss_tracker import MovingAverageBaseline
 
 # =============================================================================
-# Optional attention variants (locked to LLA2 only).
+# Optional attention variants (locked to LLA3 only).
 # CCQA is implemented in this file as `CCGQAAttention`.
 # =============================================================================
 from hydra.model.hybrid_attention_variants import (
@@ -343,14 +343,14 @@ class CCGQAAttention(nn.Module):
         # Step 5: QK normalization + temperature
         # ==========================================
         if self.use_qk_norm:
-            # L2 normalize and scale
-            # Note: We keep this as PyTorch ops because key_temperature is learnable
-            q = F.normalize(q, p=2, dim=-1) * math.sqrt(self.head_dim)
-            k = (
-                F.normalize(k, p=2, dim=-1)
-                * math.sqrt(self.head_dim)
-                * self.key_temperature
-            )
+            # L2 normalize Q and K, apply learnable temperature to K only.
+            # NOTE: We do NOT multiply by sqrt(head_dim) here because:
+            # 1. L2-norm already normalizes magnitude to 1
+            # 2. Temperature alone controls the sharpness of attention
+            # 3. We will NOT pass scale to SDPA when qk_norm is on
+            # This avoids double/triple scaling that causes attention to be too sharp.
+            q = F.normalize(q, p=2, dim=-1)
+            k = F.normalize(k, p=2, dim=-1) * self.key_temperature
 
         # ==========================================
         # Step 6: Apply RoPE
@@ -374,13 +374,16 @@ class CCGQAAttention(nn.Module):
         # Step 8: Scaled dot-product attention
         # ==========================================
         # Use Flash Attention via SDPA
+        # NOTE: When use_qk_norm=True, we do NOT pass scale because Q and K are
+        # already L2-normalized and temperature-scaled. Passing scale would
+        # double-scale and make attention too sharp (causing early plateau).
         out = F.scaled_dot_product_attention(
             q,
             k,
             v,
             attn_mask=mask,
             is_causal=True if mask is None else False,
-            scale=self.scale,
+            scale=None if self.use_qk_norm else self.scale,
         )
 
         # ==========================================
@@ -497,6 +500,8 @@ class MoDMLPWrapper(nn.Module):
         # Use tensor buffer for global_step to avoid torch.compile recompilation
         # (Dynamo treats Python int attributes as static, causing recompile storm)
         self.register_buffer("_global_step", torch.zeros((), dtype=torch.int64), persistent=False)
+        # OPTIMIZATION: Persistent zero scalar to avoid graph breaks and allocations
+        self.register_buffer("_zero_scalar", torch.tensor(0.0), persistent=False)
         
         # MoDRouter for token selection (gather/scatter pattern)
         # max_seq_len enables static k computation for torch.compile compatibility
@@ -510,9 +515,9 @@ class MoDMLPWrapper(nn.Module):
             f"mod_router must be MoDRouter, got {type(self.mod_router)}"
         
         # Diagnostics
-        self._aux_loss: torch.Tensor = torch.tensor(0.0)
-        self._last_probs_mean_t: torch.Tensor = torch.tensor(0.0)
-        self._last_probs_std_t: torch.Tensor = torch.tensor(0.0)
+        self._aux_loss: torch.Tensor = self._zero_scalar
+        self._last_probs_mean_t: torch.Tensor = self._zero_scalar
+        self._last_probs_std_t: torch.Tensor = self._zero_scalar
         self._routing_mode: str = "soft"
         self._tokens_processed: int = 0
         self._tokens_total: int = 0
@@ -946,7 +951,7 @@ class CCGQAMoRBlock(nn.Module):
         ponder_loss_weight: float = 0.01,
         layer_idx: int = 0,
         total_layers: int = 1,
-        attention_type: str = "lla2",  # Set by parent based on layer_idx % 4
+        attention_type: str = "lla3",  # Set by parent based on layer_idx % 4
         # Dimension-aware depth scaling (optional, backward compatible)
         dim_ref: int = 768,
         depth_alpha: float = 0.0,  # 0.0 = disabled (default), 0.25-0.5 = enabled
@@ -969,13 +974,14 @@ class CCGQAMoRBlock(nn.Module):
         mod_mlp_capacity = attention_kwargs.pop("mod_mlp_capacity", None)
         mod_mlp_aux_weight = attention_kwargs.pop("mod_mlp_aux_weight", 0.01)
         mod_mlp_warmup = attention_kwargs.pop("mod_mlp_warmup", 100)
+        mor_warmup = attention_kwargs.pop("mor_warmup", 1000)  # MoR ponder loss warmup
         self.use_mod_mlp = mod_mlp_capacity is not None and mod_mlp_capacity > 0
         
         # =====================================================================
-        # Attention: 3×LLA2 + 1×CCGQA pattern (determined by attention_type param)
+        # Attention: 3×LLA3 + 1×CCGQA pattern (determined by attention_type param)
         # =====================================================================
-        if attention_type == "lla2":
-            resolved = resolve_hybrid_attention_choice("lla2", default="lla2")
+        if attention_type in ("lla2", "lla3"):  # Accept both for backwards compat
+            resolved = resolve_hybrid_attention_choice("lla3", default="lla3")
             self.attention = build_hybrid_attention_module(
                 resolved,
                 dim=dim,
@@ -1034,7 +1040,7 @@ class CCGQAMoRBlock(nn.Module):
             dim=dim,
             n_recursions=max_recursions,
             ponder_loss_weight=ponder_loss_weight,
-            warmup_steps=2500,
+            warmup_steps=mor_warmup,  # From kwargs, not hardcoded
             layer_idx=layer_idx,
             total_layers=total_layers,
             dim_ref=dim_ref,
@@ -1059,30 +1065,23 @@ class CCGQAMoRBlock(nn.Module):
 
         # Global step for warmup scheduling
         self.register_buffer("_global_step", torch.zeros((), dtype=torch.int64), persistent=False)
+        # OPTIMIZATION: Persistent zero scalar to avoid graph breaks and allocations
+        self.register_buffer("_zero_scalar", torch.tensor(0.0), persistent=False)
+        
         self._warmup_steps = 2500
         self._mor_enable_step = 0
         self._mor_rampup_steps = 0
 
         self.final_norm = RMSNorm(dim)
-        self._ponder_loss: torch.Tensor = torch.tensor(0.0)
-        self._avg_ponder_time: torch.Tensor = torch.tensor(0.0)
+        self._ponder_loss: torch.Tensor = self._zero_scalar
+        self._avg_ponder_time: torch.Tensor = self._zero_scalar
 
         # Debug stats
         self._last_target_depths: Optional[torch.Tensor] = None
         self._last_router_probs_mean: float = 0.0
         self._last_router_probs_std: float = 0.0
 
-    def _create_block_wrapper(self):
-        """Create a simple wrapper for backward compatibility with .block attribute.
-        
-        NOTE: This returns None to avoid circular references. The actual block
-        components (attention, mlp, norm1, norm2) are attributes of CCGQAMoRBlock.
-        """
-        # Don't create a wrapper - it causes circular references
-        # Code that uses .block should be updated to use .attention and .mlp directly
-        return None
-
-    def forward_fixed(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_fixed(self, x: torch.Tensor) -> torch.Tensor:
         """Fixed recursion mode - attention once, then all MLP recursions.
         
         OPTION A: Attention is dense (full sequence), MLP is recursive.
@@ -1107,7 +1106,7 @@ class CCGQAMoRBlock(nn.Module):
         
         return self.final_norm(h)
 
-    def forward_fast_routing(
+    def _forward_mor(
         self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """MoR forward pass using MoRRouter and MoRExecutor.
@@ -1179,7 +1178,7 @@ class CCGQAMoRBlock(nn.Module):
             Advantage loss tensor (scalar) - add to total loss for backprop.
         """
         if not hasattr(self, '_last_probs') or self._last_probs is None:
-            return torch.tensor(0.0, device=token_losses.device)
+            return self._zero_scalar
         
         probs = self._last_probs
         n_rec = self.max_recursions
@@ -1191,79 +1190,10 @@ class CCGQAMoRBlock(nn.Module):
         # Loss-driven routing: reward depth for hard tokens, penalize for easy
         # Positive advantage (hard) * high depth → negative loss → encourages depth
         # Negative advantage (easy) * high depth → positive loss → penalizes depth
-        advantage_loss = -(advantage * depth_continuous).mean() * 0.1
+        scale = self._mor_config.advantage_loss_scale
+        advantage_loss = -(advantage * depth_continuous).mean() * scale
         
         return advantage_loss
-
-    def forward_adaptive_with_loss(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Adaptive recursion mode (legacy ACT-style, BF16/FP16 friendly).
-        
-        NOTE: This uses Option A architecture - attention ONCE, then MLP recursions.
-        Uses mor_executor's recursion_bias/embed for consistency.
-        
-        Returns (output, ponder_loss) where ponder_loss has gradients attached.
-        Per ACT paper, ponder_loss is computed from cumulative halt probability.
-        """
-        B, L, D = x.shape
-        device = x.device
-        dtype = x.dtype  # Preserve dtype for BF16/FP16
-
-        # ATTENTION: Runs ONCE on full sequence (dense)
-        h = x + self.attention(self.norm1(x))
-        
-        output = torch.zeros_like(h)
-        cumulative_halt = torch.zeros(B, L, device=device, dtype=dtype)
-        ponder_cost = torch.zeros(B, L, device=device, dtype=dtype)
-
-        current = h  # Start from attention output (no clone needed)
-
-        for i in range(self.max_recursions):
-            # Add recursion info (from mor_executor)
-            rec_bias = self.mor_executor.recursion_bias[i].squeeze()
-            rec_embed = self.mor_executor.recursion_embed(
-                self.mor_executor._recursion_indices[i:i+1]
-            ).squeeze()
-            h_with_rec = current + rec_bias + rec_embed
-
-            # Run MLP only (not attention)
-            if self.mod_mlp_wrapper is not None:
-                processed = current + self.mod_mlp_wrapper(self.norm2(h_with_rec))
-            else:
-                processed = current + self.mlp(self.norm2(h_with_rec))
-
-            # Get halting predictions
-            halt_logit = self.halt_predictor(processed).squeeze(-1)
-            halt_prob = torch.sigmoid(halt_logit)
-
-            # Update cumulative halt
-            weight = halt_prob * (1 - cumulative_halt)
-            output = output + weight.unsqueeze(-1) * processed
-            cumulative_halt = cumulative_halt + weight
-
-            # Differentiable ponder cost
-            ponder_cost = ponder_cost + (1 - cumulative_halt)
-
-            current = processed
-
-        # Handle remainder
-        remainder = 1 - cumulative_halt
-        output = output + remainder.unsqueeze(-1) * current
-
-        # Ponder loss: encourage early halting (differentiable)
-        ponder_loss = self.ponder_loss_weight * ponder_cost.mean()
-
-        if self.training:
-            self._avg_ponder_time = ponder_cost.mean().detach()
-            self._ponder_loss = ponder_loss.detach()
-
-        return self.final_norm(output), ponder_loss
-
-    def forward_adaptive(self, x: torch.Tensor) -> torch.Tensor:
-        """Adaptive forward (legacy ACT-style, returns just output)."""
-        output, _ = self.forward_adaptive_with_loss(x)
-        return output
 
     def forward(
         self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
@@ -1278,10 +1208,10 @@ class CCGQAMoRBlock(nn.Module):
             # Pre-enable: run fixed-depth only (avoid wasting compute on adaptive path
             # when its contribution is exactly zero).
             if rampup_scale <= 0.0:
-                return self.forward_fixed(x)
+                return self._forward_fixed(x)
             
             # Always compute adaptive output (router trains from step 0)
-            adaptive_output, _ = self.forward_fast_routing(x)
+            adaptive_output, _ = self._forward_mor(x)
             
             # OPTIMIZATION: Skip fixed path when rampup is complete (rampup_scale=1.0)
             # This saves ~30% compute after MoR is fully enabled.
@@ -1291,9 +1221,9 @@ class CCGQAMoRBlock(nn.Module):
                 return adaptive_output
             
             # During rampup (scale < 1.0): blend both paths for smooth transition
-            fixed_output = self.forward_fixed(x)
+            fixed_output = self._forward_fixed(x)
             return rampup_scale * adaptive_output + (1.0 - rampup_scale) * fixed_output
-        return self.forward_fixed(x)
+        return self._forward_fixed(x)
 
     def forward_with_losses(
         self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
@@ -1318,18 +1248,18 @@ class CCGQAMoRBlock(nn.Module):
             # This preserves the intended curriculum behavior and avoids doing
             # 2x compute for the first ~mor_enable_pct of training.
             if rampup_scale <= 0.0:
-                output = self.forward_fixed(x)
+                output = self._forward_fixed(x)
                 if self.mod_mlp_wrapper is not None:
                     aux_loss = self.mod_mlp_wrapper.get_aux_loss()
                 else:
-                    aux_loss = torch.tensor(0.0, device=device)
-                zero_loss = torch.tensor(0.0, device=device)
+                    aux_loss = self._zero_scalar
+                zero_loss = self._zero_scalar
                 if self.training:
                     self._ponder_loss = zero_loss.detach()
                 return output, {"ponder_loss": zero_loss, "aux_loss": aux_loss}
             
             # Always compute adaptive output (router trains from step 0)
-            adaptive_output, ponder_loss = self.forward_fast_routing(x)
+            adaptive_output, ponder_loss = self._forward_mor(x)
 
             # Apply MoR curriculum to ponder loss.
             # Before enable (rampup_scale=0), this fully gates MoR regularization so
@@ -1340,7 +1270,7 @@ class CCGQAMoRBlock(nn.Module):
             if self.mod_mlp_wrapper is not None:
                 aux_loss = self.mod_mlp_wrapper.get_aux_loss()
             else:
-                aux_loss = torch.tensor(0.0, device=device)
+                aux_loss = self._zero_scalar
             
             # OPTIMIZATION: Skip fixed path when rampup is complete (rampup_scale=1.0)
             # This saves ~30% compute after MoR is fully enabled.
@@ -1350,7 +1280,7 @@ class CCGQAMoRBlock(nn.Module):
                 return adaptive_output, {"ponder_loss": ponder_loss, "aux_loss": aux_loss}
             
             # During rampup (scale < 1.0): blend both paths for smooth transition
-            fixed_output = self.forward_fixed(x)
+            fixed_output = self._forward_fixed(x)
             output = rampup_scale * adaptive_output + (1.0 - rampup_scale) * fixed_output
             
             # Update cached loss for get_ponder_loss() consistency
@@ -1359,15 +1289,15 @@ class CCGQAMoRBlock(nn.Module):
             
             return output, {"ponder_loss": ponder_loss, "aux_loss": aux_loss}
         else:
-            output = self.forward_fixed(x)
+            output = self._forward_fixed(x)
             
             # Collect aux_loss from MoD MLP wrapper if present (even in fixed mode)
             if self.mod_mlp_wrapper is not None:
                 aux_loss = self.mod_mlp_wrapper.get_aux_loss()
             else:
-                aux_loss = torch.tensor(0.0, device=device)
+                aux_loss = self._zero_scalar
             
-            zero_loss = torch.tensor(0.0, device=device)
+            zero_loss = self._zero_scalar
             # Update cached loss for get_ponder_loss() consistency
             if self.training:
                 self._ponder_loss = zero_loss.detach()
@@ -1582,20 +1512,38 @@ class CCGQAMoDMoRModel(nn.Module):
 
         # Global step for warmup scheduling - use tensor buffer to avoid torch.compile recompilation
         self.register_buffer("_global_step", torch.zeros((), dtype=torch.int64), persistent=False)
+        
+        # Persistent zero scalar for efficient loss initialization (avoids per-step allocation)
+        self.register_buffer("_zero_scalar", torch.tensor(0.0), persistent=False)
 
         # Token embedding
         self.tok_emb = nn.Embedding(vocab_size, dim)
 
         # =====================================================================
-        # Attention pattern: FIXED 3×LLA2 + 1×CCGQA (repeating every 4 blocks)
+        # Attention pattern: FIXED 3×LLA3 + 1×CCGQA (repeating every 4 blocks)
         # This is the canonical HYDRA architecture - no configurability.
         # =====================================================================
         def _get_attention_type(block_idx: int) -> str:
-            """Return attention type for block: LLA2 for idx%4 in {0,1,2}, CCGQA for idx%4==3."""
-            return "ccgqa" if (block_idx % 4 == 3) else "lla2"
+            """Return attention type for block: LLA3 for idx%4 in {0,1,2}, CCGQA for idx%4==3."""
+            # Require lightning_attn3 (local copy with Blackwell fix) - no fallback
+            from hydra.kernels.lightning_attn3.ops import lightning_attn_func  # Will raise ImportError if missing
+            return "ccgqa" if (block_idx % 4 == 3) else "lla3"
         
         attention_pattern = [_get_attention_type(i) for i in range(n_mor_blocks)]
         self._attention_pattern = attention_pattern  # Store for introspection
+        
+        # Log attention pattern if rank 0
+        if not hasattr(self, '_logged_attention_pattern'):
+            import logging
+            logger = logging.getLogger("HYDRA")
+            # Count types
+            counts = {}
+            for t in attention_pattern:
+                counts[t] = counts.get(t, 0) + 1
+            logger.info(f"Attention Pattern: {counts} (Total: {len(attention_pattern)})")
+            if counts.get("lla3", 0) == 0 and counts.get("lla2", 0) == 0 and n_mor_blocks > 0:
+                logger.warning("⚠️  WARNING: Model is using ALL CCGQA attention. LLA3 (Lightning Attention) appears missing or disabled.")
+            self._logged_attention_pattern = True
 
         # MoR blocks - MoD applies to MLP sublayer only (attention is always dense)
         # MoD is applied to middle blocks (first and last process all tokens)
@@ -1619,7 +1567,8 @@ class CCGQAMoDMoRModel(nn.Module):
                 # MoD on MLP only for middle blocks
                 mod_mlp_capacity=mod_capacity if use_mod_mlp else None,
                 mod_mlp_aux_weight=self.aux_loss_weight if use_mod_mlp else 0.0,
-                mod_mlp_warmup=100,  # Soft routing warmup steps
+                mod_mlp_warmup=kwargs.get("mod_mlp_warmup", 100),  # Soft routing warmup steps
+                mor_warmup=kwargs.get("mor_warmup", 1000),  # MoR ponder loss warmup
                 # Dimension-aware depth scaling
                 dim_ref=dim_ref,
                 depth_alpha=depth_alpha,
@@ -1803,15 +1752,8 @@ class CCGQAMoDMoRModel(nn.Module):
             h = self.norm(h)
             logits = self.output(h)
 
-            device = logits.device
-            aux_loss = (
-                sum(aux_losses) if aux_losses else torch.tensor(0.0, device=device)
-            )
-            ponder_loss = (
-                sum(ponder_losses)
-                if ponder_losses
-                else torch.tensor(0.0, device=device)
-            )
+            aux_loss = sum(aux_losses) if aux_losses else self._zero_scalar
+            ponder_loss = sum(ponder_losses) if ponder_losses else self._zero_scalar
             return logits, {"aux_loss": aux_loss, "ponder_loss": ponder_loss}
         else:
             # Fast path - no loss computation overhead
@@ -1901,9 +1843,8 @@ class CCGQAMoDMoRModel(nn.Module):
         aux_losses = [losses["aux_loss"] for losses in layer_results if "aux_loss" in losses]
         ponder_losses = [losses["ponder_loss"] for losses in layer_results if "ponder_loss" in losses]
 
-        device = h.device
-        aux_loss = sum(aux_losses) if aux_losses else torch.tensor(0.0, device=device)
-        ponder_loss = sum(ponder_losses) if ponder_losses else torch.tensor(0.0, device=device)
+        aux_loss = sum(aux_losses) if aux_losses else self._zero_scalar
+        ponder_loss = sum(ponder_losses) if ponder_losses else self._zero_scalar
 
         return self.norm(h), {"aux_loss": aux_loss, "ponder_loss": ponder_loss}
 
@@ -1927,9 +1868,8 @@ class CCGQAMoDMoRModel(nn.Module):
         This method is provided for cases where you want to query losses
         separately from forward pass.
         """
-        device = next(self.parameters()).device
-        mod_aux_loss = torch.tensor(0.0, device=device)
-        mor_ponder_loss = torch.tensor(0.0, device=device)
+        mod_aux_loss = self._zero_scalar
+        mor_ponder_loss = self._zero_scalar
 
         for layer in self.layers:
             # MoR ponder_loss from CCGQAMoRBlock
@@ -2059,7 +1999,7 @@ class CCGQAMoDMoRModel(nn.Module):
         self.loss_baseline.update(token_losses[valid_mask])
         
         # Collect advantage loss from all blocks
-        total_advantage_loss = torch.tensor(0.0, device=device)
+        total_advantage_loss = self._zero_scalar
         for layer in self.layers:
             if hasattr(layer, 'compute_advantage_loss'):
                 layer_adv = layer.compute_advantage_loss(token_losses, self.loss_baseline)
@@ -2241,8 +2181,10 @@ class CCGQAMoDBlockWrapper(nn.Module):
         self.warmup_steps = warmup_steps
         # Use tensor buffer for global_step to avoid torch.compile recompilation
         self.register_buffer("_global_step", torch.zeros((), dtype=torch.int64), persistent=False)
-        self._last_probs_mean_t: torch.Tensor = torch.tensor(0.0)
-        self._last_probs_std_t: torch.Tensor = torch.tensor(0.0)
+        # OPTIMIZATION: Persistent zero scalar to avoid graph breaks and allocations
+        self.register_buffer("_zero_scalar", torch.tensor(0.0), persistent=False)
+        self._last_probs_mean_t: torch.Tensor = self._zero_scalar
+        self._last_probs_std_t: torch.Tensor = self._zero_scalar
 
         # =================================================================
         # VALIDATION: MoDRouter is instantiated (not a custom router)
@@ -2258,7 +2200,7 @@ class CCGQAMoDBlockWrapper(nn.Module):
             f"mod_router must be MoDRouter, got {type(self.mod_router)}"
         
         # Store aux_loss as regular attribute, not buffer (avoids CUDAGraph issues)
-        self._aux_loss: torch.Tensor = torch.tensor(0.0)
+        self._aux_loss: torch.Tensor = self._zero_scalar
         self._last_probs_mean: float = 0.0  # For logging
         self._last_probs_std: float = 0.0
         self._routing_mode: str = "soft"  # Track current mode for diagnostics
@@ -2284,13 +2226,13 @@ class CCGQAMoDBlockWrapper(nn.Module):
                 return self.block(x, **kwargs)
             
             if k == 0:
-                return x
+                return torch.zeros_like(x)
 
             # Gather selected tokens, process, scatter back
             indices_expanded = indices.unsqueeze(-1).expand(-1, -1, D)
             x_selected = torch.gather(x, 1, indices_expanded)  # [B, k, D]
             out_selected = self.block(x_selected, **kwargs)  # [B, k, D]
-            output = x.clone()
+            output = torch.zeros_like(x)
             # Ensure dtype consistency for scatter_ (handles autocast edge cases)
             output.scatter_(1, indices_expanded, out_selected.to(output.dtype))
             return output
@@ -2370,7 +2312,7 @@ class CCGQAMoDBlockWrapper(nn.Module):
                 inner_losses = {}
             
             # SCATTER: Place processed tokens back, skipped use identity
-            output = x.clone()  # Start with identity (skipped tokens unchanged)
+            output = torch.zeros_like(x)  # Start with zeros (skipped tokens are zero)
             # Ensure dtype consistency for scatter_ (handles autocast edge cases)
             output.scatter_(1, indices_expanded, block_out_selected.to(output.dtype))
             
@@ -2393,9 +2335,9 @@ class CCGQAMoDBlockWrapper(nn.Module):
                 block_out = self.block(x, **kwargs)
                 inner_losses = {}
             
-            # Soft weighted output: high prob -> block output, low prob -> identity
+            # Soft weighted output: high prob -> block output, low prob -> zero
             gate = probs.unsqueeze(-1)  # [B, L, 1]
-            output = gate * block_out + (1 - gate) * x
+            output = gate * block_out
             
             self._tokens_processed = L  # All tokens computed in Phase 1
 
@@ -2409,7 +2351,7 @@ class CCGQAMoDBlockWrapper(nn.Module):
             self._last_probs_std_t  = probs.std().detach()
             #self._last_probs_std = probs.std().item()
         else:
-            aux_loss = torch.tensor(0.0, device=x.device)
+            aux_loss = self._zero_scalar
 
         inner_losses["aux_loss"] = aux_loss
         return output, inner_losses

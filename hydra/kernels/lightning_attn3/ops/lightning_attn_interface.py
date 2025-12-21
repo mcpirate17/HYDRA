@@ -5,8 +5,19 @@ import torch
 import torch.nn.functional as F
 
 from .triton import lightning_attn3, lightning_attn3_no_decay, lightning_attn3_parallel
+from .triton import lightning_attn3_no_decay_chunked
 
 logger = logging.getLogger(__name__)
+
+# Cache for Blackwell detection
+_IS_BLACKWELL_CACHE: dict[int, bool] = {}
+
+def _is_blackwell(device_idx: int = 0) -> bool:
+    """Check if device is Blackwell (SM 12.x) architecture."""
+    if device_idx not in _IS_BLACKWELL_CACHE:
+        props = torch.cuda.get_device_properties(device_idx)
+        _IS_BLACKWELL_CACHE[device_idx] = props.major >= 12
+    return _IS_BLACKWELL_CACHE[device_idx]
 
 
 # ============================================================================
@@ -216,7 +227,12 @@ def next_power_of_2(n):
 
 def lightning_attn_func(q, k, v, s=None, variant="chunk_loop"):
     if s is None:
-        fn = lightning_attn3_no_decay
+        # Use chunked backward on Blackwell (SM 12.x) due to shared memory limits
+        device_idx = q.device.index if q.device.index is not None else 0
+        if _is_blackwell(device_idx):
+            fn = lightning_attn3_no_decay_chunked
+        else:
+            fn = lightning_attn3_no_decay
     else:
         if variant == "parallel":
             fn = lightning_attn3_parallel

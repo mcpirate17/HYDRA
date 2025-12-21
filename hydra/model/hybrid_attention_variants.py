@@ -4,9 +4,9 @@ Minimal attention variants for HYDRA.
 
 This project is locked to two attention layers:
 - CCQA (HYDRA native, implemented in `hydra.model.ccgqa.CCGQAAttention`)
-- LLA2 (Lightning Attention-2, external `lightning_attn` package)
+- LLA3 (Lightning Attention-3, local fork in `hydra.kernels.lightning_attn3`)
 
-This module only provides the LLA2 adapter used by MoR blocks.
+This module only provides the LLA3 adapter used by MoR blocks.
 """
 
 from __future__ import annotations
@@ -19,12 +19,9 @@ import torch.nn as nn
 
 from hydra.layers import RotaryEmbedding
 
-try:
-    # Optional external dependency: https://github.com/OpenNLPLab/lightning-attention
-    # Provides Lightning Attention-2 kernels.
-    from lightning_attn.ops import lightning_attn_func as _lightning_attn2_func
-except Exception:  # pragma: no cover
-    _lightning_attn2_func = None
+# Local Lightning Attention-3 with Blackwell compatibility and chunked backward.
+# See hydra/kernels/lightning_attn3/README.md for benchmarks.
+from hydra.kernels.lightning_attn3.ops import lightning_attn_func as _lightning_attn3_func
 
 @dataclass(frozen=True)
 class HybridAttentionChoice:
@@ -52,10 +49,10 @@ def resolve_hybrid_attention_choice(
     return HybridAttentionChoice(default)
 
 
-class LightningAttn2Attention(nn.Module):
-    """Lightning Attention-2 adapter.
+class LightningAttn3Attention(nn.Module):
+    """Lightning Attention-3 adapter.
 
-    This wraps the external `lightning_attn` package so it can be used as a
+    This wraps the local `lightning_attn3` kernels so they can be used as a
     drop-in attention module inside HYDRA MoR blocks.
 
     Constraints:
@@ -78,10 +75,9 @@ class LightningAttn2Attention(nn.Module):
     ):
         super().__init__()
 
-        if _lightning_attn2_func is None:
+        if _lightning_attn3_func is None:
             raise ImportError(
-                "lightning_attn is not installed. Install with: "
-                "pip install 'git+https://github.com/OpenNLPLab/lightning-attention.git'"
+                "lightning_attn3 not found. Check hydra/kernels/lightning_attn3/ exists."
             )
 
         self.dim = dim
@@ -106,7 +102,7 @@ class LightningAttn2Attention(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         if mask is not None:
-            raise ValueError("LightningAttn2Attention does not support attn masks (causal-only).")
+            raise ValueError("LightningAttn3Attention does not support attn masks (causal-only).")
 
         b, s, _ = x.shape
 
@@ -128,11 +124,11 @@ class LightningAttn2Attention(nn.Module):
             )
 
         try:
-            out = _lightning_attn2_func(q, k, v, s=None, variant=self.variant)
+            out = _lightning_attn3_func(q, k, v, s=None, variant=self.variant)
         except AssertionError as e:
-            # The external library asserts on supported head/value dims.
+            # The kernel asserts on supported head/value dims.
             raise RuntimeError(
-                f"lightning_attn rejected shapes: q={tuple(q.shape)} v={tuple(v.shape)}. "
+                f"lightning_attn3 rejected shapes: q={tuple(q.shape)} v={tuple(v.shape)}. "
                 f"Try head_dim/value_dim divisible by 16. Original error: {e}"
             )
 
@@ -160,17 +156,17 @@ def build_hybrid_attention_module(
     # Default rope behavior: keep parity with the rest of HYDRA.
     use_rope = bool(attention_kwargs.get("use_rope", True))
 
-    if name == "lla2":
-        return LightningAttn2Attention(
+    if name in ("lla2", "lla3"):  # Accept both for backwards compatibility
+        return LightningAttn3Attention(
             dim=dim,
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,
             dropout=float(attention_kwargs.get("attn_dropout", 0.0)),
             use_rope=use_rope,
             max_seq_len=max_seq_len,
-            variant=str(attention_kwargs.get("lla2_variant", "chunk_loop")),
+            variant=str(attention_kwargs.get("lla3_variant", "chunk_loop")),
         )
 
     raise ValueError(
-        f"Unknown HYDRA attention variant '{name}'. Expected: lla2."
+        f"Unknown HYDRA attention variant '{name}'. Expected: lla3 (or lla2 for compat)."
     )

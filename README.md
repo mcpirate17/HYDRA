@@ -344,7 +344,9 @@ python diagnostics/scaling_analysis.py \
 
 ### Attention Architecture (MoR blocks)
 
-HYDRA uses **Lightning-Attention 2** (lla2) for efficient scaled-dot-product attention combined with **CCGQA** (Compressed Convolutional Grouped Query Attention).
+HYDRA uses **Lightning-Attention 3** (lla3) for efficient O(n) linear attention combined with **CCGQA** (Compressed Convolutional Grouped Query Attention).
+
+**Performance**: 7.52x faster than PyTorch SDPA at N=8192, 27% less memory. See [hydra/kernels/lightning_attn3/README.md](hydra/kernels/lightning_attn3/README.md) for benchmarks.
 
 **Default pattern**: 3× Lightning-Attention blocks + 1× CCGQA block per MoR macro-block
 
@@ -353,14 +355,14 @@ HYDRA uses **Lightning-Attention 2** (lla2) for efficient scaled-dot-product att
 python diagnostics/tall_skinny_bench.py --device cuda --preset 100m --steps 1
 
 # Explicitly set the named pattern:
-HYDRA_MOR_ATTENTION_PATTERN_NAME='lla2x3+ccqa' python diagnostics/tall_skinny_bench.py --device cuda --preset 100m --steps 1
+HYDRA_MOR_ATTENTION_PATTERN_NAME='lla3x3+ccqa' python diagnostics/tall_skinny_bench.py --device cuda --preset 100m --steps 1
 
 # Or define as literal token sequence:
-HYDRA_MOR_ATTENTION_PATTERN='lla2,lla2,lla2,ccqa' python diagnostics/tall_skinny_bench.py --device cuda --preset 100m --steps 1
+HYDRA_MOR_ATTENTION_PATTERN='lla3,lla3,lla3,ccqa' python diagnostics/tall_skinny_bench.py --device cuda --preset 100m --steps 1
 ```
 
 **Requirements**:
-- `lla2` requires CUDA (the external lightning-attention kernels are Triton/CUDA based).
+- `lla3` requires CUDA (the Triton kernels are CUDA-based, optimized for Blackwell/SM12).
 - HYDRA_MOR_ATTENTION_OVERRIDE still exists and overrides all blocks if set.
 
 ---
@@ -450,7 +452,7 @@ HYDRA follows a rigorous testing philosophy:
 | `HYDRA_ENABLE_FUSED_ROPE` | `0` | Enable fused RoPE kernel (opt-in due to GPU compatibility) |
 | `HYDRA_ENABLE_FUSED_RMS_NORM` | `0` | Enable fused RMSNorm kernel (opt-in due to gradient concerns) |
 | `HF_HUB_ENABLE_HF_TRANSFER` | `1` | Enable fast HuggingFace transfers (auto-enabled) |
-| `HYDRA_MOR_ATTENTION_PATTERN_NAME` | `lla2x3+ccqa` | Attention pattern for MoR blocks (CUDA only) |
+| `HYDRA_MOR_ATTENTION_PATTERN_NAME` | `lla3x3+ccqa` | Attention pattern for MoR blocks (CUDA only) |
 
 ```bash
 # Enable all fused kernels (experimental)
