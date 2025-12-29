@@ -1,0 +1,126 @@
+{
+  "timestamp": "2025-12-22T17:47:55.781822",
+  "gpu_info": {
+    "name": "NVIDIA GeForce RTX 5090",
+    "compute_capability": "12.0",
+    "memory_gb": 33.7
+  },
+  "config": {
+    "batch_size": 4,
+    "n_heads": 8,
+    "n_kv_heads": 2,
+    "head_dim": 64,
+    "dim": 512,
+    "compression_factor": 4,
+    "dtype": "torch.bfloat16",
+    "warmup_iters": 10,
+    "bench_iters": 50,
+    "seq_lengths": [
+      512,
+      1024
+    ],
+    "device": "cuda"
+  },
+  "results": [
+    {
+      "kernel": "CCGQA",
+      "fwd_time_ms": 0.5639,
+      "bwd_time_ms": 2.4578,
+      "total_time_ms": 3.0216,
+      "throughput_iters_per_sec": 330.9,
+      "peak_memory_mb": 31.8,
+      "success": true,
+      "seq_len": 512
+    },
+    {
+      "kernel": "GQA-Ref",
+      "fwd_time_ms": 0.1433,
+      "bwd_time_ms": 0.2643,
+      "total_time_ms": 0.4076,
+      "throughput_iters_per_sec": 2453.2,
+      "peak_memory_mb": 98.2,
+      "success": true,
+      "seq_len": 512
+    },
+    {
+      "kernel": "MHA-Ref",
+      "fwd_time_ms": 0.1754,
+      "bwd_time_ms": 0.2705,
+      "total_time_ms": 0.4459,
+      "throughput_iters_per_sec": 2242.7,
+      "peak_memory_mb": 102.4,
+      "success": true,
+      "seq_len": 512
+    },
+    {
+      "kernel": "PyTorch-SDPA",
+      "fwd_time_ms": 0.0555,
+      "bwd_time_ms": 0.0864,
+      "total_time_ms": 0.1419,
+      "throughput_iters_per_sec": 7044.8,
+      "peak_memory_mb": 52.2,
+      "success": true,
+      "seq_len": 512
+    },
+    {
+      "kernel": "FlashAttn-2",
+      "fwd_time_ms": 0.0461,
+      "bwd_time_ms": 0.398,
+      "total_time_ms": 0.4441,
+      "throughput_iters_per_sec": 2251.8,
+      "peak_memory_mb": 50.0,
+      "success": true,
+      "seq_len": 512
+    },
+    {
+      "kernel": "CCGQA",
+      "fwd_time_ms": 0.556,
+      "bwd_time_ms": 1.1375,
+      "total_time_ms": 1.6936,
+      "throughput_iters_per_sec": 590.5,
+      "peak_memory_mb": 58.0,
+      "success": true,
+      "seq_len": 1024
+    },
+    {
+      "kernel": "GQA-Ref",
+      "fwd_time_ms": 0.342,
+      "bwd_time_ms": 0.7302,
+      "total_time_ms": 1.0722,
+      "throughput_iters_per_sec": 932.7,
+      "peak_memory_mb": 314.2,
+      "success": true,
+      "seq_len": 1024
+    },
+    {
+      "kernel": "MHA-Ref",
+      "fwd_time_ms": 0.4019,
+      "bwd_time_ms": 0.797,
+      "total_time_ms": 1.199,
+      "throughput_iters_per_sec": 834.0,
+      "peak_memory_mb": 314.2,
+      "success": true,
+      "seq_len": 1024
+    },
+    {
+      "kernel": "PyTorch-SDPA",
+      "fwd_time_ms": 0.0856,
+      "bwd_time_ms": 0.1805,
+      "total_time_ms": 0.2661,
+      "throughput_iters_per_sec": 3757.8,
+      "peak_memory_mb": 79.6,
+      "success": true,
+      "seq_len": 1024
+    },
+    {
+      "kernel": "FlashAttn-2",
+      "fwd_time_ms": 0.0935,
+      "bwd_time_ms": 0.2037,
+      "total_time_ms": 0.2973,
+      "throughput_iters_per_sec": 3364.0,
+      "peak_memory_mb": 75.3,
+      "success": true,
+      "seq_len": 1024
+    }
+  ]
+}

@@ -1,0 +1,77 @@
+{
+  "N1024_D16_torch.bfloat16_cuda": [
+    128,
+    128,
+    16
+  ],
+  "N512_D16_torch.bfloat16_cuda": [
+    128,
+    64,
+    16
+  ],
+  "N512_D32_torch.bfloat16_cuda": [
+    128,
+    64,
+    32
+  ],
+  "N512_D64_torch.bfloat16_cuda": [
+    64,
+    64,
+    64
+  ],
+  "N1024_D32_torch.bfloat16_cuda": [
+    128,
+    64,
+    32
+  ],
+  "N1024_D64_torch.bfloat16_cuda": [
+    64,
+    32,
+    64
+  ],
+  "N2048_D16_torch.bfloat16_cuda": [
+    64,
+    64,
+    16
+  ],
+  "N2048_D32_torch.bfloat16_cuda": [
+    64,
+    64,
+    32
+  ],
+  "N2048_D64_torch.bfloat16_cuda": [
+    64,
+    64,
+    64
+  ],
+  "N4096_D16_torch.bfloat16_cuda": [
+    64,
+    64,
+    16
+  ],
+  "N4096_D32_torch.bfloat16_cuda": [
+    64,
+    32,
+    32
+  ],
+  "N4096_D64_torch.bfloat16_cuda": [
+    64,
+    64,
+    64
+  ],
+  "N8192_D16_torch.bfloat16_cuda": [
+    128,
+    128,
+    16
+  ],
+  "N8192_D32_torch.bfloat16_cuda": [
+    64,
+    128,
+    32
+  ],
+  "N8192_D64_torch.bfloat16_cuda": [
+    64,
+    64,
+    64
+  ]
+}

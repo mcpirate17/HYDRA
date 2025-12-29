@@ -29,7 +29,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from hydra.model.ccgqa import (
+from hydra.model.framework import (
     CCGQAAttention,
     CCGQABlock,
     CCGQAMoRBlock,
@@ -238,10 +238,14 @@ class TestCCGQAPaperCompliance:
         """Paper Section 3.4: Sequence + channel convolutions on Q and K."""
         assert ccgqa_attention.use_convs is True
         # Should have 2 conv layers each for Q and K
-        assert hasattr(ccgqa_attention, "q_conv1"), "Missing q_conv1 (sequence conv)"
-        assert hasattr(ccgqa_attention, "q_conv2"), "Missing q_conv2 (channel conv)"
-        assert hasattr(ccgqa_attention, "k_conv1"), "Missing k_conv1 (sequence conv)"
-        assert hasattr(ccgqa_attention, "k_conv2"), "Missing k_conv2 (channel conv)"
+        # Updated to match OptimizedConvSequence structure
+        assert hasattr(ccgqa_attention, "q_conv"), "Missing q_conv"
+        assert hasattr(ccgqa_attention.q_conv, "conv1"), "Missing q_conv.conv1 (sequence conv)"
+        assert hasattr(ccgqa_attention.q_conv, "conv2"), "Missing q_conv.conv2 (channel conv)"
+        
+        assert hasattr(ccgqa_attention, "k_conv"), "Missing k_conv"
+        assert hasattr(ccgqa_attention.k_conv, "conv1"), "Missing k_conv.conv1 (sequence conv)"
+        assert hasattr(ccgqa_attention.k_conv, "conv2"), "Missing k_conv.conv2 (channel conv)"
 
     def test_forward_output_shape(self, ccgqa_attention: CCGQAAttention):
         """Forward pass should preserve input shape."""
@@ -253,15 +257,19 @@ class TestCCGQAPaperCompliance:
 
     def test_attention_in_compressed_space(self, ccgqa_attention: CCGQAAttention):
         """Paper Section 3.1: Attention computed entirely in compressed latent space."""
-        # The q_down, k_down, v_down project to latent_dim, not dim
-        assert ccgqa_attention.q_down.out_features == ccgqa_attention.latent_dim
-        assert ccgqa_attention.k_down.out_features == ccgqa_attention.kv_dim
-        # Note: with value_shift enabled, v_down projects to kv_dim/2
-        # (half heads see current, half see shifted)
-        if ccgqa_attention.use_value_shift:
-            assert ccgqa_attention.v_down.out_features == ccgqa_attention.kv_dim // 2
-        else:
-            assert ccgqa_attention.v_down.out_features == ccgqa_attention.kv_dim
+        # The qkv_proj projects to latent_dim + kv_dim + kv_dim (or similar)
+        # We check if the projection output dimension matches expectations
+        
+        # q (latent_dim) + k (kv_dim) + v (kv_dim)
+        # Note: with value_shift enabled, v is split but total dim is still kv_dim
+        expected_out_features = ccgqa_attention.latent_dim + ccgqa_attention.kv_dim + ccgqa_attention.kv_dim
+        
+        assert hasattr(ccgqa_attention, "qkv_proj")
+        assert ccgqa_attention.qkv_proj.out_features == expected_out_features
+        
+        # Verify compression
+        if ccgqa_attention.compression_factor > 1:
+             assert ccgqa_attention.latent_dim < ccgqa_attention.dim
 
     @pytest.mark.parametrize("variant_name", ["100M", "500M"])
     def test_ccgqa_at_scale(self, variant_name: str):
@@ -406,6 +414,7 @@ class TestMoRPaperCompliance:
             adaptive=True,
             layer_idx=2,
             total_layers=8,
+            attention_type="ccqa",
         )
 
     def test_router_architecture(self, mor_block: CCGQAMoRBlock):
@@ -435,6 +444,7 @@ class TestMoRPaperCompliance:
             max_recursions=4,
             layer_idx=0,
             total_layers=8,
+            attention_type="ccqa",
         )
         late_block = CCGQAMoRBlock(
             dim=256,
@@ -443,6 +453,7 @@ class TestMoRPaperCompliance:
             max_recursions=4,
             layer_idx=7,
             total_layers=8,
+            attention_type="ccqa",
         )
 
         # Compute target probs from MoRConfig

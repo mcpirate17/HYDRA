@@ -12,19 +12,14 @@ Tests:
 
 import pytest
 import torch
-from pathlib import Path
-
-import sys
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from universal_data_loader import (
+from hydra.data.universal_data_loader import (
     create_universal_loader,
     SyntheticDataLoader,
     LocalDataLoader,
     StreamingDataLoader,
     get_tokenizer,
     get_available_datasets,
+    DATASET_CONFIGS,
     HAS_DATASETS,
     HAS_TRANSFORMERS,
 )
@@ -266,6 +261,61 @@ class TestCreateUniversalLoader:
         assert "local" in datasets
         assert "finefineweb" in datasets
         assert "fineweb" in datasets
+
+    def test_constant_ratio_mix_preset_defined(self):
+        """Ensure the FineFineWeb+Pleias+UltraChat constant mix preset exists."""
+        name = "ffw_pleias_ultrachat_const"
+        assert name in DATASET_CONFIGS
+        cfg = DATASET_CONFIGS[name]
+        assert cfg.get("mixed") is True
+        sources = cfg.get("sources")
+        assert isinstance(sources, list)
+        source_names = {s.get("name") for s in sources}
+        assert {"finefineweb-local", "pleias_synth", "chat"}.issubset(source_names)
+
+    def test_mixed_by_seq_preset_defined(self):
+        """Ensure the sequence-aware small chat preset exists and is keyed by seq."""
+        name = "small_chat_seqaware"
+        assert name in DATASET_CONFIGS
+        cfg = DATASET_CONFIGS[name]
+        assert isinstance(cfg.get("mixed_by_seq"), dict)
+        by_seq = cfg["mixed_by_seq"]
+        assert {"512", "1024", "2048"}.issubset(set(by_seq.keys()))
+
+        # Basic sanity: each entry has sources and weights.
+        for k in ["512", "1024", "2048"]:
+            entry = by_seq[k]
+            assert isinstance(entry, dict)
+            sources = entry.get("sources")
+            assert isinstance(sources, list)
+            assert len(sources) >= 3
+            for s in sources:
+                assert "name" in s and "weight" in s
+
+    def test_pretrain_ffw_chat_pleias_seqaware_defined(self):
+        """Ensure the seq-aware 60/30/10 pretrain preset exists and selects per-seq sources."""
+        name = "pretrain_ffw60_chat30_pleias10_seqaware"
+        assert name in DATASET_CONFIGS
+        cfg = DATASET_CONFIGS[name]
+
+        by_seq = cfg.get("mixed_by_seq")
+        assert isinstance(by_seq, dict)
+        assert {"512", "1024", "2048"}.issubset(set(by_seq.keys()))
+
+        expected = {
+            "512": "chat_flat_512",
+            "1024": "chat_flat_1024",
+            "2048": "chat_flat_2048",
+        }
+        for k, chat_name in expected.items():
+            entry = by_seq[k]
+            assert isinstance(entry, dict)
+            sources = entry.get("sources")
+            assert isinstance(sources, list)
+            source_names = {s.get("name") for s in sources}
+            assert "finefineweb-sequential" in source_names
+            assert "pleias_synth" in source_names
+            assert chat_name in source_names
 
 
 @pytest.mark.skipif(not HAS_TRANSFORMERS, reason="transformers not installed")

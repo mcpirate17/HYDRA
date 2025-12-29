@@ -1,10 +1,10 @@
 """
-Benchmark CCGQA model components and full models.
+Benchmark HYDRA model components and full models.
 
 This script provides performance benchmarking for:
-- CCGQAAttention vs standard GQA
-- CCGQAModel vs baseline transformers
-- CCGQAMoDMoRModel full efficiency stack
+- CCGQAAttention compression metrics
+- HydraBaseModel vs baseline transformers
+- HydraModel full efficiency stack (LA3 + MoD + MoR)
 
 Run with:
     python -m diagnostics.benchmark_ccgqa
@@ -14,13 +14,8 @@ import torch
 import time
 from typing import Tuple
 
-from hydra.model.ccgqa import (
-    CCGQAAttention,
-    CCGQAModel,
-    CCGQAMoDMoRModel,
-    create_ccgqa_model,
-    create_ccgqa_mod_mor_model,
-)
+from hydra.attention import CCGQAAttention
+from hydra.model.framework import HydraBaseModel, HydraModel, create_base_model, create_hydra_model
 
 
 def benchmark_ccgqa_attention():
@@ -83,7 +78,7 @@ def benchmark_ccgqa_model():
         mlp_ratio = 2.67
         max_seq_len = 8192
     
-    model = create_ccgqa_model(MockSpec())
+    model = create_base_model(MockSpec())
     
     if torch.cuda.is_available():
         model = model.cuda()
@@ -114,12 +109,12 @@ def benchmark_ccgqa_model():
 
 
 def benchmark_mod_mor_model():
-    """Benchmark full CCGQA + MoD + MoR model."""
+    """Benchmark full HYDRA model (LA3 + MoD + MoR)."""
     print("=" * 80)
-    print("Benchmarking CCGQA + MoD + MoR Model")
+    print("Benchmarking HydraModel (LA3 + MoD + MoR)")
     print("=" * 80)
     
-    mod_mor_model = create_ccgqa_mod_mor_model(
+    mod_mor_model = create_hydra_model(
         dim=2048,
         n_mor_blocks=8,
         recursions_per_block=4,
@@ -214,24 +209,24 @@ def benchmark_memory_usage():
     
     # Base model
     def base_model():
-        return create_ccgqa_model(type('Spec', (), {
+        return create_base_model(type('Spec', (), {
             'vocab_size': 50257, 'dim': 1344, 'n_layers': 12,
             'n_heads': 21, 'n_kv_heads': 3, 'compression_factor': 4,
             'mlp_ratio': 2.67, 'max_seq_len': 8192
         }))
     
     fwd, bwd = measure_memory(base_model, tokens)
-    print(f"Base CCGQA (12L):     Forward={fwd:.2f}GB, Backward={bwd:.2f}GB")
+    print(f"Base HydraBaseModel (12L):  Forward={fwd:.2f}GB, Backward={bwd:.2f}GB")
     
     # MoD+MoR model
     def mod_mor_model():
-        return create_ccgqa_mod_mor_model(
+        return create_hydra_model(
             dim=1344, n_mor_blocks=6, recursions_per_block=2,
             n_heads=21, n_kv_heads=3, mlp_ratio=2.67
         )
     
     fwd, bwd = measure_memory(mod_mor_model, tokens)
-    print(f"MoD+MoR (6x2L):       Forward={fwd:.2f}GB, Backward={bwd:.2f}GB")
+    print(f"HydraModel (6x2L):          Forward={fwd:.2f}GB, Backward={bwd:.2f}GB")
     print()
 
 
@@ -239,7 +234,7 @@ def main():
     """Run all benchmarks."""
     print("\n")
     print("=" * 80)
-    print("CCGQA Benchmark Suite")
+    print("HYDRA Benchmark Suite")
     print("=" * 80)
     print(f"Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
     print(f"PyTorch version: {torch.__version__}")

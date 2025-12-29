@@ -10,7 +10,7 @@ Usage:
     python -m diagnostics
 
     # Run specific tests
-    pytest diagnostics/test_mod_mor_routing.py -v
+    pytest diagnostics/mod_mor_routing_healthcheck.py -v
     
     # Run with memory profiling
     mprof run python -m diagnostics.deep_diagnosis
@@ -33,7 +33,7 @@ def run_routing_tests():
     print("🔍 Running MoD/MoR routing tests...")
     result = subprocess.run([
         sys.executable, "-m", "pytest", 
-        "diagnostics/test_mod_mor_routing.py", "-v"
+        "diagnostics/mod_mor_routing_healthcheck.py", "-v"
     ], cwd=Path(__file__).parent.parent)
     return result.returncode == 0
 

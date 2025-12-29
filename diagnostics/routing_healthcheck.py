@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from hydra.model.ccgqa import CCGQAMoDMoRModel
+from hydra.model.framework import HydraModel
 from hydra.training.config import MODEL_SIZE_CONFIGS
 
 
@@ -30,13 +30,13 @@ def _build_model(
     mor_adaptive: bool,
     device: torch.device,
     dtype: torch.dtype,
-) -> Tuple[CCGQAMoDMoRModel, int, int]:
+) -> Tuple[HydraModel, int, int]:
     size_cfg = MODEL_SIZE_CONFIGS[model_size]
 
     mod_enable_step = int(max_steps * mod_enable_pct)
     mor_enable_step = int(max_steps * mor_enable_pct)
 
-    model = CCGQAMoDMoRModel(
+    model = HydraModel(
         vocab_size=50257,
         dim=size_cfg["mod_mor_dim"],
         n_mor_blocks=size_cfg["n_mor_blocks"],
@@ -61,7 +61,7 @@ def _build_model(
     return model, mod_enable_step, mor_enable_step
 
 
-def _summarize(model: CCGQAMoDMoRModel) -> HealthSummary:
+def _summarize(model: HydraModel) -> HealthSummary:
     mod_probs: List[float] = []
     mod_ratios: List[float] = []
     mod_modes: Dict[str, int] = {}

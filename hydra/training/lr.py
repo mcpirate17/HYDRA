@@ -24,7 +24,10 @@ def get_lr_wsd(step: int, warmup_steps: int, decay_start_step: int, decay_steps:
         return max_lr
     decay_progress = (step - decay_start_step) / max(1, decay_steps)
     decay_progress = min(1.0, decay_progress)
-    return max_lr - (max_lr - min_lr) * decay_progress
+    # Smooth warmdown: cosine easing avoids a sharp kink at decay_start_step.
+    # This keeps LR continuous with zero slope at the start/end of decay.
+    warmdown = 0.5 * (1.0 - math.cos(math.pi * decay_progress))
+    return max_lr - (max_lr - min_lr) * warmdown
 
 
 class ProgressAwareLRManager:
@@ -108,6 +111,15 @@ class ProgressAwareLRManager:
             self._check_cooldown_trigger(step, loss)
 
     def _check_cooldown_trigger(self, step: int, loss: float) -> None:
+        # Guardrail: don't allow adaptive cooldown too early in the run.
+        # Early training (and curriculum ramps) can produce transient spikes;
+        # without this, a single early trigger can drive LR to min_lr long
+        # before the planned decay window.
+        min_pct = float(getattr(self.config, "adaptive_min_trigger_pct", 0.0) or 0.0)
+        if min_pct > 0:
+            min_step = int(self.config.max_steps * min_pct)
+            if step < min_step:
+                return
         if len(self.loss_history) < 10 or self.loss_ema_long == 0:
             return
         relative_increase = (self.loss_ema_short - self.loss_ema_long) / self.loss_ema_long
@@ -147,7 +159,8 @@ class ProgressAwareLRManager:
         else:
             progress = (step - decay_start) / max(1, decay_steps)
             progress = min(1.0, progress)
-            lr = self.max_lr - (self.max_lr - self.min_lr) * progress
+            warmdown = 0.5 * (1.0 - math.cos(math.pi * progress))
+            lr = self.max_lr - (self.max_lr - self.min_lr) * warmdown
 
         if self.config.use_swa and step >= self.swa_start_step:
             lr = lr * self.config.swa_lr_factor

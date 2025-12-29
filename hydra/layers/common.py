@@ -22,7 +22,7 @@ from typing import Any, Optional, Tuple, Callable
 # FEATURE FLAGS: Detect available backends at import time
 # =============================================================================
 
-from hydra.kernels import fused_rms_norm, fused_swiglu, fused_rope, fused_qk_norm
+from hydra.kernels import fused_swiglu, fused_qk_norm, fused_rms_norm, fused_rope
 FUSED_KERNELS_AVAILABLE = True
 
 FLASH_ATTN_AVAILABLE = False

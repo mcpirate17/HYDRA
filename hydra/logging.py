@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 
@@ -17,6 +18,7 @@ class HydraLogger:
         self._logger.setLevel(logging.INFO)
 
         self._file_handler: Optional[logging.Handler] = None
+        self._log_file_path: Optional[str] = None
 
         if not self.enabled:
             return
@@ -36,7 +38,19 @@ class HydraLogger:
 
         log_dir = getattr(config, "log_dir", "logs")
         os.makedirs(log_dir, exist_ok=True)
-        file_handler = logging.FileHandler(os.path.join(log_dir, "training.log"))
+        
+        # Use run-specific log filename if run_id is available
+        run_id = getattr(config, "run_id", None)
+        if run_id:
+            log_filename = f"training_{run_id}.log"
+        else:
+            # Fallback: timestamp-based filename to avoid overwriting
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            model_size = getattr(config, "model_size", "unknown")
+            log_filename = f"training_{model_size}_{timestamp}.log"
+        
+        self._log_file_path = os.path.join(log_dir, log_filename)
+        file_handler = logging.FileHandler(self._log_file_path)
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(formatter)
         self._logger.addHandler(file_handler)

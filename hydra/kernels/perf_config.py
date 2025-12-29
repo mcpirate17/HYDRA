@@ -205,7 +205,7 @@ def print_perf_status():
     )
     from hydra.kernels.liger_integration import get_liger_status, LIGER_AVAILABLE
     from hydra.kernels.te_integration import get_te_status, TE_AVAILABLE
-    from hydra.layers.common import FLASH_ATTN_AVAILABLE
+    from hydra.layers import FLASH_ATTN_AVAILABLE
     
     hw = detect_hardware()
     

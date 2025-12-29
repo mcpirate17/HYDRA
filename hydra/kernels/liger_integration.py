@@ -17,10 +17,13 @@ References:
     https://github.com/linkedin/Liger-Kernel
 """
 
+import logging
 import os
 from typing import Optional
 import importlib.util
 import warnings
+
+_log = logging.getLogger(__name__)
 
 # Feature flag for Liger
 LIGER_AVAILABLE = False
@@ -154,7 +157,7 @@ def patch_hydra_with_liger():
     - SwiGLU activation -> LigerSiLUMulFunction
     """
     if not LIGER_AVAILABLE or not LIGER_ENABLED:
-        print("⚠️  Liger kernels not available. Install with: pip install liger-kernel")
+        _log.warning("Liger kernels not available. Install with: pip install liger-kernel")
         return False
     
     import hydra.layers.common as common_module
@@ -182,12 +185,12 @@ def patch_hydra_with_liger():
     else:
         swiglu_patched = False
     
-    print("✅ HYDRA patched with Liger kernels:")
-    print("   - RMSNorm -> LigerRMSNorm (fused, ~30% memory savings)")
+    _log.info("HYDRA patched with Liger kernels:")
+    _log.info("   - RMSNorm -> LigerRMSNorm (fused, ~30% memory savings)")
     if swiglu_patched:
-        print("   - SwiGLU -> LigerSiLUMulFunction (fused activation)")
-    print("   - Use liger_cross_entropy_loss() for ~60% CE memory savings")
-    print("   - Use liger_fused_linear_cross_entropy() for ~80% output layer savings")
+        _log.info("   - SwiGLU -> LigerSiLUMulFunction (fused activation)")
+    _log.info("   - Use liger_cross_entropy_loss() for ~60% CE memory savings")
+    _log.info("   - Use liger_fused_linear_cross_entropy() for ~80% output layer savings")
     return True
 
 
@@ -229,16 +232,16 @@ def apply_liger_kernel_to_model(model, use_fused_ce: bool = True):
             replaced_count += 1
     
     if replaced_count > 0:
-        print(f"✅ Replaced {replaced_count} RMSNorm layers with LigerRMSNorm")
+        _log.info(f"Replaced {replaced_count} RMSNorm layers with LigerRMSNorm")
     
     # Return fused CE loss if requested
     loss_fn = None
     if use_fused_ce and LigerFusedLinearCrossEntropyLoss is not None:
         loss_fn = LigerFusedLinearCrossEntropyLoss(ignore_index=-100)
-        print("✅ Using Liger Fused Linear Cross-Entropy (80% memory savings on output)")
+        _log.info("Using Liger Fused Linear Cross-Entropy (80% memory savings on output)")
     elif use_fused_ce and LigerCrossEntropyLoss is not None:
         loss_fn = LigerCrossEntropyLoss(ignore_index=-100)
-        print("✅ Using Liger Cross-Entropy (60% memory savings)")
+        _log.info("Using Liger Cross-Entropy (60% memory savings)")
     
     return model, loss_fn
 

@@ -68,10 +68,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from hydra.model.ccgqa import (
-    CCGQAMoDMoRModel,
-    create_ccgqa_mod_mor_model,
-)
+from hydra.model.framework import HydraModel, create_hydra_model
 
 
 # =============================================================================
@@ -277,7 +274,7 @@ def run_diagnostic(
     print(
         f"Creating model: dim={variant.dim}, blocks={variant.n_mor_blocks}, rec={variant.recursions}"
     )
-    model = create_ccgqa_mod_mor_model(
+    model = create_hydra_model(
         vocab_size=vocab_size,
         dim=variant.dim,
         n_mor_blocks=variant.n_mor_blocks,

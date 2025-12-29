@@ -3,8 +3,8 @@
 Minimal attention variants for HYDRA.
 
 This project is locked to two attention layers:
-- CCQA (HYDRA native, implemented in `hydra.model.ccgqa.CCGQAAttention`)
-- LLA3 (Lightning Attention-3, local fork in `hydra.kernels.lightning_attn3`)
+- CCQA (HYDRA native, implemented in `hydra.attention.ccqa.CCGQAAttention`)
+- LLA3 (Lightning Attention-3, in `hydra.attention.backends.lightning_attn3`)
 
 This module only provides the LLA3 adapter used by MoR blocks.
 """
@@ -12,6 +12,7 @@ This module only provides the LLA3 adapter used by MoR blocks.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 from typing import Optional, Union
 
 import torch
@@ -19,9 +20,19 @@ import torch.nn as nn
 
 from hydra.layers import RotaryEmbedding
 
-# Local Lightning Attention-3 with Blackwell compatibility and chunked backward.
-# See hydra/kernels/lightning_attn3/README.md for benchmarks.
-from hydra.kernels.lightning_attn3.ops import lightning_attn_func as _lightning_attn3_func
+from hydra.attention import is_hybrid_attention_backend_available
+
+def _get_lightning_attn3_func():
+    # NOTE: On CPU-only environments, importing Triton-backed kernels can raise
+    # during driver initialization. Keep this module importable for unit tests.
+    if not is_hybrid_attention_backend_available("lla3"):
+        return None
+    try:
+        from hydra.attention.backends.lightning_attn3 import get_lightning_attn_func
+
+        return get_lightning_attn_func()
+    except Exception:
+        return None
 
 @dataclass(frozen=True)
 class HybridAttentionChoice:
@@ -72,10 +83,12 @@ class LightningAttn3Attention(nn.Module):
         use_rope: bool = True,
         max_seq_len: int = 8192,
         variant: str = "chunk_loop",
+        te_fp8_projections: bool = False,
     ):
         super().__init__()
 
-        if _lightning_attn3_func is None:
+        self._lightning_attn3_func = _get_lightning_attn3_func()
+        if self._lightning_attn3_func is None:
             raise ImportError(
                 "lightning_attn3 not found. Check hydra/kernels/lightning_attn3/ exists."
             )
@@ -89,13 +102,34 @@ class LightningAttn3Attention(nn.Module):
         self.use_rope = bool(use_rope)
         self.variant = str(variant)
 
+        self._te_fp8_projections_enabled = False
+        self._fp8_autocast = nullcontext
+
+        LinearImpl: type[nn.Module] = nn.Linear
+        if te_fp8_projections:
+            try:
+                from hydra.kernels.te_integration import (
+                    FP8_AVAILABLE,
+                    TE_AVAILABLE,
+                    TELinear,
+                    fp8_autocast,
+                )
+
+                if TE_AVAILABLE and FP8_AVAILABLE:
+                    LinearImpl = TELinear
+                    self._te_fp8_projections_enabled = True
+                    self._fp8_autocast = fp8_autocast
+            except Exception:
+                # Best-effort: keep standard projections if TE is not usable.
+                LinearImpl = nn.Linear
+
         assert dim % n_heads == 0
         assert n_heads % self.n_kv_heads == 0
 
-        self.q_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
+        self.q_proj = LinearImpl(dim, n_heads * self.head_dim, bias=False)
+        self.k_proj = LinearImpl(dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = LinearImpl(dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.o_proj = LinearImpl(n_heads * self.head_dim, dim, bias=False)
 
         if self.use_rope:
             self.rope = RotaryEmbedding(self.head_dim, max_seq_len)
@@ -106,9 +140,15 @@ class LightningAttn3Attention(nn.Module):
 
         b, s, _ = x.shape
 
-        q = self.q_proj(x).view(b, s, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(b, s, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(b, s, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        if self._te_fp8_projections_enabled:
+            with self._fp8_autocast(enabled=True):
+                q = self.q_proj(x).view(b, s, self.n_heads, self.head_dim).transpose(1, 2)
+                k = self.k_proj(x).view(b, s, self.n_kv_heads, self.head_dim).transpose(1, 2)
+                v = self.v_proj(x).view(b, s, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        else:
+            q = self.q_proj(x).view(b, s, self.n_heads, self.head_dim).transpose(1, 2)
+            k = self.k_proj(x).view(b, s, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            v = self.v_proj(x).view(b, s, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         if self.use_rope:
             q = self.rope(q, s)
@@ -124,7 +164,7 @@ class LightningAttn3Attention(nn.Module):
             )
 
         try:
-            out = _lightning_attn3_func(q, k, v, s=None, variant=self.variant)
+            out = self._lightning_attn3_func(q, k, v, s=None, variant=self.variant)
         except AssertionError as e:
             # The kernel asserts on supported head/value dims.
             raise RuntimeError(
@@ -134,6 +174,11 @@ class LightningAttn3Attention(nn.Module):
 
         out = out.transpose(1, 2).contiguous().view(b, s, self.n_heads * self.head_dim)
         out = self.dropout(out)
+
+        if self._te_fp8_projections_enabled:
+            with self._fp8_autocast(enabled=True):
+                return self.o_proj(out)
+
         return self.o_proj(out)
 
 
@@ -169,6 +214,7 @@ def build_hybrid_attention_module(
             use_rope=use_rope,
             max_seq_len=max_seq_len,
             variant=str(attention_kwargs.get("lla3_variant", "chunk_loop")),
+            te_fp8_projections=bool(attention_kwargs.get("te_fp8_projections", False)),
         )
 
     raise ValueError(

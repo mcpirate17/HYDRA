@@ -14,7 +14,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from hydra.model.ccgqa import (
+from hydra.model.framework import (
     CCGQAModel,
     CCGQAMoDMoRModel,
     create_ccgqa_model,

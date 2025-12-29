@@ -35,7 +35,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 if TYPE_CHECKING:
-    from hydra.model.ccgqa import CCGQAMoDMoRModel
+    from hydra.model.framework import HydraModel
 
 
 @dataclass
@@ -71,7 +71,7 @@ def _reset_peak_mem(device: str) -> None:
         torch.cuda.reset_peak_memory_stats()
 
 
-def _get_first_layer_stats(model: CCGQAMoDMoRModel) -> Dict[str, Any]:
+def _get_first_layer_stats(model: HydraModel) -> Dict[str, Any]:
     # Use compile-disabled helpers.
     layer0 = model.layers[0]
     out: Dict[str, Any] = {}
@@ -212,7 +212,7 @@ def run_one(
 ) -> Dict[str, Any]:
     from hydra.kernels import fused_chunked_cross_entropy
     from hydra.kernels import get_kernel_status
-    from hydra.model.ccgqa import CCGQAMoDMoRModel
+    from hydra.model.framework import HydraModel
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -222,7 +222,7 @@ def run_one(
 
     dev = torch.device(device)
 
-    model = CCGQAMoDMoRModel(
+    model = HydraModel(
         vocab_size=cfg.vocab_size,
         dim=cfg.dim,
         n_mor_blocks=cfg.n_mor_blocks,

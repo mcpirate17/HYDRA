@@ -7,7 +7,7 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="hydra-transformer",
-    version="0.1.0",
+    version="0.2.0",
     author="HYDRA Team",
     description="Hybrid Dynamic Routing Architecture - CCGQA + MoD + MoR Transformer",
     long_description=long_description,

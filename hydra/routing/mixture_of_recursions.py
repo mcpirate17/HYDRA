@@ -325,7 +325,7 @@ class MoRRouter(BaseRouter):
             # Scale router gradients by advantage
             # Positive advantage = harder than average -> reward depth
             # Negative advantage = easier than average -> penalize depth
-            advantage_loss = -(advantage * depth_continuous).mean() * 0.1
+            advantage_loss = -(advantage * depth_continuous).mean() * float(self.config.advantage_loss_scale)
         else:
             advantage_loss = self._zero_scalar
         

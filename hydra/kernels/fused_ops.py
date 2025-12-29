@@ -31,12 +31,15 @@ Usage:
     fused_ops.USE_FUSED_ROPE = True
 """
 
+import logging
 import math
 import os
 from typing import Tuple
 
 import torch
 import torch.nn.functional as F
+
+_log = logging.getLogger(__name__)
 
 # Import torch.compiler.disable to prevent torch.compile from tracing through Triton kernels
 # This avoids double-autotuning conflicts on newer GPUs (Blackwell)
@@ -1154,15 +1157,14 @@ def benchmark_kernels(
 
 def print_benchmark_results(results: dict):
     """Pretty print benchmark results."""
-    print(f"\n{'='*60}")
-    print(f"HYDRA Kernel Benchmark Results")
-    print(f"{'='*60}")
+    _log.info("=" * 60)
+    _log.info("HYDRA Kernel Benchmark Results")
+    _log.info("=" * 60)
     
     config = results.get("config", {})
-    print(f"Config: B={config.get('batch_size')}, S={config.get('seq_len')}, "
-          f"D={config.get('dim')}, H={config.get('n_heads')}")
-    print(f"Triton Available: {results.get('triton_available')}")
-    print()
+    _log.info(f"Config: B={config.get('batch_size')}, S={config.get('seq_len')}, "
+              f"D={config.get('dim')}, H={config.get('n_heads')}")
+    _log.info(f"Triton Available: {results.get('triton_available')}")
     
     for name in ["rope", "qk_norm", "swiglu", "rms_norm"]:
         if name in results:
@@ -1171,20 +1173,20 @@ def print_benchmark_results(results: dict):
             triton_ms = r.get("triton_ms")
             speedup = r.get("speedup")
             
-            print(f"{name.upper()}:")
-            print(f"  PyTorch: {pytorch_ms:.3f} ms")
+            _log.info(f"{name.upper()}:")
+            _log.info(f"  PyTorch: {pytorch_ms:.3f} ms")
             if triton_ms is not None:
-                print(f"  Triton:  {triton_ms:.3f} ms")
-                print(f"  Speedup: {speedup:.2f}x")
+                _log.info(f"  Triton:  {triton_ms:.3f} ms")
+                _log.info(f"  Speedup: {speedup:.2f}x")
             else:
-                print(f"  Triton:  N/A")
-            print()
+                _log.info(f"  Triton:  N/A")
 
 
 if __name__ == "__main__":
-    print("HYDRA Triton Kernel Status:")
+    logging.basicConfig(level=logging.INFO)
+    _log.info("HYDRA Triton Kernel Status:")
     for k, v in get_kernel_status().items():
-        print(f"  {k}: {v}")
+        _log.info(f"  {k}: {v}")
     
     results = benchmark_kernels()
     print_benchmark_results(results)

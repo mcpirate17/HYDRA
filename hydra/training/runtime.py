@@ -49,10 +49,7 @@ def configure_runtime() -> dict:
         LIGER_AVAILABLE,
         patch_hydra_with_liger,
     )
-    from hydra.layers.common import (
-        FLASH_ATTN_AVAILABLE,
-        set_attention_backend,
-    )
+    from hydra.layers import FLASH_ATTN_AVAILABLE, set_attention_backend
 
     if LIGER_AVAILABLE:
         patch_hydra_with_liger()

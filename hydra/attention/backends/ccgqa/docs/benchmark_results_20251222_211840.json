@@ -1,0 +1,382 @@
+{
+  "timestamp": "2025-12-22T21:18:40.971036",
+  "gpu_info": {
+    "name": "NVIDIA GeForce RTX 5090",
+    "compute_capability": "12.0",
+    "memory_gb": 33.7
+  },
+  "config": {
+    "batch_size": 4,
+    "n_heads": 8,
+    "n_kv_heads": 2,
+    "head_dim": 64,
+    "dim": 512,
+    "compression_factor": 4,
+    "dtype": "torch.bfloat16",
+    "warmup_iters": 20,
+    "bench_iters": 50,
+    "seq_lengths": [
+      512,
+      1024,
+      2048,
+      4096,
+      8192,
+      16384
+    ],
+    "device": "cuda"
+  },
+  "results": [
+    {
+      "kernel": "CCGQA Original (Unfused)",
+      "fwd_time_ms": 0.4526,
+      "bwd_time_ms": 0.7347,
+      "total_time_ms": 1.1873,
+      "throughput_iters_per_sec": 842.2,
+      "peak_memory_mb": 34.9,
+      "success": true,
+      "seq_len": 512
+    },
+    {
+      "kernel": "CCGQA2 (Fused Path)",
+      "fwd_time_ms": 0.4197,
+      "bwd_time_ms": 0.7192,
+      "total_time_ms": 1.1389,
+      "throughput_iters_per_sec": 878.1,
+      "peak_memory_mb": 34.3,
+      "success": true,
+      "seq_len": 512
+    },
+    {
+      "kernel": "GQA-Ref",
+      "fwd_time_ms": 0.1223,
+      "bwd_time_ms": 0.2974,
+      "total_time_ms": 0.4197,
+      "throughput_iters_per_sec": 2382.4,
+      "peak_memory_mb": 99.1,
+      "success": true,
+      "seq_len": 512
+    },
+    {
+      "kernel": "MHA-Ref",
+      "fwd_time_ms": 0.1717,
+      "bwd_time_ms": 0.2845,
+      "total_time_ms": 0.4562,
+      "throughput_iters_per_sec": 2192.2,
+      "peak_memory_mb": 103.3,
+      "success": true,
+      "seq_len": 512
+    },
+    {
+      "kernel": "PyTorch-SDPA",
+      "fwd_time_ms": 0.0461,
+      "bwd_time_ms": 0.0824,
+      "total_time_ms": 0.1284,
+      "throughput_iters_per_sec": 7786.1,
+      "peak_memory_mb": 61.5,
+      "success": true,
+      "seq_len": 512
+    },
+    {
+      "kernel": "FlashAttn-2",
+      "fwd_time_ms": 0.0462,
+      "bwd_time_ms": 0.1098,
+      "total_time_ms": 0.156,
+      "throughput_iters_per_sec": 6410.1,
+      "peak_memory_mb": 57.3,
+      "success": true,
+      "seq_len": 512
+    },
+    {
+      "kernel": "CCGQA Original (Unfused)",
+      "fwd_time_ms": 0.4467,
+      "bwd_time_ms": 0.8753,
+      "total_time_ms": 1.322,
+      "throughput_iters_per_sec": 756.4,
+      "peak_memory_mb": 62.1,
+      "success": true,
+      "seq_len": 1024
+    },
+    {
+      "kernel": "CCGQA2 (Fused Path)",
+      "fwd_time_ms": 0.4283,
+      "bwd_time_ms": 0.8654,
+      "total_time_ms": 1.2937,
+      "throughput_iters_per_sec": 773.0,
+      "peak_memory_mb": 59.0,
+      "success": true,
+      "seq_len": 1024
+    },
+    {
+      "kernel": "GQA-Ref",
+      "fwd_time_ms": 0.3401,
+      "bwd_time_ms": 0.7238,
+      "total_time_ms": 1.0638,
+      "throughput_iters_per_sec": 940.0,
+      "peak_memory_mb": 315.2,
+      "success": true,
+      "seq_len": 1024
+    },
+    {
+      "kernel": "MHA-Ref",
+      "fwd_time_ms": 0.3993,
+      "bwd_time_ms": 0.7864,
+      "total_time_ms": 1.1857,
+      "throughput_iters_per_sec": 843.4,
+      "peak_memory_mb": 315.2,
+      "success": true,
+      "seq_len": 1024
+    },
+    {
+      "kernel": "PyTorch-SDPA",
+      "fwd_time_ms": 0.0963,
+      "bwd_time_ms": 0.1824,
+      "total_time_ms": 0.2786,
+      "throughput_iters_per_sec": 3589.1,
+      "peak_memory_mb": 97.3,
+      "success": true,
+      "seq_len": 1024
+    },
+    {
+      "kernel": "FlashAttn-2",
+      "fwd_time_ms": 0.0819,
+      "bwd_time_ms": 0.2242,
+      "total_time_ms": 0.3061,
+      "throughput_iters_per_sec": 3266.8,
+      "peak_memory_mb": 89.0,
+      "success": true,
+      "seq_len": 1024
+    },
+    {
+      "kernel": "CCGQA Original (Unfused)",
+      "fwd_time_ms": 0.5049,
+      "bwd_time_ms": 1.0233,
+      "total_time_ms": 1.5282,
+      "throughput_iters_per_sec": 654.4,
+      "peak_memory_mb": 94.5,
+      "success": true,
+      "seq_len": 2048
+    },
+    {
+      "kernel": "CCGQA2 (Fused Path)",
+      "fwd_time_ms": 0.4882,
+      "bwd_time_ms": 1.0083,
+      "total_time_ms": 1.4965,
+      "throughput_iters_per_sec": 668.2,
+      "peak_memory_mb": 88.3,
+      "success": true,
+      "seq_len": 2048
+    },
+    {
+      "kernel": "GQA-Ref",
+      "fwd_time_ms": 1.4418,
+      "bwd_time_ms": 2.8753,
+      "total_time_ms": 4.3171,
+      "throughput_iters_per_sec": 231.6,
+      "peak_memory_mb": 1141.6,
+      "success": true,
+      "seq_len": 2048
+    },
+    {
+      "kernel": "MHA-Ref",
+      "fwd_time_ms": 1.5695,
+      "bwd_time_ms": 3.0183,
+      "total_time_ms": 4.5877,
+      "throughput_iters_per_sec": 218.0,
+      "peak_memory_mb": 1141.6,
+      "success": true,
+      "seq_len": 2048
+    },
+    {
+      "kernel": "PyTorch-SDPA",
+      "fwd_time_ms": 0.2586,
+      "bwd_time_ms": 0.5656,
+      "total_time_ms": 0.8242,
+      "throughput_iters_per_sec": 1213.3,
+      "peak_memory_mb": 169.0,
+      "success": true,
+      "seq_len": 2048
+    },
+    {
+      "kernel": "FlashAttn-2",
+      "fwd_time_ms": 0.2529,
+      "bwd_time_ms": 0.5636,
+      "total_time_ms": 0.8165,
+      "throughput_iters_per_sec": 1224.8,
+      "peak_memory_mb": 152.3,
+      "success": true,
+      "seq_len": 2048
+    },
+    {
+      "kernel": "CCGQA Original (Unfused)",
+      "fwd_time_ms": 0.692,
+      "bwd_time_ms": 1.4815,
+      "total_time_ms": 2.1735,
+      "throughput_iters_per_sec": 460.1,
+      "peak_memory_mb": 165.8,
+      "success": true,
+      "seq_len": 4096
+    },
+    {
+      "kernel": "CCGQA2 (Fused Path)",
+      "fwd_time_ms": 0.6654,
+      "bwd_time_ms": 1.4976,
+      "total_time_ms": 2.163,
+      "throughput_iters_per_sec": 462.3,
+      "peak_memory_mb": 153.2,
+      "success": true,
+      "seq_len": 4096
+    },
+    {
+      "kernel": "GQA-Ref",
+      "fwd_time_ms": 5.3772,
+      "bwd_time_ms": 9.6834,
+      "total_time_ms": 15.0605,
+      "throughput_iters_per_sec": 66.4,
+      "peak_memory_mb": 4405.0,
+      "success": true,
+      "seq_len": 4096
+    },
+    {
+      "kernel": "MHA-Ref",
+      "fwd_time_ms": 5.6166,
+      "bwd_time_ms": 9.9021,
+      "total_time_ms": 15.5187,
+      "throughput_iters_per_sec": 64.4,
+      "peak_memory_mb": 4405.0,
+      "success": true,
+      "seq_len": 4096
+    },
+    {
+      "kernel": "PyTorch-SDPA",
+      "fwd_time_ms": 0.7939,
+      "bwd_time_ms": 1.9509,
+      "total_time_ms": 2.7448,
+      "throughput_iters_per_sec": 364.3,
+      "peak_memory_mb": 312.4,
+      "success": true,
+      "seq_len": 4096
+    },
+    {
+      "kernel": "FlashAttn-2",
+      "fwd_time_ms": 0.7691,
+      "bwd_time_ms": 1.9203,
+      "total_time_ms": 2.6894,
+      "throughput_iters_per_sec": 371.8,
+      "peak_memory_mb": 278.9,
+      "success": true,
+      "seq_len": 4096
+    },
+    {
+      "kernel": "CCGQA Original (Unfused)",
+      "fwd_time_ms": 1.4061,
+      "bwd_time_ms": 3.4342,
+      "total_time_ms": 4.8403,
+      "throughput_iters_per_sec": 206.6,
+      "peak_memory_mb": 297.5,
+      "success": true,
+      "seq_len": 8192
+    },
+    {
+      "kernel": "CCGQA2 (Fused Path)",
+      "fwd_time_ms": 1.3901,
+      "bwd_time_ms": 3.3828,
+      "total_time_ms": 4.7729,
+      "throughput_iters_per_sec": 209.5,
+      "peak_memory_mb": 272.6,
+      "success": true,
+      "seq_len": 8192
+    },
+    {
+      "kernel": "GQA-Ref",
+      "fwd_time_ms": 20.2911,
+      "bwd_time_ms": 37.9186,
+      "total_time_ms": 58.2096,
+      "throughput_iters_per_sec": 17.2,
+      "peak_memory_mb": 17374.3,
+      "success": true,
+      "seq_len": 8192
+    },
+    {
+      "kernel": "MHA-Ref",
+      "fwd_time_ms": 20.6556,
+      "bwd_time_ms": 38.1763,
+      "total_time_ms": 58.8319,
+      "throughput_iters_per_sec": 17.0,
+      "peak_memory_mb": 17374.3,
+      "success": true,
+      "seq_len": 8192
+    },
+    {
+      "kernel": "PyTorch-SDPA",
+      "fwd_time_ms": 2.8121,
+      "bwd_time_ms": 7.1338,
+      "total_time_ms": 9.9459,
+      "throughput_iters_per_sec": 100.5,
+      "peak_memory_mb": 599.2,
+      "success": true,
+      "seq_len": 8192
+    },
+    {
+      "kernel": "FlashAttn-2",
+      "fwd_time_ms": 2.7514,
+      "bwd_time_ms": 7.0222,
+      "total_time_ms": 9.7736,
+      "throughput_iters_per_sec": 102.3,
+      "peak_memory_mb": 532.1,
+      "success": true,
+      "seq_len": 8192
+    },
+    {
+      "kernel": "CCGQA Original (Unfused)",
+      "fwd_time_ms": 3.9482,
+      "bwd_time_ms": 9.6666,
+      "total_time_ms": 13.6148,
+      "throughput_iters_per_sec": 73.4,
+      "peak_memory_mb": 569.4,
+      "success": true,
+      "seq_len": 16384
+    },
+    {
+      "kernel": "CCGQA2 (Fused Path)",
+      "fwd_time_ms": 3.9156,
+      "bwd_time_ms": 9.6668,
+      "total_time_ms": 13.5824,
+      "throughput_iters_per_sec": 73.6,
+      "peak_memory_mb": 519.5,
+      "success": true,
+      "seq_len": 16384
+    },
+    {
+      "kernel": "GQA-Ref",
+      "error": "CUDA out of memory. Tried to allocate 16.00 GiB. GPU 0 has a total capacity of 31.36 GiB of which 13.73 GiB is free. Including non-PyTorch memory, this process has 17.17 GiB memory in use. Of the allocated memory 16.34 GiB is allocated by PyTorch, and 220.79 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)",
+      "success": false,
+      "seq_len": 16384
+    },
+    {
+      "kernel": "MHA-Ref",
+      "error": "CUDA out of memory. Tried to allocate 16.00 GiB. GPU 0 has a total capacity of 31.36 GiB of which 13.73 GiB is free. Including non-PyTorch memory, this process has 17.17 GiB memory in use. Of the allocated memory 16.40 GiB is allocated by PyTorch, and 158.79 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)",
+      "success": false,
+      "seq_len": 16384
+    },
+    {
+      "kernel": "PyTorch-SDPA",
+      "fwd_time_ms": 10.5613,
+      "bwd_time_ms": 26.8815,
+      "total_time_ms": 37.4428,
+      "throughput_iters_per_sec": 26.7,
+      "peak_memory_mb": 1169.4,
+      "success": true,
+      "seq_len": 16384
+    },
+    {
+      "kernel": "FlashAttn-2",
+      "fwd_time_ms": 10.4406,
+      "bwd_time_ms": 26.9709,
+      "total_time_ms": 37.4114,
+      "throughput_iters_per_sec": 26.7,
+      "peak_memory_mb": 1035.2,
+      "success": true,
+      "seq_len": 16384
+    }
+  ]
+}

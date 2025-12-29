@@ -44,7 +44,7 @@ torch._dynamo.config.allow_unspec_int_on_nn_module = True
 torch._dynamo.config.cache_size_limit = 64
 torch._dynamo.config.recompile_limit = 32
 
-from hydra.model.ccgqa import CCGQAMoDMoRModel
+from hydra.model.framework import CCGQAMoDMoRModel
 from hydra.kernels import get_kernel_status
 
 

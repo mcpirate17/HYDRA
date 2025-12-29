@@ -26,19 +26,19 @@ class TestImports:
     """Verify all expected imports work."""
     
     def test_import_lightning_attn_func(self):
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         assert callable(lightning_attn_func)
     
     def test_import_no_decay_kernel(self):
-        from hydra.kernels.lightning_attn3.ops.triton import lightning_attn3_no_decay
+        from hydra.attention.backends.lightning_attn3.ops.triton import lightning_attn3_no_decay
         assert lightning_attn3_no_decay is not None
     
     def test_import_decay_kernel(self):
-        from hydra.kernels.lightning_attn3.ops.triton import lightning_attn3
+        from hydra.attention.backends.lightning_attn3.ops.triton import lightning_attn3
         assert lightning_attn3 is not None
     
     def test_import_parallel_kernel(self):
-        from hydra.kernels.lightning_attn3.ops.triton import lightning_attn3_parallel
+        from hydra.attention.backends.lightning_attn3.ops.triton import lightning_attn3_parallel
         assert lightning_attn3_parallel is not None
 
 
@@ -49,7 +49,7 @@ class TestBlackwellTileSelection:
         """Verify _BWD_KERNEL_CACHE exists in no_decay module."""
         import importlib
         no_decay_module = importlib.import_module(
-            'hydra.kernels.lightning_attn3.ops.triton.lightning_attn3_no_decay'
+            'hydra.attention.backends.lightning_attn3.ops.triton.lightning_attn3_no_decay'
         )
         assert hasattr(no_decay_module, '_BWD_KERNEL_CACHE')
     
@@ -57,17 +57,17 @@ class TestBlackwellTileSelection:
         """Verify _BWD_TILE_CACHE exists in decay module."""
         import importlib
         decay_module = importlib.import_module(
-            'hydra.kernels.lightning_attn3.ops.triton.lightning_attn3'
+            'hydra.attention.backends.lightning_attn3.ops.triton.lightning_attn3'
         )
         assert hasattr(decay_module, '_BWD_TILE_CACHE')
     
     def test_kernel_cache_populated_after_backward(self):
         """Verify _BWD_KERNEL_CACHE is populated after a backward pass."""
         import importlib
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         no_decay_module = importlib.import_module(
-            'hydra.kernels.lightning_attn3.ops.triton.lightning_attn3_no_decay'
+            'hydra.attention.backends.lightning_attn3.ops.triton.lightning_attn3_no_decay'
         )
         
         # Run a backward pass to populate the cache
@@ -94,10 +94,10 @@ class TestBlackwellTileSelection:
     def test_blackwell_kernel_selection(self):
         """Test that Blackwell GPUs get chunked kernel after backward pass."""
         import importlib
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         no_decay_module = importlib.import_module(
-            'hydra.kernels.lightning_attn3.ops.triton.lightning_attn3_no_decay'
+            'hydra.attention.backends.lightning_attn3.ops.triton.lightning_attn3_no_decay'
         )
         
         # Run backward to populate cache
@@ -138,7 +138,7 @@ class TestForwardPass:
     
     def test_forward_basic(self, qkv_tensors):
         """Basic forward pass with standard shapes."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         q, k, v = qkv_tensors
         out = lightning_attn_func(q, k, v)
@@ -151,7 +151,7 @@ class TestForwardPass:
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_forward_dtypes(self, dtype):
         """Test forward pass with different dtypes."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         B, H, N, D = 2, 4, 128, 64
         q = torch.randn(B, H, N, D, device='cuda', dtype=dtype)
@@ -164,7 +164,7 @@ class TestForwardPass:
     @pytest.mark.parametrize("N", [64, 128, 256, 512, 1024])
     def test_forward_sequence_lengths(self, N):
         """Test forward pass with various sequence lengths."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         B, H, D = 2, 4, 64
         q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16)
@@ -177,7 +177,7 @@ class TestForwardPass:
     @pytest.mark.parametrize("D", [32, 64, 128])
     def test_forward_head_dims(self, D):
         """Test forward pass with various head dimensions."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         B, H, N = 2, 4, 256
         q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16)
@@ -189,7 +189,7 @@ class TestForwardPass:
     
     def test_forward_large_head_dim_splitting(self):
         """Test head-splitting for D > 128."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         B, H, N, D = 2, 4, 128, 192  # D > 128 triggers splitting
         q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16)
@@ -201,7 +201,7 @@ class TestForwardPass:
     
     def test_forward_non_power_of_2_value_dim(self):
         """Test value padding for non-power-of-2 E."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         B, H, N, D, E = 2, 4, 128, 64, 48  # E=48 not power of 2
         q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16)
@@ -217,7 +217,7 @@ class TestBackwardPass:
     
     def test_backward_basic(self):
         """Basic backward pass with gradient computation."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         B, H, N, D = 2, 4, 128, 64
         q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16, requires_grad=True)
@@ -242,7 +242,7 @@ class TestBackwardPass:
     
     def test_backward_gradient_flow(self):
         """Verify gradients actually flow (non-zero)."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         B, H, N, D = 2, 4, 128, 64
         q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16, requires_grad=True)
@@ -261,7 +261,7 @@ class TestBackwardPass:
     @pytest.mark.parametrize("N", [128, 256, 512])
     def test_backward_sequence_lengths(self, N):
         """Test backward pass with various sequence lengths."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         B, H, D = 2, 4, 64
         q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16, requires_grad=True)
@@ -279,7 +279,7 @@ class TestBackwardPass:
     @pytest.mark.slow
     def test_backward_large_sequence(self):
         """Test backward pass with large sequence (stress test)."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         B, H, N, D = 1, 8, 4096, 64
         q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16, requires_grad=True)
@@ -299,7 +299,7 @@ class TestDecayVariant:
     
     def test_decay_forward(self):
         """Test forward pass with decay."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         B, H, N, D = 2, 4, 64, 64  # Shorter sequence for stability
         q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16) * 0.1
@@ -315,7 +315,7 @@ class TestDecayVariant:
     
     def test_decay_backward(self):
         """Test backward pass with decay."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         B, H, N, D = 2, 4, 64, 64
         q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16, requires_grad=True)
@@ -337,7 +337,7 @@ class TestDecayVariant:
     
     def test_parallel_variant(self):
         """Test parallel variant with decay."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         B, H, N, D = 2, 4, 64, 64
         q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16) * 0.1
@@ -355,7 +355,7 @@ class TestNumericalStability:
     
     def test_small_values(self):
         """Test with small input values."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         B, H, N, D = 2, 4, 128, 64
         scale = 1e-3
@@ -370,7 +370,7 @@ class TestNumericalStability:
     
     def test_large_values(self):
         """Test with moderately larger input values (within fp16 safe range)."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         B, H, N, D = 2, 4, 128, 64
         scale = 2.0  # Moderate scale - 10.0 causes fp16 overflow with cumulative ops
@@ -385,7 +385,7 @@ class TestNumericalStability:
     
     def test_determinism(self):
         """Test that same inputs produce same outputs."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         
         B, H, N, D = 2, 4, 128, 64
         
@@ -406,7 +406,7 @@ class TestIntegration:
     def test_hydra_imports(self):
         """Verify HYDRA model files can import lightning_attn3."""
         from hydra.model.hybrid_attention_variants import LightningAttn2Attention
-        from hydra.model.ccgqa import CCGQAMoDMoRModel
+        from hydra.model.framework import CCGQAMoDMoRModel
         
         assert LightningAttn2Attention is not None
         assert CCGQAMoDMoRModel is not None
@@ -435,7 +435,7 @@ class TestBenchmarks:
     @pytest.mark.slow
     def test_forward_throughput(self):
         """Measure forward pass throughput."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         import time
         
         B, H, N, D = 4, 8, 2048, 64
@@ -463,7 +463,7 @@ class TestBenchmarks:
     @pytest.mark.slow
     def test_backward_throughput(self):
         """Measure forward+backward pass throughput."""
-        from hydra.kernels.lightning_attn3.ops import lightning_attn_func
+        from hydra.attention.backends.lightning_attn3.ops import lightning_attn_func
         import time
         
         B, H, N, D = 4, 8, 2048, 64
@@ -499,12 +499,12 @@ class TestChunkedBackward:
     
     def test_import_chunked_kernel(self):
         """Verify chunked kernel import."""
-        from hydra.kernels.lightning_attn3.ops.triton import lightning_attn3_no_decay_chunked
+        from hydra.attention.backends.lightning_attn3.ops.triton import lightning_attn3_no_decay_chunked
         assert callable(lightning_attn3_no_decay_chunked)
     
     def test_validate_config(self):
         """Test SRAM budget validation."""
-        from hydra.kernels.lightning_attn3.ops.triton.lightning_attn3_no_decay_chunked import (
+        from hydra.attention.backends.lightning_attn3.ops.triton.lightning_attn3_no_decay_chunked import (
             validate_config, SRAM_BUDGET
         )
         
@@ -520,7 +520,7 @@ class TestChunkedBackward:
     
     def test_chunked_forward_basic(self):
         """Test basic forward pass through chunked kernel."""
-        from hydra.kernels.lightning_attn3.ops.triton import lightning_attn3_no_decay_chunked
+        from hydra.attention.backends.lightning_attn3.ops.triton import lightning_attn3_no_decay_chunked
         
         B, H, N, D = 2, 4, 128, 64
         q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16)
@@ -536,7 +536,7 @@ class TestChunkedBackward:
     
     def test_chunked_backward_basic(self):
         """Test basic backward pass."""
-        from hydra.kernels.lightning_attn3.ops.triton import lightning_attn3_no_decay_chunked
+        from hydra.attention.backends.lightning_attn3.ops.triton import lightning_attn3_no_decay_chunked
         
         B, H, N, D = 2, 4, 128, 64
         q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16, requires_grad=True)
@@ -562,7 +562,7 @@ class TestChunkedBackward:
     
     def test_chunked_gradient_flow(self):
         """Ensure gradients flow through all inputs."""
-        from hydra.kernels.lightning_attn3.ops.triton import lightning_attn3_no_decay_chunked
+        from hydra.attention.backends.lightning_attn3.ops.triton import lightning_attn3_no_decay_chunked
         
         B, H, N, D = 2, 4, 256, 64
         q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16, requires_grad=True)
@@ -581,7 +581,7 @@ class TestChunkedBackward:
     @pytest.mark.parametrize("N", [64, 128, 256, 512])
     def test_chunked_sequence_lengths(self, N):
         """Test chunked kernel with various sequence lengths."""
-        from hydra.kernels.lightning_attn3.ops.triton import lightning_attn3_no_decay_chunked
+        from hydra.attention.backends.lightning_attn3.ops.triton import lightning_attn3_no_decay_chunked
         
         B, H, D = 2, 4, 64
         q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16, requires_grad=True)
@@ -599,7 +599,7 @@ class TestChunkedBackward:
     @pytest.mark.parametrize("D", [32, 64, 128])
     def test_chunked_head_dims(self, D):
         """Test chunked kernel with various head dimensions."""
-        from hydra.kernels.lightning_attn3.ops.triton import lightning_attn3_no_decay_chunked
+        from hydra.attention.backends.lightning_attn3.ops.triton import lightning_attn3_no_decay_chunked
         
         B, H, N = 2, 4, 128
         q = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16, requires_grad=True)
@@ -616,7 +616,7 @@ class TestChunkedBackward:
     
     def test_chunked_determinism(self):
         """Test that chunked kernel produces deterministic results."""
-        from hydra.kernels.lightning_attn3.ops.triton import lightning_attn3_no_decay_chunked
+        from hydra.attention.backends.lightning_attn3.ops.triton import lightning_attn3_no_decay_chunked
         
         torch.manual_seed(42)
         B, H, N, D = 2, 4, 128, 64

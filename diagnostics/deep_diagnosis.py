@@ -19,7 +19,7 @@ import sys
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from hydra.model.ccgqa import create_ccgqa_mod_mor_model
+from hydra.model.framework import create_hydra_model
 
 # Device selection with CPU fallback
 if torch.cuda.is_available():
@@ -49,7 +49,7 @@ config = {
 }
 
 print("Creating 570M model...")
-model = create_ccgqa_mod_mor_model(**config).to(device)
+model = create_hydra_model(**config).to(device)
 
 # Create batch
 batch_size = 4

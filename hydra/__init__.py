@@ -14,7 +14,7 @@ Paper references:
 
 __version__ = "0.2.0"  # Updated with optimizations
 
-from .model.ccgqa import (
+from .model.framework import (
     CCGQAAttention,
     CCGQABlock,
     CCGQAMoRBlock,
@@ -40,19 +40,6 @@ from .kernels import (
     set_use_triton_kernels,
 )
 
-# Optimization module (optional import - requires optuna)
-try:
-    from .optimization import (
-        optimize_mlp_hyperparams,
-        optimize_attention_hyperparams,
-        optimize_norm_hyperparams,
-        optimize_all_components,
-    )
-
-    _HAS_OPTIMIZATION = True
-except ImportError:
-    _HAS_OPTIMIZATION = False
-
 __all__ = [
     # Models
     "CCGQAAttention",
@@ -74,14 +61,4 @@ __all__ = [
     "get_kernel_status",
     "set_use_triton_kernels",
 ]
-
-if _HAS_OPTIMIZATION:
-    __all__.extend(
-        [
-            "optimize_mlp_hyperparams",
-            "optimize_attention_hyperparams",
-            "optimize_norm_hyperparams",
-            "optimize_all_components",
-        ]
-    )
 

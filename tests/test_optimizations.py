@@ -359,6 +359,9 @@ class TestIntegration:
             fused_rms_norm,
             TRITON_AVAILABLE,
         )
+
+        if not TRITON_AVAILABLE:
+            pytest.skip("Triton kernels unavailable in this environment")
         
         assert fused_rope is not None
         assert fused_swiglu is not None

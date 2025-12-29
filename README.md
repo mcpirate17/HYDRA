@@ -1,9 +1,5 @@
 # HYDRA: Hybrid Dynamic Routing Architecture
 
-<p align="center">
-  <img src="docs/hydra_architecture.png" alt="HYDRA Architecture" width="600">
-</p>
-
 > **A scalable transformer architecture combining Compressed Convolutional Grouped Query Attention (CCGQA), Mixture-of-Depths (MoD), and Mixture-of-Recursions (MoR) for efficient and adaptive language modeling.**
 
 ---
@@ -95,6 +91,8 @@ HYDRA supports multiple scales optimized for different GPU memory budgets:
 
 | Variant | Parameters | Dim | MoR Blocks × Rec | Eff Layers | GPU Memory | Status |
 |---------|------------|-----|------------------|------------|------------|--------|
+| **debug** | ~33M | 512 | 2 × 2 | 4 | ~4GB | ✅ Fast iteration |
+| **50M** | ~50M | 512 | 8 × 3 | 24 | ~8GB | ✅ Deep & narrow |
 | **100M** | ~104M | 768 | 8 × 4 | 32 | ~14GB | ✅ Validated |
 | **250M** | ~198M | 1024 | 10 × 4 | 40 | ~18GB | ✅ Validated |
 | **500M** | ~426M | 1280 | 16 × 4 | 64 | ~22GB | ✅ Validated |
@@ -103,6 +101,40 @@ HYDRA supports multiple scales optimized for different GPU memory budgets:
 | **1.5B** | ~1,369M | 2048 | 22 × 4 | 88 | ~36GB | ⚠️ 48GB+ GPU |
 
 > **Note:** GPU memory is peak usage during training with 8-bit Adam + gradient checkpointing on RTX 5090 32GB.
+>
+> **50M "deep" config:** Designed for MoD/MoR curriculum validation. Narrow (dim=512) but deep (24 effective layers) to test dynamic routing effectiveness.
+
+---
+
+## 🔬 Attention Backend Comparison
+
+HYDRA supports two attention backends:
+
+| Backend | Type | Complexity | Best For |
+|---------|------|------------|----------|
+| **LA3** | Linear Attention | O(n) | Long sequences, memory efficiency |
+| **CCGQA** | Compressed GQA | O(n²) compressed | Better convergence, shorter sequences |
+
+### Benchmark Results (December 2024)
+
+Training comparison on `debug` model (500 steps) and `50M` model (1000 steps):
+
+| Model | Backend | Initial Loss | Final Loss | Best Loss | Reduction |
+|-------|---------|-------------|------------|-----------|-----------|
+| debug | LA3 | 10.94 | 6.37 | 6.22 | 41.8% |
+| debug | **CCGQA** | 11.29 | **5.88** | **5.69** | **47.9%** |
+| 50M | LA3 | 11.01 | 6.30 | 6.18 | 42.8% |
+| 50M | **CCGQA** | 12.69 | **5.12** | **4.95** | **59.7%** |
+
+**Key Finding:** CCGQA consistently outperforms LA3 in convergence speed and final loss quality. The 50M deep model with CCGQA achieved a 1.18-point lower final loss (5.12 vs 6.30).
+
+```bash
+# Run with CCGQA attention (recommended for < 4K sequence length)
+python trainer.py --model_size 50M --attention ccgqa --max_steps 5000
+
+# Run with LA3 attention (for long sequences or memory constraints)  
+python trainer.py --model_size 50M --attention la3 --max_steps 5000
+```
 
 ### Block Architecture
 
@@ -192,6 +224,89 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python trainer.py \
 
 > **Note:** Batch size and gradient accumulation are automatically set based on `--model_size`. Override with `--batch_size` and `--grad_accum` if needed.
 
+---
+
+## 🗄️ Local Dataset Mounts (recommended)
+
+If you store converted `.pt` shards on an external drive, avoid relying on GUI automount paths like `/media/<user>/<Drive Name>/...` (they can change, or be unavailable in non-GUI sessions).
+
+HYDRA will use these environment variables when present:
+- `HYDRA_DATA_ROOT`: A stable parent directory that contains `hydra_small_chat_pt/`, `hydra_nemotron_pt/`, and optionally `hf_finefineweb/`.
+- `HYDRA_SMALL_CHAT_PT_DIR`: Explicit path to `hydra_small_chat_pt`.
+- `HYDRA_NEMOTRON_PT_DIR`: Explicit path to `hydra_nemotron_pt`.
+
+### Option A: Mount the drive to a stable path (best)
+
+1) Find the drive UUID + filesystem type:
+```bash
+lsblk -f
+```
+
+2) Create a mount point (example):
+```bash
+sudo mkdir -p /mnt/hydra_data
+```
+
+3) Add an `/etc/fstab` entry using the UUID (edit with `sudo nano /etc/fstab`). Examples:
+
+- **ext4**:
+```text
+UUID=<YOUR_UUID>  /mnt/hydra_data  ext4  defaults,nofail  0  2
+```
+
+- **exFAT** (common for portable SSDs):
+```text
+UUID=<YOUR_UUID>  /mnt/hydra_data  exfat  defaults,nofail,uid=1000,gid=1000,umask=022  0  0
+```
+
+4) Mount it:
+```bash
+sudo mount -a
+```
+
+5) Point HYDRA at the stable location:
+```bash
+export HYDRA_DATA_ROOT=/mnt/hydra_data
+```
+
+You can put the `export` into `~/.bashrc` or `~/.profile` to make it permanent.
+
+### Option B: Symlink (quick, but less robust)
+
+If you don’t want to edit `fstab`, you can symlink the expected default paths to your current mount:
+```bash
+sudo mkdir -p /mnt/nvme0
+sudo ln -s "/media/<user>/<Drive Name>/hydra_small_chat_pt" /mnt/nvme0/hydra_small_chat_pt
+sudo ln -s "/media/<user>/<Drive Name>/hydra_nemotron_pt" /mnt/nvme0/hydra_nemotron_pt
+```
+
+---
+
+## ⚡ Optional FP8 (Transformer Engine)
+
+HYDRA includes optional integration with NVIDIA Transformer Engine (TE) to run **FP8** for *Linear projections* when available.
+
+- Default is **OFF** to avoid surprising numeric changes and because TE requires extra dependencies and Hopper+ GPUs.
+- When enabled and supported, HYDRA will use TE’s `fp8_autocast` + `TELinear` for the LA3 adapter’s `q/k/v/o` projections.
+
+Requirements:
+- Hopper+ GPU (sm_90+) and CUDA 12+
+- `pip install transformer-engine[pytorch]`
+
+Enable for the LA3 adapter (opt-in):
+- Set `te_fp8_projections=True` via the attention kwargs path (see [hydra/model/hybrid_attention_variants.py](hydra/model/hybrid_attention_variants.py)).
+
+Note:
+- This only affects projection layers; the LA3 Triton attention kernels still run in fp16/bf16.
+
+## 🧭 Hybrid Attention Routing
+
+The MoD+MoR model uses a fixed layerwise attention pattern by default:
+- 3× `lla3` blocks then 1× `ccqa` block (repeat every 4 blocks)
+
+You can disable the hybrid routing and force all blocks to use compressed attention:
+- Set `hybrid_attention=False` when constructing `CCGQAMoDMoRModel` (then all blocks use `ccqa`).
+
 ### Stepped Sequence Training (Advanced)
 
 For 1B model with longer context, use stepped sequence scheduling:
@@ -247,31 +362,102 @@ For 1B model with longer context, use stepped sequence scheduling:
 HYDRA/
 ├── hydra/                    # Main package
 │   ├── __init__.py          # Package exports
-│   ├── model/               # Core model components
-│   │   ├── __init__.py
-│   │   └── ccgqa.py         # CCGQA + MoD + MoR implementation
-│   └── routing/             # Routing modules (MoD, MoR)
-│       └── __init__.py
-├── tests/                   # Test suite
-│   ├── __init__.py
-│   └── test_paper_compliance.py  # 64 compliance tests
-├── diagnostics/             # Scaling and compliance tools
-│   ├── __init__.py
-│   ├── scaling_analysis.py  # Multi-scale curve fitting
-│   ├── run_variant_diagnostics.py
-│   └── deep_diagnosis.py
+│   ├── logging.py           # Logging utilities
+│   ├── utils.py             # Common utilities
+│   ├── attention/           # Attention backends
+│   │   ├── backends/        
+│   │   │   ├── ccgqa/       # Compressed Convolutional GQA
+│   │   │   └── lightning_attn3/  # LA3 linear attention
+│   │   └── factory.py       # Attention factory
+│   ├── data/                # Data loading utilities
+│   ├── kernels/             # Triton/CUDA kernels
+│   ├── layers/              # Core layer implementations
+│   ├── model/               # Model components
+│   │   ├── framework/       # Model wiring (MoD/MoR + factories)
+│   │   └── ccgqa/           # Back-compat shims
+│   ├── optim/               # Optimizers and schedulers
+│   ├── routing/             # Routing modules (MoD, MoR)
+│   └── training/            # Training infrastructure
+│       ├── trainer.py       # Main trainer class
+│       ├── config.py        # Configuration dataclasses
+│       ├── checkpointing.py # Checkpoint management
+│       └── metrics.py       # Training metrics
+├── trainer.py               # Training entrypoint (CLI)
+├── scripts/                 # Utility scripts
+│   ├── compare_mod_mor_effectiveness.py  # MoD/MoR comparison
+│   └── ...
+├── tests/                   # Test suite (305 tests)
+│   └── test_paper_compliance.py  # Paper compliance tests
+├── diagnostics/             # Diagnostic and benchmarking tools
+│   ├── mod_mor_routing_healthcheck.py  # Routing health checks
+│   ├── scaling_analysis.py  # Multi-scale analysis
+│   └── ...
 ├── configs/                 # Model configurations
 │   └── variants.yaml        # Model variant definitions
 ├── reports/                 # Generated analysis reports
-│   ├── scaling_analysis.png
-│   ├── scaling_summary_table.png
-│   └── scaling_analysis_results.json
-├── docs/                    # Documentation
-│   └── ARCHITECTURE.md      # This file
-├── README.md               # Project overview
-├── pytest.ini              # Test configuration
-└── requirements.txt        # Dependencies
+├── checkpoints/             # Training checkpoints (hydra_{model_size}_*.pt)
+├── README.md                # This file
+├── pytest.ini               # Test configuration
+└── requirements.txt         # Dependencies
 ```
+
+---
+
+## 🎯 MoD/MoR Curriculum Training
+
+HYDRA uses a **curriculum approach** for MoD and MoR to ensure stable training:
+
+### MoD (Mixture of Depths) Curriculum
+
+| Phase | Step Range | Behavior |
+|-------|-----------|----------|
+| **Warmup** | 0 → 10% | MoD **disabled** (dense MLP, all tokens processed) |
+| **Loss Gate** | 10% → force% | MoD enables when CE loss EMA < 5.0 |
+| **Force Enable** | 15-20% | MoD **forced on** regardless of loss |
+| **Active** | 20% → 100% | MoD active, ~50% compute savings |
+
+### MoR (Mixture of Recursions) Curriculum
+
+| Phase | Step Range | Behavior |
+|-------|-----------|----------|
+| **Fixed Depth** | 0 → 20-30% | All tokens use maximum recursion depth |
+| **Ramp Up** | 20% → 30% | Gradually enable adaptive depth routing |
+| **Full Adaptive** | 30% → 100% | MoR decides recursion depth per-token |
+
+### Running Curriculum Experiments
+
+```bash
+# Standard curriculum (MoD@10%, MoR@30%)
+python trainer.py --model_size 50M --attention ccgqa --max_steps 5000
+
+# Override curriculum timing (for short experiments)
+python trainer.py --model_size 50M --attention ccgqa --max_steps 1000 \
+    --no_short_run_override \
+    --mod_enable_pct 0.10 --mod_force_enable_pct 0.15 \
+    --mor_enable_pct 0.20
+
+# Disable MoD/MoR (vanilla baseline)
+python trainer.py --model_size 50M --attention ccgqa --max_steps 5000 \
+    --mod_off --mor_off
+```
+
+### MoD/MoR Effectiveness Comparison
+
+Run the comprehensive comparison script to evaluate routing effectiveness:
+
+```bash
+# Full comparison: vanilla vs MoD-only vs MoR-only vs full routing
+python scripts/compare_mod_mor_effectiveness.py --model_size 50M --max_steps 5000
+
+# Quick test (1000 steps)
+python scripts/compare_mod_mor_effectiveness.py --model_size 50M --max_steps 1000 --quick
+```
+
+This generates:
+- **Loss curves** comparing all configurations
+- **MoD compute savings** per layer
+- **MoR depth histograms** (token distribution across recursion levels)
+- **Summary report** with key findings
 
 ---
 
@@ -346,7 +532,7 @@ python diagnostics/scaling_analysis.py \
 
 HYDRA uses **Lightning-Attention 3** (lla3) for efficient O(n) linear attention combined with **CCGQA** (Compressed Convolutional Grouped Query Attention).
 
-**Performance**: 7.52x faster than PyTorch SDPA at N=8192, 27% less memory. See [hydra/kernels/lightning_attn3/README.md](hydra/kernels/lightning_attn3/README.md) for benchmarks.
+**Performance**: 7.52x faster than PyTorch SDPA at N=8192, 27% less memory. See [hydra/attention/backends/lightning_attn3/README.md](hydra/attention/backends/lightning_attn3/README.md) for benchmarks.
 
 **Default pattern**: 3× Lightning-Attention blocks + 1× CCGQA block per MoR macro-block
 
@@ -498,7 +684,7 @@ MIT License - See [LICENSE](LICENSE) for details.
 
 ## 🤝 Contributing
 
-Contributions welcome! Please read [CONTRIBUTING.md](docs/CONTRIBUTING.md) first.
+Contributions welcome!
 
 ---
 
