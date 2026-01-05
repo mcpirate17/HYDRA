@@ -1,17 +1,15 @@
 """
-Benchmark HYDRA model components and full models.
+Benchmark HYDRA full models: HydraBaseModel, HydraModel (MoD+MoR), memory usage.
 
-This script provides performance benchmarking for:
-- CCGQAAttention compression metrics
-- HydraBaseModel vs baseline transformers
-- HydraModel full efficiency stack (LA3 + MoD + MoR)
+This script benchmarks complete model forward/backward passes, NOT attention kernels.
+For attention-level benchmarks, see: hydra/attention/backends/ccgqa/benchmark.py
 
 Run with:
-        python -m diagnostics.benchmark_ccgqa
+    python -m diagnostics.benchmark_hydra_models
 
 Notes:
 - REQUIRES: CUDA for full GPU benchmarks. Running on CPU will work for very small shapes
-    but results are not indicative of GPU throughput.
+  but results are not indicative of GPU throughput.
 """
 
 import torch
@@ -23,54 +21,68 @@ from hydra.model.framework import HydraBaseModel, HydraModel, create_base_model,
 
 
 def benchmark_ccgqa_attention():
-    """Benchmark CCGQA attention vs standard parameters."""
+    """Quick benchmark of CCGQA attention (for model context).
+    
+    For comprehensive attention benchmarks, run:
+        python hydra/attention/backends/ccgqa/benchmark.py --save --plot
+    """
     print("=" * 80)
-    print("Benchmarking CCGQA Attention")
+    print("CCGQA Attention Quick Check")
+    print("(For full attention benchmarks: python hydra/attention/backends/ccgqa/benchmark.py)")
     print("=" * 80)
     
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    
     B, S, D = 2, 512, 1344
-    x = torch.randn(B, S, D)
+    x = torch.randn(B, S, D, device=device, dtype=dtype)
     
     attn = CCGQAAttention(
         dim=D,
         n_heads=21,
         n_kv_heads=3,
         compression_factor=4,
-    )
+        max_seq_len=S * 2,
+    ).to(device=device, dtype=dtype)
     
     # Warm up
     for _ in range(5):
         _ = attn(x)
     
     # Benchmark
-    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     start = time.time()
     for _ in range(100):
         out = attn(x)
-    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     elapsed = time.time() - start
     
     print(f"Input shape: {x.shape}")
     print(f"Output shape: {out.shape}")
     print(f"Time per forward: {elapsed / 100 * 1000:.2f}ms")
+    print(f"Device: {device}, dtype: {dtype}")
     
     # Parameter comparison
     n_params = sum(p.numel() for p in attn.parameters())
     print(f"\nCCGQA Attention params: {n_params:,}")
     
     # Compare to standard GQA
-    # GQA would have: q_proj(D, D) + kv_proj(D, 2*D//7) + o_proj(D, D)
     gqa_params = D * D + D * (2 * D // 7) + D * D
     print(f"Standard GQA params (approx): {gqa_params:,}")
     print(f"Compression ratio: {gqa_params / n_params:.2f}x")
     print()
 
 
-def benchmark_ccgqa_model():
-    """Benchmark full CCGQA model."""
+def benchmark_base_model():
+    """Benchmark HydraBaseModel (CCGQA transformer without MoD/MoR)."""
     print("=" * 80)
-    print("Benchmarking CCGQA Model")
+    print("Benchmarking HydraBaseModel (CCGQA Transformer)")
     print("=" * 80)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     
     class MockSpec:
         vocab_size = 50257
@@ -82,25 +94,22 @@ def benchmark_ccgqa_model():
         mlp_ratio = 2.67
         max_seq_len = 8192
     
-    model = create_base_model(MockSpec())
+    model = create_base_model(MockSpec()).to(device=device, dtype=dtype)
     
-    if torch.cuda.is_available():
-        model = model.cuda()
-    
-    tokens = torch.randint(0, 50257, (2, 512))
-    if torch.cuda.is_available():
-        tokens = tokens.cuda()
+    tokens = torch.randint(0, 50257, (2, 512), device=device)
     
     # Warm up
     for _ in range(5):
         _ = model(tokens)
     
     # Benchmark
-    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     start = time.time()
     for _ in range(20):
         logits = model(tokens)
-    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     elapsed = time.time() - start
     
     print(f"Tokens shape: {tokens.shape}")
@@ -112,11 +121,14 @@ def benchmark_ccgqa_model():
     print()
 
 
-def benchmark_mod_mor_model():
-    """Benchmark full HYDRA model (LA3 + MoD + MoR)."""
+def benchmark_hydra_model():
+    """Benchmark full HydraModel (CCGQA + MoD + MoR)."""
     print("=" * 80)
-    print("Benchmarking HydraModel (LA3 + MoD + MoR)")
+    print("Benchmarking HydraModel (CCGQA + MoD + MoR)")
     print("=" * 80)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     
     mod_mor_model = create_hydra_model(
         dim=2048,
@@ -125,28 +137,25 @@ def benchmark_mod_mor_model():
         n_heads=32,
         n_kv_heads=4,
         mlp_ratio=4.0,
-    )
-    
-    if torch.cuda.is_available():
-        mod_mor_model = mod_mor_model.cuda()
+    ).to(device=device, dtype=dtype)
     
     mod_mor_model.train()
     mod_mor_model.set_global_step(200)  # Enable hard routing
     
-    tokens = torch.randint(0, 50257, (2, 256))
-    if torch.cuda.is_available():
-        tokens = tokens.cuda()
+    tokens = torch.randint(0, 50257, (2, 256), device=device)
     
     # Warm up
     for _ in range(5):
         _, _ = mod_mor_model(tokens, return_losses=True)
     
     # Benchmark
-    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     start = time.time()
     for _ in range(20):
         logits, losses = mod_mor_model(tokens, return_losses=True)
-    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     elapsed = time.time() - start
     
     print(f"Tokens shape: {tokens.shape}")
@@ -185,7 +194,7 @@ def benchmark_memory_usage():
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.empty_cache()
         
-        model = model_fn().cuda()
+        model = model_fn().cuda().to(torch.bfloat16)
         tokens = tokens.cuda()
         
         # Forward
@@ -220,7 +229,7 @@ def benchmark_memory_usage():
         }))
     
     fwd, bwd = measure_memory(base_model, tokens)
-    print(f"Base HydraBaseModel (12L):  Forward={fwd:.2f}GB, Backward={bwd:.2f}GB")
+    print(f"HydraBaseModel (12L):       Forward={fwd:.2f}GB, Backward={bwd:.2f}GB")
     
     # MoD+MoR model
     def mod_mor_model():
@@ -230,30 +239,34 @@ def benchmark_memory_usage():
         )
     
     fwd, bwd = measure_memory(mod_mor_model, tokens)
-    print(f"HydraModel (6x2L):          Forward={fwd:.2f}GB, Backward={bwd:.2f}GB")
+    print(f"HydraModel (6x2L MoD+MoR):  Forward={fwd:.2f}GB, Backward={bwd:.2f}GB")
     print()
 
 
 def main():
-    """Run all benchmarks."""
+    """Run all model benchmarks."""
     print("\n")
     print("=" * 80)
-    print("HYDRA Benchmark Suite")
+    print("HYDRA Model Benchmark Suite")
     print("=" * 80)
     print(f"Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
     print(f"PyTorch version: {torch.__version__}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name()}")
     print()
     
     benchmark_ccgqa_attention()
-    benchmark_ccgqa_model()
-    benchmark_mod_mor_model()
+    benchmark_base_model()
+    benchmark_hydra_model()
     
     if torch.cuda.is_available():
         benchmark_memory_usage()
     
     print("=" * 80)
-    print("Benchmark Complete")
+    print("Model Benchmark Complete")
     print("=" * 80)
+    print("\nFor attention kernel benchmarks, run:")
+    print("  python hydra/attention/backends/ccgqa/benchmark.py --save --plot")
 
 
 if __name__ == "__main__":

@@ -10,26 +10,23 @@ Compares CCGQA against baselines:
 - PyTorch-SDPA: scaled_dot_product_attention
 
 Usage:
-    python benchmark.py                    # Full benchmark
-    python benchmark.py --quick            # Quick test (fewer seq lengths)
-    python benchmark.py --device cpu       # CPU benchmark
-    python benchmark.py --save             # Save results to docs/
-    python benchmark.py --plot             # Generate plots
+    python -m hydra.attention.backends.ccgqa.benchmarks.benchmark_attention
+    python -m hydra.attention.backends.ccgqa.benchmarks.benchmark_attention --quick
+    python -m hydra.attention.backends.ccgqa.benchmarks.benchmark_attention --device cpu
+    python -m hydra.attention.backends.ccgqa.benchmarks.benchmark_attention --save --plot
+
+For full model benchmarks (HydraModel, HydraBaseModel), see:
+    python -m diagnostics.benchmark_hydra_models
 """
 
 import argparse
 import json
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
-
-# Add repo root to path for imports when running as a script
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent))
 
 from hydra.attention.backends.ccgqa.attention import CCGQAAttention
 
@@ -39,7 +36,6 @@ try:
     HAS_FLASH_ATTN = True
 except ImportError:
     HAS_FLASH_ATTN = False
-    print("Note: flash_attn not available, skipping FlashAttn-2 benchmark")
 
 
 def get_gpu_info() -> dict:
@@ -73,22 +69,18 @@ class ReferenceGQA(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, D = x.shape
         
-        # Q, K, V projections
         q = self.wq(x).view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.wk(x).view(B, N, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.wv(x).view(B, N, self.n_kv_heads, self.head_dim).transpose(1, 2)
         
-        # Expand K, V to match Q heads (GQA)
         if self.n_kv_heads < self.n_heads:
             k = k.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
             v = v.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
         
-        # Attention
         attn = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
         attn = F.softmax(attn, dim=-1)
         out = attn @ v
         
-        # Output projection
         out = out.transpose(1, 2).contiguous().view(B, N, -1)
         return self.wo(out)
 
@@ -132,7 +124,7 @@ def benchmark_kernel(
 ) -> dict:
     """Benchmark a single kernel."""
     
-    # Warmup - include backward to trigger Triton compilation for both passes
+    # Warmup - include backward to trigger Triton compilation
     for _ in range(warmup):
         try:
             out = forward_fn(x)
@@ -142,11 +134,7 @@ def benchmark_kernel(
             if device == "cuda":
                 torch.cuda.synchronize()
         except Exception as e:
-            return {
-                "kernel": kernel_name,
-                "error": str(e),
-                "success": False,
-            }
+            return {"kernel": kernel_name, "error": str(e), "success": False}
     
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -175,7 +163,7 @@ def benchmark_kernel(
         loss.backward()
         if device == "cuda":
             torch.cuda.synchronize()
-        x.grad = None  # Clear gradients
+        x.grad = None
     t1 = time.perf_counter()
     total_ms = (t1 - t0) * 1000 / rep
     bwd_ms = total_ms - fwd_ms
@@ -233,7 +221,7 @@ def run_benchmark(
     results = []
     
     print("=" * 80)
-    print(f"CCGQA Attention Benchmark")
+    print("CCGQA Attention Benchmark")
     print(f"Device: {gpu_info['name']} ({device})")
     if device == "cuda":
         print(f"Compute: SM {gpu_info['compute_capability']}")
@@ -245,72 +233,53 @@ def run_benchmark(
         print(f"Sequence Length: {seq_len}")
         print(f"{'='*60}")
         
-        # Create tensors
         x = torch.randn(batch_size, seq_len, dim,
                        device=device, dtype=dtype, requires_grad=True)
         
-        # CCGQA Original
-        print("\n[1/6] CCGQA Original (Unfused)...")
+        # CCGQA Unfused
+        print("\n[1/6] CCGQA (Unfused)...")
         ccgqa_orig = CCGQAAttention(
-            dim=dim,
-            n_heads=n_heads,
-            n_kv_heads=n_kv_heads,
-            compression_factor=compression_factor,
-            max_seq_len=seq_len * 2,
+            dim=dim, n_heads=n_heads, n_kv_heads=n_kv_heads,
+            compression_factor=compression_factor, max_seq_len=seq_len * 2,
             use_fused_kernel=False,
         ).to(device=device, dtype=dtype)
         
-        result = benchmark_kernel("CCGQA Original (Unfused)", lambda inp: ccgqa_orig(inp), x, warmup, rep, device)
+        result = benchmark_kernel("CCGQA (Unfused)", lambda inp: ccgqa_orig(inp), x, warmup, rep, device)
         result["seq_len"] = seq_len
         results.append(result)
-        if result["success"]:
-            print(f"  ✓ {result['total_time_ms']:.2f}ms ({result['throughput_iters_per_sec']:.1f} iter/s)")
-        else:
-            print(f"  ✗ Error: {result.get('error', 'Unknown')}")
+        _print_result(result)
         
-        # CCGQA2
-        print("\n[2/6] CCGQA2 (Fused Path / SDPA-GQA on CUDA)...")
-        ccgqa2 = CCGQAAttention(
-            dim=dim,
-            n_heads=n_heads,
-            n_kv_heads=n_kv_heads,
-            compression_factor=compression_factor,
-            max_seq_len=seq_len * 2,  # Extra headroom
+        # CCGQA Fused
+        print("\n[2/6] CCGQA (Fused/SDPA)...")
+        ccgqa_fused = CCGQAAttention(
+            dim=dim, n_heads=n_heads, n_kv_heads=n_kv_heads,
+            compression_factor=compression_factor, max_seq_len=seq_len * 2,
             use_fused_kernel=True,
         ).to(device=device, dtype=dtype)
         
-        result = benchmark_kernel("CCGQA2 (Fused Path)", lambda inp: ccgqa2(inp), x, warmup, rep, device)
+        result = benchmark_kernel("CCGQA (Fused)", lambda inp: ccgqa_fused(inp), x, warmup, rep, device)
         result["seq_len"] = seq_len
         results.append(result)
-        if result["success"]:
-            print(f"  ✓ {result['total_time_ms']:.2f}ms ({result['throughput_iters_per_sec']:.1f} iter/s)")
-        else:
-            print(f"  ✗ Error: {result.get('error', 'Unknown')}")
+        _print_result(result)
         
         # GQA Reference
-        print("\n[3/6] GQA (Reference PyTorch)...")
+        print("\n[3/6] GQA (Reference)...")
         gqa = ReferenceGQA(dim, n_heads, n_kv_heads).to(device=device, dtype=dtype)
         result = benchmark_kernel("GQA-Ref", lambda inp: gqa(inp), x, warmup, rep, device)
         result["seq_len"] = seq_len
         results.append(result)
-        if result["success"]:
-            print(f"  ✓ {result['total_time_ms']:.2f}ms ({result['throughput_iters_per_sec']:.1f} iter/s)")
-        else:
-            print(f"  ✗ Error: {result.get('error', 'Unknown')}")
+        _print_result(result)
         
         # MHA Reference
-        print("\n[3/5] MHA (Multi-Head Baseline)...")
+        print("\n[4/6] MHA (Baseline)...")
         mha = ReferenceMHA(dim, n_heads).to(device=device, dtype=dtype)
         result = benchmark_kernel("MHA-Ref", lambda inp: mha(inp), x, warmup, rep, device)
         result["seq_len"] = seq_len
         results.append(result)
-        if result["success"]:
-            print(f"  ✓ {result['total_time_ms']:.2f}ms ({result['throughput_iters_per_sec']:.1f} iter/s)")
-        else:
-            print(f"  ✗ Error: {result.get('error', 'Unknown')}")
+        _print_result(result)
         
         # PyTorch SDPA
-        print("\n[4/5] PyTorch SDPA...")
+        print("\n[5/6] PyTorch SDPA...")
         def sdpa_forward(inp):
             q = torch.randn(batch_size, n_heads, seq_len, head_dim, device=device, dtype=dtype, requires_grad=True)
             k = torch.randn(batch_size, n_heads, seq_len, head_dim, device=device, dtype=dtype, requires_grad=True)
@@ -321,14 +290,11 @@ def run_benchmark(
         result = benchmark_kernel("PyTorch-SDPA", sdpa_forward, x, warmup, rep, device)
         result["seq_len"] = seq_len
         results.append(result)
-        if result["success"]:
-            print(f"  ✓ {result['total_time_ms']:.2f}ms ({result['throughput_iters_per_sec']:.1f} iter/s)")
-        else:
-            print(f"  ✗ Error: {result.get('error', 'Unknown')}")
+        _print_result(result)
         
         # FlashAttention-2
         if HAS_FLASH_ATTN and device == "cuda":
-            print("\n[5/5] FlashAttention-2...")
+            print("\n[6/6] FlashAttention-2...")
             def flash_forward(inp):
                 q = torch.randn(batch_size, seq_len, n_heads, head_dim, device=device, dtype=dtype, requires_grad=True)
                 k = torch.randn(batch_size, seq_len, n_heads, head_dim, device=device, dtype=dtype, requires_grad=True)
@@ -339,10 +305,7 @@ def run_benchmark(
             result = benchmark_kernel("FlashAttn-2", flash_forward, x, warmup, rep, device)
             result["seq_len"] = seq_len
             results.append(result)
-            if result["success"]:
-                print(f"  ✓ {result['total_time_ms']:.2f}ms ({result['throughput_iters_per_sec']:.1f} iter/s)")
-            else:
-                print(f"  ✗ Error: {result.get('error', 'Unknown')}")
+            _print_result(result)
         else:
             print("\n[6/6] FlashAttention-2... (skipped)")
     
@@ -354,13 +317,20 @@ def run_benchmark(
     }
 
 
+def _print_result(result: dict):
+    """Print a single benchmark result."""
+    if result["success"]:
+        print(f"  ✓ {result['total_time_ms']:.2f}ms ({result['throughput_iters_per_sec']:.1f} iter/s)")
+    else:
+        print(f"  ✗ Error: {result.get('error', 'Unknown')}")
+
+
 def print_summary_table(data: dict):
     """Print a formatted summary table."""
     print("\n" + "=" * 80)
     print("BENCHMARK SUMMARY")
     print("=" * 80)
     
-    # Group by sequence length
     by_seqlen = {}
     for r in data["results"]:
         if not r["success"]:
@@ -390,7 +360,6 @@ def generate_plots(data: dict, output_dir: Path):
         print("matplotlib not available, skipping plot generation")
         return
     
-    # Group results
     by_kernel = {}
     for r in data["results"]:
         if not r["success"]:
@@ -410,7 +379,7 @@ def generate_plots(data: dict, output_dir: Path):
         plt.plot(vals["seq_lens"], vals["total"], marker='o', label=kernel, linewidth=2)
     plt.xlabel("Sequence Length", fontsize=12)
     plt.ylabel("Total Time (ms)", fontsize=12)
-    plt.title("CCGQA2 vs Baselines: Total Time", fontsize=14, fontweight='bold')
+    plt.title("CCGQA vs Baselines: Total Time", fontsize=14, fontweight='bold')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -424,15 +393,15 @@ def generate_plots(data: dict, output_dir: Path):
         ax1.plot(vals["seq_lens"], vals["fwd"], marker='o', label=kernel, linewidth=2)
         ax2.plot(vals["seq_lens"], vals["bwd"], marker='o', label=kernel, linewidth=2)
     
-    ax1.set_xlabel("Sequence Length", fontsize=11)
-    ax1.set_ylabel("Forward Time (ms)", fontsize=11)
-    ax1.set_title("Forward Pass Timing", fontsize=12, fontweight='bold')
+    ax1.set_xlabel("Sequence Length")
+    ax1.set_ylabel("Forward Time (ms)")
+    ax1.set_title("Forward Pass Timing")
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     
-    ax2.set_xlabel("Sequence Length", fontsize=11)
-    ax2.set_ylabel("Backward Time (ms)", fontsize=11)
-    ax2.set_title("Backward Pass Timing", fontsize=12, fontweight='bold')
+    ax2.set_xlabel("Sequence Length")
+    ax2.set_ylabel("Backward Time (ms)")
+    ax2.set_title("Backward Pass Timing")
     ax2.legend()
     ax2.grid(True, alpha=0.3)
     
@@ -441,30 +410,30 @@ def generate_plots(data: dict, output_dir: Path):
     print(f"  ✓ Saved: {output_dir / 'fwd_bwd_comparison.png'}")
     plt.close()
     
-    # Plot 3: Memory usage (log scale)
+    # Plot 3: Memory usage
     plt.figure(figsize=(12, 6))
     for kernel, vals in by_kernel.items():
         plt.plot(vals["seq_lens"], vals["memory"], marker='o', label=kernel, linewidth=2)
     plt.xlabel("Sequence Length", fontsize=12)
     plt.ylabel("Peak Memory (MB, log scale)", fontsize=12)
-    plt.yscale('log')  # Use logarithmic scale for y-axis
-    plt.title("CCGQA2 vs Baselines: Memory Usage", fontsize=14, fontweight='bold')
+    plt.yscale('log')
+    plt.title("CCGQA vs Baselines: Memory Usage", fontsize=14, fontweight='bold')
     plt.legend()
-    plt.grid(True, alpha=0.3, which='both')  # Show grid for both major and minor ticks
+    plt.grid(True, alpha=0.3, which='both')
     plt.tight_layout()
     plt.savefig(output_dir / "memory_comparison.png", dpi=150)
     print(f"  ✓ Saved: {output_dir / 'memory_comparison.png'}")
     plt.close()
 
-    # Plot 4: LA3-style grouped bars (time / throughput / memory)
+    # Plot 4: Bar comparison
     seq_lens = sorted({r["seq_len"] for r in data["results"] if r.get("success")})
     kernels = sorted(by_kernel.keys())
     if not seq_lens or not kernels:
         return
 
     colors = {
-        "CCGQA Original (Unfused)": "#e74c3c",
-        "CCGQA2 (Fused Path)": "#3498db",
+        "CCGQA (Unfused)": "#e74c3c",
+        "CCGQA (Fused)": "#3498db",
         "GQA-Ref": "#2ecc71",
         "MHA-Ref": "#9b59b6",
         "PyTorch-SDPA": "#95a5a6",
@@ -478,11 +447,9 @@ def generate_plots(data: dict, output_dir: Path):
     # Bar 1: Total time
     ax1 = axes[0]
     for i, kernel in enumerate(kernels):
-        times = [
-            next((r["total_time_ms"] for r in data["results"]
-                  if r.get("success") and r["kernel"] == kernel and r["seq_len"] == s), 0)
-            for s in seq_lens
-        ]
+        times = [next((r["total_time_ms"] for r in data["results"]
+                      if r.get("success") and r["kernel"] == kernel and r["seq_len"] == s), 0)
+                for s in seq_lens]
         if any(t > 0 for t in times):
             ax1.bar(x + i * width, times, width, label=kernel, color=colors.get(kernel, "#333"))
     ax1.set_xlabel("Sequence Length")
@@ -496,11 +463,9 @@ def generate_plots(data: dict, output_dir: Path):
     # Bar 2: Throughput
     ax2 = axes[1]
     for i, kernel in enumerate(kernels):
-        throughputs = [
-            next((r["throughput_iters_per_sec"] for r in data["results"]
-                  if r.get("success") and r["kernel"] == kernel and r["seq_len"] == s), 0)
-            for s in seq_lens
-        ]
+        throughputs = [next((r["throughput_iters_per_sec"] for r in data["results"]
+                            if r.get("success") and r["kernel"] == kernel and r["seq_len"] == s), 0)
+                      for s in seq_lens]
         if any(t > 0 for t in throughputs):
             ax2.bar(x + i * width, throughputs, width, label=kernel, color=colors.get(kernel, "#333"))
     ax2.set_xlabel("Sequence Length")
@@ -511,37 +476,18 @@ def generate_plots(data: dict, output_dir: Path):
     ax2.legend()
     ax2.grid(axis="y", alpha=0.3)
 
-    # Bar 3: Memory (stacked: forward + extra backward)
+    # Bar 3: Memory
     ax3 = axes[2]
     for i, kernel in enumerate(kernels):
-        fwd_mem = [
-            next((r.get("fwd_memory_mb", r.get("peak_memory_mb", 0)) for r in data["results"]
-                  if r.get("success") and r["kernel"] == kernel and r["seq_len"] == s), 0)
-            for s in seq_lens
-        ]
-        bwd_mem = [
-            next((r.get("bwd_memory_mb", 0) for r in data["results"]
-                  if r.get("success") and r["kernel"] == kernel and r["seq_len"] == s), 0)
-            for s in seq_lens
-        ]
+        fwd_mem = [next((r.get("fwd_memory_mb", r.get("peak_memory_mb", 0)) for r in data["results"]
+                        if r.get("success") and r["kernel"] == kernel and r["seq_len"] == s), 0)
+                  for s in seq_lens]
+        bwd_mem = [next((r.get("bwd_memory_mb", 0) for r in data["results"]
+                        if r.get("success") and r["kernel"] == kernel and r["seq_len"] == s), 0)
+                  for s in seq_lens]
         if any(m > 0 for m in fwd_mem):
-            ax3.bar(
-                x + i * width,
-                fwd_mem,
-                width,
-                label=kernel,
-                color=colors.get(kernel, "#333"),
-                alpha=0.7,
-            )
-            ax3.bar(
-                x + i * width,
-                bwd_mem,
-                width,
-                bottom=fwd_mem,
-                color=colors.get(kernel, "#333"),
-                alpha=1.0,
-                hatch="//",
-            )
+            ax3.bar(x + i * width, fwd_mem, width, label=kernel, color=colors.get(kernel, "#333"), alpha=0.7)
+            ax3.bar(x + i * width, bwd_mem, width, bottom=fwd_mem, color=colors.get(kernel, "#333"), alpha=1.0, hatch="//")
     ax3.set_xlabel("Sequence Length")
     ax3.set_ylabel("Memory (MB)")
     ax3.set_title("GPU Memory: Forward (solid) + Backward (hatched)")
@@ -565,24 +511,24 @@ def main():
     parser.add_argument("--compression", type=int, default=4, help="CCGQA compression factor")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"])
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
-    parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations (increased for Triton compilation)")
+    parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations")
     parser.add_argument("--rep", type=int, default=50, help="Benchmark iterations")
     parser.add_argument("--quick", action="store_true", help="Quick test (fewer seq lengths)")
     parser.add_argument("--save", action="store_true", help="Save results to JSON")
     parser.add_argument("--plot", action="store_true", help="Generate plots")
     args = parser.parse_args()
     
-    # Parse dtype
+    if not HAS_FLASH_ATTN:
+        print("Note: flash_attn not available, skipping FlashAttn-2 benchmark\n")
+    
     dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
     dtype = dtype_map[args.dtype]
     
-    # Set sequence lengths
     if args.quick:
         seq_lengths = [512, 1024, 2048, 4096, 8192] if args.device == "cuda" else [128, 256, 512, 1024]
     else:
         seq_lengths = [512, 1024, 2048, 4096, 8192, 16384] if args.device == "cuda" else [128, 256, 512, 1024, 2048]
     
-    # Run benchmark
     data = run_benchmark(
         batch_size=args.batch_size,
         n_heads=args.n_heads,
@@ -596,23 +542,20 @@ def main():
         device=args.device,
     )
     
-    # Print summary
     print_summary_table(data)
     
-    # Save results
+    # Output goes to parent docs/ folder (ccgqa/docs/)
+    output_dir = Path(__file__).parent.parent / "docs"
+    
     if args.save:
-        output_dir = Path(__file__).parent / "docs"
         output_dir.mkdir(exist_ok=True)
-        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         json_path = output_dir / f"benchmark_results_{timestamp}.json"
         with open(json_path, "w") as f:
             json.dump(data, f, indent=2)
         print(f"\n✓ Results saved to: {json_path}")
     
-    # Generate plots
     if args.plot:
-        output_dir = Path(__file__).parent / "docs"
         output_dir.mkdir(exist_ok=True)
         print("\nGenerating plots...")
         generate_plots(data, output_dir)

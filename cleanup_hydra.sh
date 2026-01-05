@@ -1,6 +1,7 @@
 #!/bin/bash
 # HYDRA Project Cleanup Script
 # Generated: 2026-01-05
+# Updated: Added phases 7-10 (benchmark consolidation)
 # 
 # This script consolidates logging outputs and removes noise files.
 # Review before running!
@@ -115,19 +116,89 @@ fi
 echo ""
 
 # ============================================================
+# PHASE 7: Remove duplicate test files
+# ============================================================
+echo "Phase 7: Removing duplicate test files..."
+
+# Duplicate pytest file (keep the one in tests/)
+if [ -f "diagnostics/mod_mor_routing_healthcheck.py" ]; then
+    rm -v "diagnostics/mod_mor_routing_healthcheck.py"
+    echo "  (kept tests/test_mod_mor_routing_healthcheck.py)"
+fi
+
+echo ""
+
+# ============================================================
+# PHASE 8: Remove vendored test_small_transformer
+# ============================================================
+echo "Phase 8: Removing vendored lightning_attn3 test (fix integrated)..."
+
+if [ -d "hydra/attention/backends/lightning_attn3/test_small_transformer" ]; then
+    rm -rf "hydra/attention/backends/lightning_attn3/test_small_transformer"
+    echo "  Removed test_small_transformer/ (~50KB duplicate ops/)"
+fi
+
+echo ""
+
+# ============================================================
+# PHASE 9: Remove build artifacts
+# ============================================================
+echo "Phase 9: Removing build artifacts..."
+
+# egg-info should be gitignored and regenerated on install
+if [ -d "hydra_transformer.egg-info" ]; then
+    rm -rf "hydra_transformer.egg-info"
+    echo "  Removed hydra_transformer.egg-info/"
+fi
+
+echo ""
+
+# ============================================================
+# PHASE 10: Consolidate CCGQA benchmarks
+# ============================================================
+echo "Phase 10: Consolidating CCGQA benchmarks..."
+
+# Remove old diagnostics benchmark files (consolidated into hydra/attention/backends/ccgqa/benchmarks/)
+if [ -f "diagnostics/benchmark_ccgqa.py" ]; then
+    rm -v "diagnostics/benchmark_ccgqa.py"
+    echo "  (replaced by diagnostics/benchmark_hydra_models.py for model benchmarks)"
+fi
+
+if [ -f "diagnostics/benchmark_ccgqa_cpu.py" ]; then
+    rm -v "diagnostics/benchmark_ccgqa_cpu.py"
+    echo "  (consolidated into hydra/attention/backends/ccgqa/benchmarks/)"
+fi
+
+# Remove old benchmark.py at ccgqa root (moved to benchmarks/ folder)
+if [ -f "hydra/attention/backends/ccgqa/benchmark.py" ]; then
+    rm -v "hydra/attention/backends/ccgqa/benchmark.py"
+    echo "  (moved to hydra/attention/backends/ccgqa/benchmarks/benchmark_attention.py)"
+fi
+
+echo ""
+
+# ============================================================
 # SUMMARY
 # ============================================================
 echo "=== Cleanup Complete ==="
 echo ""
 echo "Space freed (estimated):"
 echo "  - Root garbage: ~20KB"
-echo "  - Nested benchmarks: ~50KB"  
+echo "  - Nested benchmarks: ~50KB"
+echo "  - Duplicate test file: ~7KB"
+echo "  - Vendored test_small_transformer: ~50KB"
+echo "  - Build artifacts (egg-info): ~5KB"
+echo "  - Consolidated benchmarks: ~50KB"
 echo "  - Empty logs: variable"
 echo "  - Reports (if script ran): ~2-3MB"
 echo ""
 echo "To free ~75GB more, uncomment the checkpoint deletion in Phase 5"
 echo ""
+echo "Benchmark locations after cleanup:"
+echo "  - Model benchmarks:     python -m diagnostics.benchmark_hydra_models"
+echo "  - Attention benchmarks: python -m hydra.attention.backends.ccgqa.benchmarks.benchmark_attention --save --plot"
+echo ""
 echo "Next steps:"
 echo "  1. Review changes with: git status"
-echo "  2. Update .gitignore (see below)"
+echo "  2. Update .gitignore: cat GITIGNORE_ADDITIONS.txt >> .gitignore"
 echo "  3. Commit: git add -A && git commit -m 'Clean up project structure'"
