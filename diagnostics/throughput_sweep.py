@@ -104,22 +104,25 @@ def _bench_via_subprocess(
     # Optional: enable AdaRMSNorm (MoR blocks only).
     if use_ada_rmsnorm:
         env["HYDRA_USE_ADA_RMSNORM"] = "1"
-    else:
-        env.pop("HYDRA_USE_ADA_RMSNORM", None)
+    """
+    Exhaustive-ish throughput sweep for HYDRA (MoD+MoR+CCGQA kept ON).
 
-    # Pattern selection for MoR blocks (optional).
-    # - "baseline" means: do not set any pattern env vars.
-    # - If the pattern contains ',' => treat as explicit token list and set HYDRA_MOR_ATTENTION_PATTERN.
-    # - Otherwise set HYDRA_MOR_ATTENTION_PATTERN_NAME.
-    env.pop("HYDRA_MOR_ATTENTION_PATTERN", None)
-    env.pop("HYDRA_MOR_ATTENTION_PATTERN_NAME", None)
-    pattern = (mor_attention_pattern or "baseline").strip()
-    if pattern and pattern.lower() != "baseline":
-        if "," in pattern:
-            env["HYDRA_MOR_ATTENTION_PATTERN"] = pattern
-        else:
-            env["HYDRA_MOR_ATTENTION_PATTERN_NAME"] = pattern
+    This script:
+    - Sweeps presets (100m/500m), seq lens, AMP dtype, compile on/off, grad-ckpt, grad-accum, chunked CE.
+    - Auto-finds a near-max microbatch size under a target VRAM fraction (OOM-safe).
+    - Writes raw results (JSONL), a CSV summary, a Markdown report, and plots.
 
+    Notes:
+    - REQUIRES: CUDA for meaningful throughput sweeps. Ensure no other processes occupy the GPU.
+
+    It uses the same training-critical path as diagnostics/tall_skinny_bench.py:
+        forward_hidden_with_losses + fused_chunked_cross_entropy
+
+    Run example:
+        /home/tim/venvs/llm/bin/python diagnostics/throughput_sweep.py \
+            --presets 100m,500m --seq_lens 512,1024,2048 --compile 1,0 \
+            --grad_accum 1,2 --grad_ckpt_every_n 2,0 --chunked_ce 4096,2048
+    """
     cmd = [
         sys.executable,
         str(REPO_ROOT / "diagnostics" / "tall_skinny_bench.py"),

@@ -76,20 +76,24 @@ def _get_first_layer_stats(model: HydraModel) -> Dict[str, Any]:
     layer0 = model.layers[0]
     out: Dict[str, Any] = {}
     if hasattr(layer0, "get_routing_stats"):
-        try:
-            out["mor_layer0"] = layer0.get_routing_stats()
-        except Exception as e:
-            out["mor_layer0_error"] = str(e)
-    if hasattr(layer0, "mod_mlp_wrapper") and layer0.mod_mlp_wrapper is not None:
-        try:
-            out["mod_layer0"] = layer0.mod_mlp_wrapper.get_routing_stats()
-        except Exception as e:
-            out["mod_layer0_error"] = str(e)
-    return out
+        """
+        Tall/skinny + small-model diagnostics for HYDRA (MoD + MoR + frontier opts).
 
+        Goals:
+        - Keep MoD+MoR enabled.
+        - Exercise the training-critical path (AMP, torch.compile, chunked CE, grad ckpt).
+        - Report tok/s, step time, peak VRAM, and routing/regularizer stats.
 
-def _sdpa_backend_probe(
-    *,
+        This script is intentionally self-contained and uses only repo code.
+
+        Notes:
+        - RECOMMENDED: Run on CUDA for meaningful throughput and VRAM measurements.
+            It can run on CPU for quick functional checks but will be much slower.
+
+        Run examples:
+            /home/tim/venvs/llm/bin/python diagnostics/tall_skinny_bench.py --device cuda --compile 1
+            /home/tim/venvs/llm/bin/python diagnostics/tall_skinny_bench.py --device cuda --compile 1 --steps 50
+        """
     device: str,
     dtype: torch.dtype,
     batch_size: int,

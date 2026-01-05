@@ -78,6 +78,7 @@ class MoRConfig:
         dim_ref: Reference dimension for depth scaling (default 768)
         depth_alpha: Power-law exponent for dim-aware scaling (0=disabled)
         depth_scale_max: Maximum depth scaling factor
+        min_depth: Minimum recursion depth (0=allow immediate exit, 1=force at least one full iteration)
     """
     dim: int
     n_recursions: int = 5
@@ -90,6 +91,7 @@ class MoRConfig:
     depth_alpha: float = 0.0
     depth_scale_max: float = 2.0
     advantage_loss_scale: float = 0.1
+    min_depth: int = 0  # 0=allow depth-0 exit, 1+=force minimum iterations
     
     def __post_init__(self) -> None:
         """Validate configuration values."""
@@ -271,11 +273,18 @@ class MoRRouter(BaseRouter):
         
         # Map to continuous depth
         n_rec = self.config.n_recursions
-        depth_continuous = probs * (n_rec - 1)  # [B, L] in [0, n_rec-1]
+        min_d = self.config.min_depth
+        
+        # If min_depth > 0, map probs to [min_depth, n_rec-1] instead of [0, n_rec-1]
+        if min_d > 0:
+            depth_range = n_rec - 1 - min_d
+            depth_continuous = min_d + probs * depth_range  # [B, L] in [min_d, n_rec-1]
+        else:
+            depth_continuous = probs * (n_rec - 1)  # [B, L] in [0, n_rec-1]
         
         # Discretize with rounding
         depths = torch.round(depth_continuous).long()
-        depths = torch.clamp(depths, 0, n_rec - 1)
+        depths = torch.clamp(depths, min_d, n_rec - 1)
         
         return depths, probs, logits
     

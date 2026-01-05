@@ -8,20 +8,10 @@ fits polynomial/power/exponential curves, and predicts behavior at 4B scale.
 This validates that the aux_loss_weight scaling and other hyperparameters
 will work correctly when scaling beyond locally-testable sizes.
 
-Papers validated:
-- MoD (arXiv:2404.02258): Mixture-of-Depths
-- MoR (arXiv:2507.10524): Mixture-of-Recursions
-- CCGQA (arXiv:2510.04476): Compressed Convolutional GQA
-
-Usage:
-    python scaling_analysis.py --predict-4b
-    
-    # With memory profiling:
-    mprof run python scaling_analysis.py --predict-4b
-    mprof plot
-
-Optional dependencies:
-    pip install memory-profiler matplotlib scipy
+Notes:
+- RECOMMENDED: GPU for faster model diagnostics when running variants that use CUDA.
+- OPTIONAL DEPS: `matplotlib`, `scipy`, `memory-profiler` for plotting and profiling.
+    Install with: `pip install matplotlib scipy memory-profiler`
 """
 
 import argparse

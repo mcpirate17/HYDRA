@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import math
 import os
+import signal
 import time
 from collections import deque
-import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
-
-import json
 
 import torch
 import torch.nn.functional as F
@@ -17,7 +15,7 @@ from torch.amp import GradScaler, autocast
 import torch.profiler
 
 from hydra.model.framework import HydraModel
-from hydra.data.universal_data_loader import create_universal_loader
+from hydra.data.universal_data_loader import DATASET_CONFIGS, create_universal_loader
 from hydra.data.data_filter import BatchFilter, FilterConfig
 
 from .config import TrainingConfig
@@ -31,6 +29,8 @@ from . import checkpointing as _checkpointing
 from . import reporting as _reporting
 from .loop import (
     compute_microbatch_loss,
+    compute_token_losses_from_hidden,
+    evaluate_fixed_batches,
     eval_sanity_check_on_train_batch,
     maybe_run_fixed_eval,
     resolve_micro_diag_tensors,
@@ -38,62 +38,12 @@ from .loop import (
 )
 from .gradients import skip_update_for_nonfinite_gradients
 from . import spike_diagnostics as _spike
+from .halt import HaltController
+from .policy import SeqLenPolicy
+from .curriculum import CurriculumController
 from . import step_diagnostics as _step_diag
 
 _RUNTIME_STATUS = configure_runtime()
-def _load_seq_len_policy_from_env() -> dict | None:
-    path = os.environ.get("HYDRA_SEQ_LEN_POLICY_JSON", "").strip()
-    if not path:
-        return None
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except Exception as e:
-        warnings.warn(f"Failed to load HYDRA_SEQ_LEN_POLICY_JSON='{path}': {e}")
-        return None
-
-
-def _policy_for_seq_len(policy: dict, seq_len: int) -> dict:
-    by_seq = policy.get("by_seq_len", {}) if isinstance(policy, dict) else {}
-    if isinstance(by_seq, dict):
-        exact = by_seq.get(str(seq_len))
-        if isinstance(exact, dict):
-            return exact
-    default = policy.get("default", {}) if isinstance(policy, dict) else {}
-    return default if isinstance(default, dict) else {}
-
-
-def _auto_policy_for_seq_len(seq_len: int) -> dict:
-    """Built-in heuristic policy keyed on current sequence length.
-
-    This is intentionally conservative (safe) and only touches runtime knobs.
-    It does NOT attempt to change architecture (e.g. LA3 vs CCQA) mid-run.
-    """
-
-    L = int(seq_len)
-
-    # Short context: prioritize throughput (checkpointing is overhead; chunked CE can be slower).
-    if L <= 512:
-        return {
-            "use_chunked_ce": False,
-            "gradient_checkpointing": True,
-            "checkpoint_every_n": 4,
-        }
-
-    # Mid context: balanced
-    if L <= 1024:
-        return {
-            "use_chunked_ce": True,
-            "gradient_checkpointing": True,
-            "checkpoint_every_n": 2,
-        }
-
-    # Long context: prioritize memory
-    return {
-        "use_chunked_ce": True,
-        "gradient_checkpointing": True,
-        "checkpoint_every_n": 1,
-    }
 
 
 class Trainer:
@@ -129,10 +79,15 @@ class Trainer:
         "_last_aux_loss",
         "_last_ponder_loss",
         "_last_advantage_loss",
+        "_last_moe_aux_loss",
         "_last_pre_clip_norm",
         "_ce_ema",
         "_adaptive_lr",
         "_use_progress_aware_lr",
+        "_use_per_component_lr",
+        "_expert_lr_scale",
+        "_router_lr_scale",
+        "_moe_rewarmup_start_step",
         "_batch_filter",
         "_checkpoint_seq_len",
         "_checkpoint_config",
@@ -150,6 +105,16 @@ class Trainer:
         "_resume_state_incomplete",
         "_prev_run_best_loss",
         "_resume_ce_ema",
+        "_curriculum_controller",
+        "_mor_advantage_nudge_until_step",
+        "_mor_advantage_nudge_cooldown_until_step",
+        "_mor_advantage_nudge_active",
+        "_last_moe_divergence",
+        "_moe_domain_expert_map",
+        "_last_batch_source_name",
+        "_source_name_counts",
+        "_source_name_counts_total",
+        "_grad_norm_ema",  # For dynamic gradient clipping
     )
 
     def __init__(self, config: TrainingConfig):
@@ -157,6 +122,23 @@ class Trainer:
         self.logger = HydraLogger(config)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.metrics = TrainingMetrics()
+
+        # Domain -> expert mapping (for InterleavedDataLoader batches).
+        self._moe_domain_expert_map = {}
+        self._last_batch_source_name = None
+        self._source_name_counts: dict[str, int] = {}
+        self._source_name_counts_total: dict[str, int] = {}
+        try:
+            raw = str(getattr(config, "moe_domain_expert_map", "") or "").strip()
+            if raw:
+                for part in raw.split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    k, v = part.split(":", 1)
+                    self._moe_domain_expert_map[k.strip()] = int(v.strip())
+        except Exception:
+            self._moe_domain_expert_map = {}
 
         # Quality-of-life: if the user sets a stepped schedule but forgets to
         # bump max_seq_len, make it consistent with the largest phase length.
@@ -173,21 +155,13 @@ class Trainer:
             except Exception:
                 pass
 
-        self._seq_len_policy = _load_seq_len_policy_from_env()
-        if self._seq_len_policy is None:
-            # Optional built-in auto-tune (no external policy file).
-            # Opt-in to avoid surprising config changes.
-            env_auto = os.environ.get("HYDRA_SEQ_LEN_AUTO_TUNE", "").strip().lower()
-            if env_auto in ("1", "true", "yes", "on"):
-                self._seq_len_policy = {"version": 1, "default": {}, "by_seq_len": {}}
-                self._seq_len_policy["_auto"] = True
+        # SeqLenPolicy owns all HYDRA_SEQ_LEN_* env parsing and policy matching
+        self._seq_len_policy = SeqLenPolicy.from_env()
 
-        if self._seq_len_policy:
+        if self._seq_len_policy.is_active:
             try:
                 initial_seq_len = config.seq_steps[0][1] if config.seq_steps else config.max_seq_len
-                patch = _policy_for_seq_len(self._seq_len_policy, int(initial_seq_len))
-                if not patch and bool(self._seq_len_policy.get("_auto", False)):
-                    patch = _auto_policy_for_seq_len(int(initial_seq_len))
+                patch = self._seq_len_policy.get_patch(int(initial_seq_len))
                 if isinstance(patch, dict) and patch:
                     if "use_chunked_ce" in patch:
                         config.use_chunked_ce = bool(patch["use_chunked_ce"])
@@ -227,6 +201,8 @@ class Trainer:
         self._last_aux_loss: float = 0.0
         self._last_ponder_loss: float = 0.0
         self._last_advantage_loss: float = 0.0
+        self._last_moe_aux_loss: float = 0.0
+        self._last_moe_divergence: float = 0.0  # For tracking divergence trend
         self._last_pre_clip_norm: float = 0.0  # Raw gradient norm before clipping
 
         self._adaptive_lr: Optional[ProgressAwareLRManager] = None
@@ -265,6 +241,17 @@ class Trainer:
         self._resume_state_incomplete: bool = False
         self._prev_run_best_loss: float = float("inf")
         self._resume_ce_ema: float = 0.0
+
+        # MoE per-component LR state
+        self._use_per_component_lr: bool = False
+        self._expert_lr_scale: float = 1.0
+        self._router_lr_scale: float = 1.0
+        self._moe_rewarmup_start_step: int = 0  # Set on resume if moe_lr_rewarmup_steps > 0
+
+        # MoR auto-nudge state (gentle, temporary damping of router advantage loss)
+        self._mor_advantage_nudge_until_step: int = 0
+        self._mor_advantage_nudge_cooldown_until_step: int = 0
+        self._mor_advantage_nudge_active: bool = False
         if config.resume_from:
             self._checkpoint_config = self._peek_checkpoint_config(config.resume_from)
             self._checkpoint_seq_len = self._checkpoint_config.get("max_seq_len", config.max_seq_len)
@@ -328,8 +315,12 @@ class Trainer:
             if triton_enabled:
                 self.logger.info(f"  ├─ fused_swiglu:  {ks.get('fused_swiglu', False)}")
                 self.logger.info(f"  ├─ fused_qk_norm: {ks.get('fused_qk_norm', False)}")
-                self.logger.info(f"  ├─ fused_rope:    {ks.get('fused_rope', False)}" + ("" if ks.get('fused_rope', False) else " (opt-in: HYDRA_ENABLE_FUSED_ROPE=1)"))
-                self.logger.info(f"  └─ fused_rms_norm:{ks.get('fused_rms_norm', False)}" + ("" if ks.get('fused_rms_norm', False) else " (opt-in: HYDRA_ENABLE_FUSED_RMS_NORM=1)"))
+                self.logger.info(
+                    f"  ├─ fused_rope:    {ks.get('fused_rope', False)}" + ("" if ks.get('fused_rope', False) else " (disabled; set HYDRA_DISABLE_FUSED_ROPE=0 / HYDRA_ENABLE_FUSED_ROPE=1)")
+                )
+                self.logger.info(
+                    f"  └─ fused_rms_norm:{ks.get('fused_rms_norm', False)}" + ("" if ks.get('fused_rms_norm', False) else " (disabled; set HYDRA_DISABLE_FUSED_RMS_NORM=0 / HYDRA_ENABLE_FUSED_RMS_NORM=1)")
+                )
         _chunked_ce_active = config.use_chunked_ce and hasattr(self.model, "forward_hidden")
         self.logger.info(f"Chunked CE: {_chunked_ce_active}" + (" (model supports forward_hidden)" if _chunked_ce_active else f" (disabled: use_chunked_ce={config.use_chunked_ce}, has forward_hidden={hasattr(self.model, 'forward_hidden')})"))
         self.logger.info(f"AMP dtype: {config.dtype}")
@@ -426,11 +417,11 @@ class Trainer:
         # MoR warmup defaults to 30% of training (ponder loss ramps up to this point)
         mor_warmup = int(config.max_steps * 0.30)
         
-        # MoD is now MoR-informed: starts disabled, triggers when MoR early_exit crosses threshold
-        # We set a very high warmup initially so MoD stays disabled until we trigger it dynamically
-        mod_mlp_warmup = config.max_steps + 1  # MoD disabled initially
-        mod_force_enable_step = config.max_steps + 1  # No step-based forcing
-        self._mod_triggered = False  # Track if MoD has been dynamically enabled
+        # MoD is step-based: dense MLP during warmup, then hard top-k routing.
+        # This avoids brittle MoR/CE-gated enabling.
+        mod_mlp_warmup = int(getattr(config, "mod_mlp_warmup_steps", 1000) or 1000)
+        mod_mlp_warmup = max(0, mod_mlp_warmup)
+        mod_force_enable_step = None
         
         # HydraModel uses CCGQA attention (Compressed Convolutional GQA)
         attention_backend = "ccgqa"  # Only CCGQA is supported
@@ -450,34 +441,43 @@ class Trainer:
             adaptive=config.mor_adaptive,
             tie_weights=True,
             mod_mlp_warmup=mod_mlp_warmup,
-            mod_enable_loss_threshold=getattr(config, "mod_enable_loss_threshold", None),
+            # Step-based MoD warmup: do not CE-gate enablement.
+            mod_enable_loss_threshold=None,
             mod_force_enable_step=mod_force_enable_step,
             mor_warmup=mor_warmup,
-            mor_advantage_loss_scale=getattr(config, "mor_advantage_loss_scale", 0.1),
+            mor_advantage_loss_scale=getattr(config, "mor_advantage_loss_scale", 0.02),
+            mor_min_depth=getattr(config, "mor_min_depth", 1),
             attention_backend=attention_backend,
+            # MoE configuration
+            moe_enabled=config.moe_enabled,
+            moe_num_experts=config.moe_num_experts,
+            moe_num_layers=config.moe_num_layers,
+            moe_top_k=config.moe_top_k,
+            moe_aux_weight=config.moe_aux_weight,
+            moe_router_jitter=config.moe_router_jitter,
+            moe_expert_diversity_noise=config.moe_expert_diversity_noise,
+            moe_warmup_steps=config.moe_warmup_steps,
+            moe_identity_init=config.moe_identity_init,
+            moe_forced_routing_steps=getattr(config, "moe_forced_routing_steps", 0),
+            moe_teacher_until_step=getattr(config, "moe_teacher_until_step", 0),
         ).to(self.device)
         self._use_mod_mor = True
-        mod_status = "OFF (capacity=1.0)" if config.mod_capacity >= 1.0 else f"{config.mod_capacity:.0%} capacity (MoR-informed)"
+        mod_status = "OFF (capacity=1.0)" if config.mod_capacity >= 1.0 else f"{config.mod_capacity:.0%} capacity (warmup={mod_mlp_warmup} steps)"
         mor_status = "adaptive" if config.mor_adaptive else "fixed-depth (no routing)"
         self.logger.info(f"MoD: {mod_status}")
         self.logger.info(f"MoR: {mor_status}, {config.mor_recursions} recursions/block")
+        
+        # CurriculumController owns MoR/MoD gating state and decision logic
+        self._curriculum_controller = CurriculumController.from_training_config(config, start_step=self._start_step)
+        mor_enable_step, actual_rampup = self._curriculum_controller.get_mor_curriculum_params()
+        
         if config.mor_adaptive:
-            # Apply floor: MoR needs minimum steps to stabilize regardless of pct
-            mor_enable_min = getattr(config, "mor_enable_min_steps", 3000)
-            mor_enable_step = max(
-                mor_enable_min,
-                int(config.max_steps * config.mor_enable_pct)
-            )
             if config.mor_already_enabled:
-                mor_enable_step = 0
                 self.logger.info("MoR RESTART MODE: Adaptive routing enabled from start (resumed after enable point)")
-            remaining_steps = config.max_steps - mor_enable_step
-            default_rampup = min(config.mor_rampup_steps, 2 * mor_enable_step)
-            actual_rampup = min(default_rampup, remaining_steps)
-            actual_rampup = max(actual_rampup, min(100, int(config.max_steps * 0.1)))
             self.model.set_mor_curriculum(enable_step=mor_enable_step, rampup_steps=actual_rampup)
             self._mor_enable_step = mor_enable_step
             mor_loss_thr = getattr(config, "mor_enable_loss_threshold", 0.0) or 0.0
+            mor_enable_min = getattr(config, "mor_enable_min_steps", 3000)
             if mor_enable_step > 0:
                 if mor_loss_thr > 0:
                     self.logger.info(f"MoR CURRICULUM: Fixed-depth until step {mor_enable_step:,} (min={mor_enable_min}, pct={config.mor_enable_pct:.0%}) OR CE_EMA < {mor_loss_thr:.1f}, then {actual_rampup:,} step rampup")
@@ -506,83 +506,190 @@ class Trainer:
 
     def _setup_optimizer(self) -> None:
         config = self.config
-        decay_params = []
-        no_decay_params = []
-        embed_params = []  # Separate group for embeddings - they need lower LR
+        
+        # =====================================================================
+        # Per-Component Parameter Groups for MoE Gradient Stabilization
+        # =====================================================================
+        # When MoE is enabled, split parameters into distinct groups:
+        #   - Group A (Veterans/Experts): expert/mlp params -> slower LR (stabilize)
+        #   - Group B (Rookies/Routers): router/gate params -> faster LR (accelerate)
+        #   - Group C (Backbone): everything else -> base LR
+        #   - Group D (Embeddings): embed params -> much slower LR (prevent spikes)
+        #
+        # This addresses gradient instability from upcycled pre-trained experts
+        # exploding while new routers learn too slowly.
+        # =====================================================================
+        
+        expert_lr_scale = float(getattr(config, "moe_expert_lr_scale", 1.0) or 1.0)
+        router_lr_scale = float(getattr(config, "moe_router_lr_scale", 1.0) or 1.0)
+        expert_wd_scale = float(getattr(config, "moe_expert_weight_decay_scale", 1.0) or 1.0)
+        embed_lr_scale = 0.1  # Always slower for embeddings
+        
+        use_per_component_lr = config.moe_enabled and (expert_lr_scale != 1.0 or router_lr_scale != 1.0 or expert_wd_scale != 1.0)
+        
+        # Parameter categorization
+        expert_decay_params = []      # Group A: expert/mlp with decay
+        expert_no_decay_params = []   # Group A: expert/mlp without decay  
+        router_decay_params = []      # Group B: router/gate with decay
+        router_no_decay_params = []   # Group B: router/gate without decay
+        backbone_decay_params = []    # Group C: backbone with decay
+        backbone_no_decay_params = [] # Group C: backbone without decay
+        embed_params = []             # Group D: embeddings
+        
+        expert_param_count = 0
+        router_param_count = 0
+        backbone_param_count = 0
+        embed_param_count = 0
         
         for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                if "embed" in name or "tok_emb" in name:
-                    embed_params.append(param)
-                elif "weight" in name and "norm" not in name:
-                    decay_params.append(param)
+            if not param.requires_grad:
+                continue
+            
+            n_params = param.numel()
+            name_lower = name.lower()
+            is_weight = "weight" in name_lower
+            is_norm = "norm" in name_lower
+            has_decay = is_weight and not is_norm
+            
+            # Classification priority: embed > moe_expert > moe_router > backbone
+            # Key insight: we need to distinguish:
+            #   - MoE expert FFNs: moe_layers.X.experts.* -> expert group
+            #   - MoE routers: moe_layers.X.router.* -> router group  
+            #   - Backbone MLPs: layers.X.mlp.* -> backbone group (NOT expert!)
+            #   - Other routers: mor_router, mod_router -> backbone (they're part of base model)
+            
+            is_moe_expert = "moe_layers" in name_lower and "experts" in name_lower
+            is_moe_router = "moe_layers" in name_lower and "router" in name_lower and "experts" not in name_lower
+            
+            if "embed" in name_lower or "tok_emb" in name_lower:
+                embed_params.append(param)
+                embed_param_count += n_params
+            elif use_per_component_lr and is_moe_expert:
+                # MoE expert FFN weights (moe_layers.X.experts.*)
+                if has_decay:
+                    expert_decay_params.append(param)
                 else:
-                    no_decay_params.append(param)
+                    expert_no_decay_params.append(param)
+                expert_param_count += n_params
+            elif use_per_component_lr and is_moe_router:
+                # MoE router gate weights (moe_layers.X.router.*)
+                if has_decay:
+                    router_decay_params.append(param)
+                else:
+                    router_no_decay_params.append(param)
+                router_param_count += n_params
+            else:
+                # Everything else is backbone: attention, backbone MLPs, norms, MoR/MoD routers, etc.
+                if has_decay:
+                    backbone_decay_params.append(param)
+                else:
+                    backbone_no_decay_params.append(param)
+                backbone_param_count += n_params
         
-        # Embedding LR scale: 0.1x base LR to prevent gradient spikes
-        embed_lr_scale = 0.1
+        # Compute per-group LRs
+        expert_lr = config.max_lr * expert_lr_scale
+        router_lr = config.max_lr * router_lr_scale
+        backbone_lr = config.max_lr
         embed_lr = config.max_lr * embed_lr_scale
+        
+        # Compute expert weight decay (allow higher WD to shrink blown-up weights)
+        expert_weight_decay = config.weight_decay * expert_wd_scale
         
         self._skip_lr_schedule = False
         
+        # Store LR scales for training loop to apply per-group scaling
+        self._embed_lr_scale = embed_lr_scale
+        self._expert_lr_scale = expert_lr_scale
+        self._router_lr_scale = router_lr_scale
+        self._use_per_component_lr = use_per_component_lr
+        
+        # Build parameter groups list
+        if use_per_component_lr:
+            # Full per-component groups (6 groups)
+            param_groups = [
+                # Group 0: Expert decay (with scaled weight decay to shrink blown-up weights)
+                {"params": expert_decay_params, "weight_decay": expert_weight_decay, "lr": expert_lr, "lr_scale": expert_lr_scale, "name": "expert_decay"},
+                # Group 1: Expert no-decay
+                {"params": expert_no_decay_params, "weight_decay": 0.0, "lr": expert_lr, "lr_scale": expert_lr_scale, "name": "expert_nodecay"},
+                # Group 2: Router decay
+                {"params": router_decay_params, "weight_decay": config.weight_decay, "lr": router_lr, "lr_scale": router_lr_scale, "name": "router_decay"},
+                # Group 3: Router no-decay
+                {"params": router_no_decay_params, "weight_decay": 0.0, "lr": router_lr, "lr_scale": router_lr_scale, "name": "router_nodecay"},
+                # Group 4: Backbone decay
+                {"params": backbone_decay_params, "weight_decay": config.weight_decay, "lr": backbone_lr, "lr_scale": 1.0, "name": "backbone_decay"},
+                # Group 5: Backbone no-decay
+                {"params": backbone_no_decay_params, "weight_decay": 0.0, "lr": backbone_lr, "lr_scale": 1.0, "name": "backbone_nodecay"},
+                # Group 6: Embeddings
+                {"params": embed_params, "weight_decay": 0.0, "lr": embed_lr, "lr_scale": embed_lr_scale, "name": "embed"},
+            ]
+            # Remove empty groups
+            param_groups = [g for g in param_groups if len(g["params"]) > 0]
+        else:
+            # Legacy 3-group setup (backward compatible)
+            decay_params = backbone_decay_params + expert_decay_params + router_decay_params
+            no_decay_params = backbone_no_decay_params + expert_no_decay_params + router_no_decay_params
+            param_groups = [
+                {"params": decay_params, "weight_decay": config.weight_decay, "lr": config.max_lr, "lr_scale": 1.0, "name": "decay"},
+                {"params": no_decay_params, "weight_decay": 0.0, "lr": config.max_lr, "lr_scale": 1.0, "name": "nodecay"},
+                {"params": embed_params, "weight_decay": 0.0, "lr": embed_lr, "lr_scale": embed_lr_scale, "name": "embed"},
+            ]
+            param_groups = [g for g in param_groups if len(g["params"]) > 0]
+        
         if config.use_adafactor:
-            # PyTorch Adafactor: lr is the MAX for relative step size ρ_t, not a direct LR
-            # Paper and PyTorch default: lr=0.01 (used as: ρ_t = min(lr, 1/√t))
-            # The optimizer internally adapts step sizes - no manual scaling needed
-            # Reference: https://docs.pytorch.org/docs/stable/generated/torch.optim.Adafactor.html
-            adafactor_lr = 0.01  # Paper/PyTorch default, acts as ceiling for ρ_t
-            adafactor_embed_lr = adafactor_lr * embed_lr_scale  # Lower for embeddings
+            adafactor_lr = 0.01
+            for pg in param_groups:
+                pg["lr"] = adafactor_lr * pg.get("lr_scale", 1.0)
             
             self.optimizer = torch.optim.Adafactor(
-                [
-                    {"params": decay_params, "weight_decay": config.weight_decay},
-                    {"params": no_decay_params, "weight_decay": 0.0},
-                    {"params": embed_params, "weight_decay": 0.0, "lr": adafactor_embed_lr},
-                ],
+                param_groups,
                 lr=adafactor_lr,
-                beta2_decay=-0.8,  # Paper default
-                eps=(None, 1e-3),  # (eps1, eps2) - stabilization terms
-                d=1.0,  # Clipping threshold for update/weight ratio
-                weight_decay=0.0,  # Handled by param groups
-                foreach=True,  # Batch ops for speed
+                beta2_decay=-0.8,
+                eps=(None, 1e-3),
+                d=1.0,
+                weight_decay=0.0,
+                foreach=True,
             )
-            # Skip external LR scheduling - Adafactor manages its own step sizes
             self._skip_lr_schedule = True
-            self.logger.info(f"Using PyTorch Adafactor - lr={adafactor_lr:.2e} (internal 1/√t schedule, external LR schedule disabled)")
-            self.logger.info(f"  Embedding LR: {adafactor_embed_lr:.2e} ({embed_lr_scale}x base)")
-            self._embed_lr_scale = embed_lr_scale
+            self.logger.info(f"Using PyTorch Adafactor - lr={adafactor_lr:.2e} (internal 1/√t schedule)")
         elif config.use_8bit_adam:
             import bitsandbytes as bnb
-
             self.optimizer = bnb.optim.AdamW8bit(
-                [
-                    {"params": decay_params, "weight_decay": config.weight_decay},
-                    {"params": no_decay_params, "weight_decay": 0.0},
-                    {"params": embed_params, "weight_decay": 0.0, "lr": embed_lr},
-                ],
+                param_groups,
                 lr=config.max_lr,
                 betas=(0.9, 0.95),
             )
             self.logger.info("Using 8-bit AdamW (bitsandbytes) - ~75% optimizer memory savings")
-            self.logger.info(f"  Embedding LR: {embed_lr:.2e} ({embed_lr_scale}x base)")
-            self._embed_lr_scale = embed_lr_scale
         else:
             self.optimizer = torch.optim.AdamW(
-                [
-                    {"params": decay_params, "weight_decay": config.weight_decay},
-                    {"params": no_decay_params, "weight_decay": 0.0},
-                    {"params": embed_params, "weight_decay": 0.0, "lr": embed_lr},
-                ],
+                param_groups,
                 lr=config.max_lr,
                 betas=(0.9, 0.95),
-                fused=True,
+                fused=(self.device == "cuda"),
             )
-            self.logger.info(f"  Embedding LR: {embed_lr:.2e} ({embed_lr_scale}x base)")
-            self._embed_lr_scale = embed_lr_scale
+        
         self._param_groups = self.optimizer.param_groups
         use_scaler = config.dtype == "float16"
-        self.scaler = GradScaler("cuda", enabled=use_scaler)
+        self.scaler = GradScaler(self.device, enabled=use_scaler)
         self._use_scaler = use_scaler
+        
+        # Log parameter group summary
+        total_params = expert_param_count + router_param_count + backbone_param_count + embed_param_count
+        self.logger.info("=" * 60)
+        self.logger.info("OPTIMIZER PARAMETER GROUPS")
+        self.logger.info("=" * 60)
+        if use_per_component_lr:
+            self.logger.info(f"  🎯 Per-Component LR ENABLED (MoE gradient stabilization)")
+            wd_info = f", WD scale: {expert_wd_scale}x" if expert_wd_scale != 1.0 else ""
+            self.logger.info(f"  MoE Experts (moe_layers.*.experts.*): {expert_param_count:,} params ({100*expert_param_count/max(1,total_params):.1f}%) | LR scale: {expert_lr_scale}x{wd_info}")
+            self.logger.info(f"  MoE Routers (moe_layers.*.router.*):  {router_param_count:,} params ({100*router_param_count/max(1,total_params):.1f}%) | LR scale: {router_lr_scale}x")
+            self.logger.info(f"  Backbone (attn, MLP, norms, MoR/MoD): {backbone_param_count:,} params ({100*backbone_param_count/max(1,total_params):.1f}%) | LR scale: 1.0x")
+            self.logger.info(f"  Embeddings (tok_emb, recursion_emb):  {embed_param_count:,} params ({100*embed_param_count/max(1,total_params):.1f}%) | LR scale: {embed_lr_scale}x")
+        else:
+            self.logger.info(f"  Standard parameter groups (per-component LR disabled)")
+            self.logger.info(f"  Backbone params: {backbone_param_count + expert_param_count + router_param_count:,}")
+            self.logger.info(f"  Embedding params: {embed_param_count:,}")
+        self.logger.info(f"  Total trainable: {total_params:,}")
+        self.logger.info("=" * 60)
 
     def _setup_data(self) -> None:
         config = self.config
@@ -601,6 +708,35 @@ class Trainer:
             tokenizer_name=config.tokenizer_name,
             max_steps=config.max_steps,
         )
+
+        if self._moe_domain_expert_map:
+            self.logger.info(f"MoE domain->expert map: {self._moe_domain_expert_map}")
+            names = getattr(self.train_loader, "dataset_names", None)
+            if isinstance(names, list) and names:
+                self.logger.info(f"Interleaved sources: {names}")
+                missing = [n for n in names if n not in self._moe_domain_expert_map]
+                if missing:
+                    self.logger.info(
+                        "MoE domain forcing: no mapping for sources: " + ", ".join(str(x) for x in missing)
+                    )
+            # Log two-phase specialization strategy
+            forced_steps = int(getattr(config, "moe_forced_routing_steps", 0) or 0)
+            teacher_weight = float(getattr(config, "moe_teacher_weight", 0.0) or 0.0)
+            teacher_until = int(getattr(config, "moe_teacher_until_step", 0) or 0)
+            if forced_steps > 0 or teacher_weight > 0.0:
+                self.logger.info("=" * 60)
+                self.logger.info("🎯 MoE TWO-PHASE EXPERT SPECIALIZATION ENABLED")
+                self.logger.info("=" * 60)
+                if forced_steps > 0:
+                    self.logger.info(f"  Phase 1 (HARD FORCING): steps 0-{forced_steps}")
+                    self.logger.info("    → Domain batches forced to mapped expert (bypasses router)")
+                if teacher_weight > 0.0:
+                    until_str = f"step {teacher_until}" if teacher_until > 0 else "forever"
+                    phase2_start = f"step {forced_steps}" if forced_steps > 0 else "step 0"
+                    self.logger.info(f"  Phase 2 (TEACHER SUPERVISION): {phase2_start} to {until_str}")
+                    self.logger.info("    → Router chooses freely, but CE loss guides toward domain expert")
+                    self.logger.info(f"    → Teacher loss weight (alpha): {teacher_weight}")
+                self.logger.info("=" * 60)
         if hasattr(self.train_loader, "set_max_steps"):
             self.train_loader.set_max_steps(config.max_steps)
         self._tokens_per_step = config.batch_size * config.grad_accum_steps * initial_seq_len
@@ -611,7 +747,10 @@ class Trainer:
         self.logger.info(f"\n{'='*70}")
         self.logger.info(f"RESUMING FROM CHECKPOINT: {checkpoint_path}")
         self.logger.info(f"{'='*70}")
-        checkpoint = torch.load(checkpoint_path, weights_only=False, map_location=self.device)
+        
+        # Load checkpoint to CPU first to avoid OOM from loading large optimizer states
+        # Model weights will be moved to device during load_state_dict
+        checkpoint = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
         model = self.model
         if hasattr(model, "_orig_mod"):
             model = model._orig_mod
@@ -639,19 +778,117 @@ class Trainer:
 
         # strict=False because we intentionally exclude cache buffers.
         model.load_state_dict(state_dict, strict=False)
+
+        def _sanitize_bitsandbytes_state_for_step() -> bool:
+            """Return True if bnb optimizer state looks usable; else clear it.
+
+            bitsandbytes initializes per-parameter state only when `len(state)==0`.
+            If we load a checkpoint from a *non-bnb* optimizer (e.g., torch AdamW),
+            the loaded state dict can contain keys like `exp_avg`/`exp_avg_sq` and
+            `step`, which makes `len(state)>0` but lacks bnb's required buffers
+            (`state1`/`state2`, etc.), causing a KeyError on the first step.
+            """
+
+            if not bool(getattr(self.config, "use_8bit_adam", False)):
+                return True
+
+            try:
+                if not str(getattr(self.optimizer.__class__, "__module__", "")).startswith("bitsandbytes"):
+                    return True
+            except Exception:
+                return True
+
+            cleared = 0
+            # Iterate over the optimizer's current parameter states.
+            for p, state in list(getattr(self.optimizer, "state", {}).items()):
+                try:
+                    if not isinstance(state, dict) or len(state) == 0:
+                        continue
+                    # Minimum required keys for `update_step`.
+                    if ("step" not in state) or ("state1" not in state) or ("state2" not in state):
+                        state.clear()
+                        cleared += 1
+                        continue
+                    # Additional required keys when running in 8-bit mode.
+                    s1 = state.get("state1")
+                    if hasattr(s1, "dtype") and s1.dtype == torch.uint8:
+                        if ("qmap1" not in state) or ("qmap2" not in state):
+                            state.clear()
+                            cleared += 1
+                            continue
+                        has_blockwise = ("absmax1" in state) and ("absmax2" in state)
+                        has_non_blockwise = (
+                            ("max1" in state)
+                            and ("max2" in state)
+                            and ("new_max1" in state)
+                            and ("new_max2" in state)
+                        )
+                        if not (has_blockwise or has_non_blockwise):
+                            state.clear()
+                            cleared += 1
+                            continue
+                except Exception:
+                    try:
+                        state.clear()
+                    except Exception:
+                        pass
+                    cleared += 1
+
+            if cleared > 0:
+                self.logger.warning(
+                    f"  ⚠️  bitsandbytes optimizer state incompatible for {cleared} params; "
+                    "resetting 8-bit optimizer state (moments will be re-initialized)"
+                )
+                return False
+            return True
+
         optimizer_loaded = False
         scaler_loaded = False
         rng_loaded = False
-        try:
-            self.optimizer.load_state_dict(checkpoint["optimizer"])
-            optimizer_loaded = True
-        except ValueError as e:
-            # Common after changing optimizer grouping or adding/removing params.
-            # Keep training going: resume weights + step, but re-init optimizer state.
-            self.logger.warning("  ⚠️  Optimizer state incompatible with current parameter groups; skipping optimizer resume")
-            self.logger.warning(f"  Reason: {e}")
+        
+        # Detect optimizer type mismatch BEFORE loading (avoids OOM from allocating old state)
+        skip_optimizer_load = False
+        if "optimizer" in checkpoint:
+            ckpt_opt_state = checkpoint["optimizer"]
+            # Check if checkpoint has AdamW-style state but we're using 8-bit or Adafactor
+            if isinstance(ckpt_opt_state, dict) and "state" in ckpt_opt_state:
+                ckpt_param_state = ckpt_opt_state.get("state", {})
+                # Sample first param state to detect optimizer type
+                for _, pstate in ckpt_param_state.items():
+                    if isinstance(pstate, dict):
+                        has_adamw_keys = "exp_avg" in pstate and "exp_avg_sq" in pstate
+                        has_bnb_keys = "state1" in pstate and "state2" in pstate
+                        
+                        # Switching FROM AdamW TO 8-bit/Adafactor - skip to avoid OOM
+                        if has_adamw_keys and not has_bnb_keys:
+                            if getattr(self.config, "use_8bit_adam", False):
+                                self.logger.warning("  ⚠️  Checkpoint has AdamW state but using 8-bit Adam - skipping optimizer load to avoid OOM")
+                                skip_optimizer_load = True
+                            elif getattr(self.config, "use_adafactor", False):
+                                self.logger.warning("  ⚠️  Checkpoint has AdamW state but using Adafactor - skipping optimizer load")
+                                skip_optimizer_load = True
+                        break  # Only need to check one param
+        
+        if not skip_optimizer_load:
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer"])
+                optimizer_loaded = _sanitize_bitsandbytes_state_for_step()
+                if not optimizer_loaded:
+                    # Avoid LR scaling based on a checkpoint optimizer LR we didn't actually restore.
+                    self._resume_lr_scale = 1.0
+            except Exception as e:
+                # Common after changing optimizer type/grouping or adding/removing params.
+                # Keep training going: resume weights + step, but re-init optimizer state.
+                self.logger.warning(
+                    "  ⚠️  Optimizer state incompatible with current optimizer; skipping optimizer resume"
+                )
+                self.logger.warning(f"  Reason: {e}")
+                self.logger.warning("  Continuing with freshly initialized optimizer (momentum/Adam moments reset)")
+                optimizer_loaded = False
+                # Avoid LR scaling based on a checkpoint optimizer LR we didn't apply.
+                self._resume_lr_scale = 1.0
+        else:
             self.logger.warning("  Continuing with freshly initialized optimizer (momentum/Adam moments reset)")
-            # Avoid LR scaling based on a checkpoint optimizer LR we didn't apply.
             self._resume_lr_scale = 1.0
         try:
             self.scaler.load_state_dict(checkpoint["scaler"])
@@ -744,8 +981,12 @@ class Trainer:
         # Restore trainer-side EMA used for curriculum/gating (best-effort)
         try:
             extra = checkpoint.get("trainer_state", {})
-            if isinstance(extra, dict) and "ce_ema" in extra:
-                self._resume_ce_ema = float(extra.get("ce_ema", 0.0) or 0.0)
+            if isinstance(extra, dict):
+                if "ce_ema" in extra:
+                    self._resume_ce_ema = float(extra.get("ce_ema", 0.0) or 0.0)
+                if "grad_norm_ema" in extra:
+                    self._grad_norm_ema = float(extra.get("grad_norm_ema", 0.0) or 0.0)
+                    self.logger.info(f"  Restored grad_norm_ema: {self._grad_norm_ema:.1f}")
         except Exception:
             self._resume_ce_ema = 0.0
         self._checkpoint_adaptive_state = None
@@ -766,7 +1007,136 @@ class Trainer:
                 )
         else:
             self._resume_rewarmup_steps = 0
+        
+        # MoE per-component LR re-warmup (for mid-run optimizer reset / hot-fix)
+        # This is triggered when moe_lr_rewarmup_steps > 0, indicating user intentionally
+        # wants to re-warmup after applying new per-component LR scales (momentum states lost).
+        moe_rewarmup_steps = int(getattr(self.config, "moe_lr_rewarmup_steps", 0) or 0)
+        if moe_rewarmup_steps > 0 and int(self._start_step) > 0:
+            self._moe_rewarmup_start_step = int(self._start_step)
+            self.logger.info("=" * 60)
+            self.logger.info("🔧 MoE LR RE-WARMUP ENABLED (hot-fix for gradient instability)")
+            self.logger.info("=" * 60)
+            self.logger.info(f"  Re-warmup steps: {moe_rewarmup_steps}")
+            self.logger.info(f"  Starting from step: {self._start_step}")
+            self.logger.info(f"  Will ramp LR from 0 -> target over {moe_rewarmup_steps} steps")
+            if getattr(self, "_use_per_component_lr", False):
+                self.logger.info(f"  Expert LR scale: {self._expert_lr_scale}x (stabilize upcycled experts)")
+                self.logger.info(f"  Router LR scale: {self._router_lr_scale}x (accelerate router learning)")
+            self.logger.info("=" * 60)
+        
+        # Apply MoE expert diversity noise post-load to break symmetry on resumed checkpoints
+        # This is critical for identity-init MoE that hasn't specialized yet
+        if hasattr(self.config, "moe_expert_diversity_noise") and self.config.moe_expert_diversity_noise > 0:
+            noise_std = self.config.moe_expert_diversity_noise
+            model = self.model
+            if hasattr(model, "_orig_mod"):
+                model = model._orig_mod
+            if hasattr(model, "moe_layers") and len(model.moe_layers) > 0:
+                with torch.no_grad():
+                    perturbed_count = 0
+                    for layer_idx, moe_layer in enumerate(model.moe_layers):
+                        if hasattr(moe_layer, "experts"):
+                            for expert_idx, expert in enumerate(moe_layer.experts):
+                                # Deterministic seed per (layer, expert) for reproducibility
+                                gen = torch.Generator(device=expert.gate_up.weight.device)
+                                gen.manual_seed(42 + layer_idx * 1000 + expert_idx * 137)
+                                for param in expert.parameters():
+                                    noise = torch.randn_like(param, generator=gen) * noise_std
+                                    param.add_(noise)
+                                perturbed_count += 1
+                self.logger.info(f"  ⚡ Applied diversity noise (std={noise_std}) to {perturbed_count} MoE experts to break symmetry")
+        
         self.logger.info(f"{'='*70}\n")
+
+    def _compute_moe_divergence(self) -> tuple[float, float, list[float]]:
+        """Compute MoE expert divergence, routing entropy, and utilization.
+        
+        Divergence: 1 - avg(cosine_similarity) between expert weight pairs.
+            0 = identical experts, 1 = orthogonal/maximally different.
+        Entropy: Actual routing entropy from router stats (not placeholder).
+        Utilization: Fraction of tokens routed to each expert (accumulated over interval).
+        
+        Returns:
+            (divergence, entropy, utilization_list)
+        """
+        import math
+        import torch.nn.functional as F
+        
+        model = self.model
+        if hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        
+        if not hasattr(model, "moe_layers") or len(model.moe_layers) == 0:
+            return 0.0, 0.0, []
+        
+        # Compute pairwise cosine distance between expert weights
+        all_cos_distances = []
+        num_experts = 0
+        all_utilizations = []
+        all_entropies = []
+        
+        with torch.no_grad():
+            for moe_layer in model.moe_layers:
+                if not hasattr(moe_layer, "experts"):
+                    continue
+                experts = moe_layer.experts
+                num_experts = len(experts)
+                
+                # Flatten expert weights for cosine similarity
+                weights = [experts[i].gate_up.weight.float().flatten() for i in range(num_experts)]
+                
+                # Pairwise cosine distance: 1 - cos_sim (0=identical, 1=orthogonal, 2=opposite)
+                for i in range(num_experts):
+                    for j in range(i + 1, num_experts):
+                        cos_sim = F.cosine_similarity(weights[i].unsqueeze(0), weights[j].unsqueeze(0)).item()
+                        cos_distance = 1.0 - cos_sim  # 0=identical, 1=orthogonal
+                        all_cos_distances.append(cos_distance)
+                
+                # Get real routing stats from router if available
+                if hasattr(moe_layer, "router"):
+                    router = moe_layer.router
+                    # Prefer accumulated counts (better signal across multiple batches)
+                    if hasattr(router, "_expert_counts_accum") and hasattr(router, "_expert_counts_n"):
+                        n = router._expert_counts_n.item()
+                        if n > 0:
+                            counts = (router._expert_counts_accum / n).detach().cpu().float()
+                        else:
+                            counts = router._expert_counts.detach().cpu().float() if hasattr(router, "_expert_counts") else None
+                    elif hasattr(router, "_expert_counts"):
+                        counts = router._expert_counts.detach().cpu().float()
+                    else:
+                        counts = None
+                    
+                    if counts is not None and counts.sum() > 0:
+                        probs = counts / counts.sum()
+                        all_utilizations.append(probs.tolist())
+                        # Compute actual entropy: -sum(p * log(p))
+                        entropy = -sum(p * math.log(p + 1e-10) for p in probs.tolist())
+                        all_entropies.append(entropy)
+                    
+                    # Reset accumulated counts after reading
+                    if hasattr(router, "reset_accumulated_counts"):
+                        router.reset_accumulated_counts()
+        
+        # Average divergence across all layers and pairs
+        avg_divergence = sum(all_cos_distances) / len(all_cos_distances) if all_cos_distances else 0.0
+        
+        # Average entropy across layers (or estimate from uniform if no stats)
+        if all_entropies:
+            avg_entropy = sum(all_entropies) / len(all_entropies)
+        else:
+            # Fallback: max entropy for uniform routing
+            avg_entropy = math.log(num_experts) if num_experts > 1 else 0.0
+        
+        # Average utilization across layers
+        if all_utilizations:
+            avg_util = [sum(u[i] for u in all_utilizations) / len(all_utilizations) 
+                        for i in range(num_experts)]
+        else:
+            avg_util = [1.0 / num_experts] * num_experts if num_experts > 0 else []
+        
+        return avg_divergence, avg_entropy, avg_util
 
     def _count_params(self) -> int:
         return sum(p.numel() for p in self.model.parameters())
@@ -811,13 +1181,10 @@ class Trainer:
         self.logger.info(f"{'='*70}\n")
 
     def _apply_seq_len_policy(self, seq_len: int) -> None:
-        policy = self._seq_len_policy
-        if not policy:
+        if not self._seq_len_policy.is_active:
             return
 
-        patch = _policy_for_seq_len(policy, int(seq_len))
-        if not patch and bool(policy.get("_auto", False)):
-            patch = _auto_policy_for_seq_len(int(seq_len))
+        patch = self._seq_len_policy.get_patch(int(seq_len))
         if not patch:
             return
 
@@ -872,6 +1239,16 @@ class Trainer:
 
     def _get_batch(self) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         batch = self.train_loader.get_batch()
+        # Keep source metadata (if present) for MoE domain forcing/teacher.
+        try:
+            self._last_batch_source_name = batch.get("source_name")
+        except Exception:
+            self._last_batch_source_name = None
+
+        sn = self._last_batch_source_name
+        if isinstance(sn, str) and sn:
+            self._source_name_counts[sn] = self._source_name_counts.get(sn, 0) + 1
+            self._source_name_counts_total[sn] = self._source_name_counts_total.get(sn, 0) + 1
         mask = batch.get("attention_mask")
         if mask is not None:
             mask = mask.to(self.device, non_blocking=True)
@@ -880,51 +1257,6 @@ class Trainer:
             batch["labels"].to(self.device, non_blocking=True),
             mask,
         )
-
-    @torch.no_grad()
-    def _compute_token_losses_from_hidden(
-        self,
-        hidden: torch.Tensor,
-        weight: torch.Tensor,
-        targets: torch.Tensor,
-        ignore_index: int = -100,
-        token_chunk_size: int = 2048,
-        vocab_chunk_size: int = 4096,
-    ) -> torch.Tensor:
-        """Compute per-token cross-entropy losses without storing full logits.
-
-        This is used to support loss-driven routing (MoR) and loss-aware MoD
-        supervision when training uses chunked CE (logits may be omitted).
-        Returns [B, L] float32 losses with ignored positions set to 0.
-        """
-        B, L, D = hidden.shape
-        V = weight.shape[0]
-        N = B * L
-
-        h = hidden.view(N, D).float()
-        t = targets.view(N)
-        valid = t != ignore_index
-
-        # Correct-class logits (only for valid positions)
-        correct_logits = torch.zeros((N,), device=hidden.device, dtype=torch.float32)
-        if valid.any():
-            w_y = weight[t[valid]].float()  # [M, D]
-            correct_logits[valid] = (h[valid] * w_y).sum(dim=1)
-
-        losses = torch.zeros((N,), device=hidden.device, dtype=torch.float32)
-        for t0 in range(0, N, token_chunk_size):
-            t1 = min(N, t0 + token_chunk_size)
-            h_chunk = h[t0:t1]  # [T, D]
-            lse = torch.full((t1 - t0,), -float("inf"), device=hidden.device, dtype=torch.float32)
-            for v0 in range(0, V, vocab_chunk_size):
-                v1 = min(V, v0 + vocab_chunk_size)
-                w_chunk = weight[v0:v1].float()  # [C, D]
-                logits_chunk = h_chunk @ w_chunk.t()  # [T, C]
-                lse = torch.logaddexp(lse, torch.logsumexp(logits_chunk, dim=1))
-            losses[t0:t1] = lse - correct_logits[t0:t1]
-
-        losses = losses * valid.float()
-        return losses.view(B, L)
 
     def train(self) -> TrainingMetrics:
         config = self.config
@@ -946,6 +1278,19 @@ class Trainer:
         param_groups = self._param_groups
         loss_scale = 1.0 / grad_accum
 
+        # Dynamic gradient clipping state
+        _use_dynamic_clip = bool(getattr(config, "grad_clip_dynamic", False))
+        _clip_k = float(getattr(config, "grad_clip_k", 2.0))
+        _clip_min = float(getattr(config, "grad_clip_min", 5.0))
+        _clip_max = float(getattr(config, "grad_clip_max", 500.0))
+        _clip_ema_alpha = float(getattr(config, "grad_clip_ema_alpha", 0.05))
+        # Initialize EMA from checkpoint or static grad_clip (R2/R5 mitigation)
+        _grad_norm_ema = float(getattr(self, "_grad_norm_ema", 0.0) or 0.0)
+        if _grad_norm_ema <= 0:
+            _grad_norm_ema = float(grad_clip) / _clip_k  # Start so dynamic_clip = grad_clip
+        self._grad_norm_ema = _grad_norm_ema  # Initialize slot
+        if _use_dynamic_clip:
+            self.logger.info(f"Dynamic gradient clipping: ENABLED (k={_clip_k}, min={_clip_min}, max={_clip_max}, ema={_grad_norm_ema:.1f})")
         start_step = self._start_step
         use_mod_mor = bool(getattr(self, "_use_mod_mor", False))
         use_scaler = bool(getattr(self, "_use_scaler", False))
@@ -961,23 +1306,119 @@ class Trainer:
             self.logger.info("Starting training...")
         self.logger.info("-" * 70)
         model.train()
+
+        # Peak VRAM tracking (for quick smoke runs / capacity estimates)
+        _is_cuda_device = False
+        if torch.cuda.is_available():
+            if isinstance(device, torch.device):
+                _is_cuda_device = device.type == "cuda"
+            elif isinstance(device, str):
+                _is_cuda_device = device.startswith("cuda")
+
+        _track_peak_vram = bool(_is_cuda_device)
+        _cuda_device_idx = torch.cuda.current_device() if _track_peak_vram else None
+        if _track_peak_vram:
+            try:
+                torch.cuda.reset_peak_memory_stats(device=_cuda_device_idx)
+            except Exception:
+                pass
+
         metrics.start_time = time.time()
         self._last_aux_loss = 0.0
         self._ce_ema = float(getattr(self, "_resume_ce_ema", 0.0) or 0.0) if start_step > 0 else 0.0
         eval_batches = 25
-        eval_dataset = config.dataset_name
-        if config.dataset_name.startswith("pretrain_") or config.dataset_name in ["sft_chat"]:
+        eval_dataset = str(getattr(config, "eval_dataset_name", "") or "")
+        if not eval_dataset:
+            eval_dataset = config.dataset_name
+            if config.dataset_name.startswith("pretrain_"):
+                eval_dataset = "pretrain_default_eval"
+                self.logger.info(
+                    f"📊 Using pretrain_default_eval for evaluation (train dataset: {config.dataset_name})"
+                )
+            elif config.dataset_name in ["sft_chat"]:
+                eval_dataset = "wikitext2"
+                self.logger.info(
+                    f"📊 Using wikitext2 for evaluation (train dataset: {config.dataset_name})"
+                )
+        else:
+            self.logger.info(
+                f"📊 Using {eval_dataset} for evaluation (override; train dataset: {config.dataset_name})"
+            )
+
+        try:
+            eval_loader = create_universal_loader(
+                dataset=eval_dataset,
+                batch_size=config.batch_size,
+                seq_len=self._current_seq_len,
+                vocab_size=config.vocab_size,
+                device="cpu",
+                tokenizer_name=config.tokenizer_name,
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"⚠️  Failed to create eval loader for dataset='{eval_dataset}': {type(e).__name__}: {e}"
+            )
+            self.logger.warning("   Falling back to wikitext2 for evaluation.")
             eval_dataset = "wikitext2"
-            self.logger.info(f"📊 Using wikitext2 for evaluation (mixed dataset: {config.dataset_name})")
-        eval_loader = create_universal_loader(
-            dataset=eval_dataset,
-            batch_size=config.batch_size,
-            seq_len=self._current_seq_len,
-            vocab_size=config.vocab_size,
-            device="cpu",
-            tokenizer_name=config.tokenizer_name,
-        )
+            eval_loader = create_universal_loader(
+                dataset=eval_dataset,
+                batch_size=config.batch_size,
+                seq_len=self._current_seq_len,
+                vocab_size=config.vocab_size,
+                device="cpu",
+                tokenizer_name=config.tokenizer_name,
+            )
         fixed_eval_batches = [eval_loader.get_batch() for _ in range(eval_batches)]
+
+        # Optional: for mixed eval presets, also build per-component fixed eval batches
+        # so we can report per-source eval loss (e.g. "math died, web improved").
+        fixed_eval_batches_by_component: Dict[str, List[dict]] = {}
+        eval_component_weights: Dict[str, float] = {}
+        try:
+            eval_cfg = DATASET_CONFIGS.get(eval_dataset, {}) if isinstance(DATASET_CONFIGS, dict) else {}
+            sources = None
+            if isinstance(eval_cfg, dict) and eval_cfg.get("mixed"):
+                sources = eval_cfg.get("sources")
+            elif isinstance(eval_cfg, dict) and eval_cfg.get("mixed_by_seq"):
+                seq_key = str(int(self._current_seq_len))
+                seq_cfg = eval_cfg.get("mixed_by_seq", {}).get(seq_key)
+                if seq_cfg is None:
+                    # Best-effort: pick nearest available seq
+                    available = [int(k) for k in eval_cfg.get("mixed_by_seq", {}).keys() if str(k).isdigit()]
+                    if available:
+                        nearest = min(available, key=lambda v: abs(v - int(self._current_seq_len)))
+                        seq_cfg = eval_cfg.get("mixed_by_seq", {}).get(str(nearest))
+                if isinstance(seq_cfg, dict):
+                    sources = seq_cfg.get("sources")
+
+            if isinstance(sources, list) and sources:
+                # Keep total eval work roughly constant: split eval_batches across components.
+                per_comp_batches = max(1, int(math.ceil(eval_batches / max(1, len(sources)))))
+                for s in sources:
+                    name = str(s.get("name", ""))
+                    if not name:
+                        continue
+                    try:
+                        eval_component_weights[name] = float(s.get("weight", 0.0) or 0.0)
+                    except Exception:
+                        eval_component_weights[name] = 0.0
+                    try:
+                        comp_loader = create_universal_loader(
+                            dataset=name,
+                            batch_size=config.batch_size,
+                            seq_len=self._current_seq_len,
+                            vocab_size=config.vocab_size,
+                            device="cpu",
+                            tokenizer_name=config.tokenizer_name,
+                        )
+                        fixed_eval_batches_by_component[name] = [comp_loader.get_batch() for _ in range(per_comp_batches)]
+                    except Exception as e:
+                        self.logger.warning(
+                            f"⚠️  Skipping eval component '{name}': failed to create loader ({type(e).__name__}: {e})"
+                        )
+        except Exception:
+            fixed_eval_batches_by_component = {}
+            eval_component_weights = {}
         
         # Sanity check flag: run once at first eval to verify eval codepath
         _eval_sanity_done = False
@@ -1070,20 +1511,11 @@ class Trainer:
             env_min=_env_spike_min,
         )
 
-        # Spike tracker for rolling window rate analysis
-        _halt_spike_window = int(os.environ.get("HYDRA_HALT_SPIKE_WINDOW", "200") or 200)
-        _halt_spike_count = int(os.environ.get("HYDRA_HALT_SPIKE_COUNT", "10") or 10)
-        _spike_tracker = _spike.SpikeTracker(window_size=_halt_spike_window)
-
-        # Halt policy (no spike-based halts):
-        # - Halt on NaN/Inf loss or gradients
-        # - Halt on sustained EMA degradation (but only if EMA is also high)
-        _halt_ema_window = int(os.environ.get("HYDRA_HALT_EMA_WINDOW", "200") or 200)
-        # Relaxed default: 0.5 (was 0.3, too sensitive for MoR curriculum learning)
-        _halt_ema_delta = float(os.environ.get("HYDRA_HALT_EMA_DELTA", "0.5") or 0.5)
-        # Absolute EMA threshold: don't halt if EMA is still below this (model is learning fine)
-        _halt_ema_abs = float(os.environ.get("HYDRA_HALT_EMA_ABS", "8.0") or 8.0)
-        _ema_hist = deque(maxlen=max(2, _halt_ema_window + 1))
+        # HaltController owns all halt-related env vars, EMA tracking, and decision logic
+        _halt_controller = HaltController.from_env(debug=getattr(self.config, "ema_debug", False))
+        
+        # Spike tracker for rolling window rate analysis (window size from HaltController)
+        _spike_tracker = _spike.SpikeTracker(window_size=_halt_controller.spike_window)
 
         if os.environ.get("HYDRA_SMART_HALT_ON_SPIKE", "0") == "1":
             self.logger.warning("HYDRA_SMART_HALT_ON_SPIKE is deprecated/ignored (spikes never halt training).")
@@ -1100,6 +1532,23 @@ class Trainer:
         _diag_steps = _step_diag.get_diag_steps_from_env(start_step)
 
         step = int(start_step)
+
+        # Graceful shutdown handling for Ctrl+C
+        _interrupt_requested = False
+        _original_sigint_handler = signal.getsignal(signal.SIGINT)
+        
+        def _handle_interrupt(signum, frame):
+            nonlocal _interrupt_requested
+            if _interrupt_requested:
+                # Second Ctrl+C: force exit
+                self.logger.warning("\n⚠️  Second interrupt received - forcing exit without save")
+                signal.signal(signal.SIGINT, _original_sigint_handler)
+                raise KeyboardInterrupt
+            _interrupt_requested = True
+            self.logger.info("\n🛑 Interrupt received - will save checkpoint and exit after current step completes")
+            self.logger.info("   (Press Ctrl+C again to force immediate exit without saving)")
+        
+        signal.signal(signal.SIGINT, _handle_interrupt)
 
         while step < max_steps:
             step_start = time.time()
@@ -1123,10 +1572,50 @@ class Trainer:
 
             for micro_step in range(grad_accum):
                 x, y, mask = self._get_batch()
+
+                # Optional MoE domain forcing + router teacher target.
+                # Done here (outside autocast/compile regions) to avoid sync/graph issues.
+                #
+                # Two-Phase Expert Specialization:
+                # - Phase 1 (Hard Forcing): step < moe_forced_routing_steps
+                #   All tokens from domain X are forced to expert X (bypasses router).
+                #   Controlled by: moe_forced_routing_steps > 0 && step < that value.
+                # - Phase 2 (Teacher Supervision): step >= moe_forced_routing_steps (or always if moe_teacher_weight > 0)
+                #   Router chooses freely, but CE(router_logits, target_domain) is added to loss.
+                #   Controlled by: moe_teacher_weight > 0.0 && (step < moe_teacher_until_step OR moe_teacher_until_step == 0 for "forever").
+                #
+                # Both phases use the same domain->expert mapping (moe_domain_expert_map).
+                try:
+                    base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+                    moe_layers = getattr(base_model, "moe_layers", None)
+                    if moe_layers is not None and len(moe_layers) > 0:
+                        source_name = self._last_batch_source_name
+                        expert_id = -1
+                        if isinstance(source_name, str) and self._moe_domain_expert_map:
+                            expert_id = int(self._moe_domain_expert_map.get(source_name, -1))
+
+                        # Force phase: expert_id >= 0 tells router to hard-route to this expert
+                        # (only effective while global_step < forced_routing_steps in router).
+                        forced_expert_id = expert_id if expert_id >= 0 else -1
+
+                        # Teacher phase: expert_id >= 0 tells router to compute CE loss toward this expert.
+                        # Active when moe_teacher_weight > 0. Step cutoff handled inside router
+                        # (moe_teacher_until_step=0 means forever, >0 means until that step).
+                        teacher_weight = float(getattr(self.config, "moe_teacher_weight", 0.0) or 0.0)
+                        teacher_target_id = forced_expert_id if teacher_weight > 0.0 else -1
+
+                        for moe_block in moe_layers:
+                            if hasattr(moe_block, "set_forced_expert"):
+                                moe_block.set_forced_expert(forced_expert_id)
+                            if hasattr(moe_block, "set_teacher_target"):
+                                moe_block.set_teacher_target(teacher_target_id)
+                except Exception:
+                    pass
+
                 if self.device == "cuda" and self.config.use_compile:
                     torch.compiler.cudagraph_mark_step_begin()
                 with autocast(device, dtype=dtype):
-                    loss, ce_loss, logits, aux_loss_t, ponder_loss_t, advantage_loss_t = compute_microbatch_loss(
+                    loss, ce_loss, logits, aux_loss_t, ponder_loss_t, advantage_loss_t, moe_aux_loss_t = compute_microbatch_loss(
                         model=model,
                         x=x,
                         y=y,
@@ -1136,7 +1625,7 @@ class Trainer:
                         dtype=dtype,
                         use_mod_mor=use_mod_mor,
                         track_loss_scalars=track_loss_scalars,
-                        compute_token_losses_from_hidden=lambda hidden, weight, targets: self._compute_token_losses_from_hidden(
+                        compute_token_losses_from_hidden=lambda hidden, weight, targets: compute_token_losses_from_hidden(
                             hidden,
                             weight,
                             targets,
@@ -1158,6 +1647,11 @@ class Trainer:
                         self._last_advantage_loss = (
                             advantage_loss_t.detach()
                             if isinstance(advantage_loss_t, torch.Tensor)
+                            else torch.tensor(0.0, device=self.device)
+                        )
+                        self._last_moe_aux_loss = (
+                            moe_aux_loss_t.detach()
+                            if isinstance(moe_aux_loss_t, torch.Tensor)
                             else torch.tensor(0.0, device=self.device)
                         )
                 if collect_micro_diag:
@@ -1272,11 +1766,24 @@ class Trainer:
             if _step_diag_ctx.active:
                 _step_diag.collect_phase2_preclip_grads(_step_diag_ctx, model, self.logger)
 
+            # Dynamic gradient clipping: compute adaptive threshold
+            if _use_dynamic_clip:
+                # Compute dynamic clip: clamp between min and max (R1 mitigation)
+                dynamic_clip = min(_clip_max, max(_clip_min, _clip_k * _grad_norm_ema))
+                effective_clip = dynamic_clip
+            else:
+                effective_clip = grad_clip
+
             base = model._orig_mod if hasattr(model, "_orig_mod") else model
-            pre_clip_norm_t = torch.nn.utils.clip_grad_norm_(base.parameters(), grad_clip)
+            pre_clip_norm_t = torch.nn.utils.clip_grad_norm_(base.parameters(), effective_clip)
             pre_clip_norm = float(pre_clip_norm_t) if torch.is_tensor(pre_clip_norm_t) else float(pre_clip_norm_t)
 
-            clipped_this_step = math.isfinite(pre_clip_norm) and (pre_clip_norm > float(grad_clip))
+            # Update gradient norm EMA (R4 mitigation: skip NaN/Inf)
+            if _use_dynamic_clip and math.isfinite(pre_clip_norm):
+                _grad_norm_ema = _clip_ema_alpha * pre_clip_norm + (1 - _clip_ema_alpha) * _grad_norm_ema
+                self._grad_norm_ema = _grad_norm_ema  # Store for checkpoint save
+
+            clipped_this_step = math.isfinite(pre_clip_norm) and (pre_clip_norm > float(effective_clip))
             _clip_hist.append(1 if clipped_this_step else 0)
             clip_pct = 100.0 * (sum(_clip_hist) / max(1, len(_clip_hist)))
 
@@ -1286,10 +1793,10 @@ class Trainer:
                 _step_diag.log_step_diagnostics(_step_diag_ctx, accum_loss, self.logger)
 
             self._last_pre_clip_norm = pre_clip_norm  # Store for diagnostics
-            grad_norm = min(pre_clip_norm, float(grad_clip)) if math.isfinite(pre_clip_norm) else float("nan")
+            grad_norm = min(pre_clip_norm, float(effective_clip)) if math.isfinite(pre_clip_norm) else float("nan")
 
             # Clip coefficient implied by global norm (uniform scaling factor).
-            clip_coef = grad_clip / (pre_clip_norm + 1e-12)
+            clip_coef = effective_clip / (pre_clip_norm + 1e-12)
             clip_scale = min(1.0, clip_coef) if math.isfinite(clip_coef) else 0.0
             try:
                 scaler_scale = float(scaler.get_scale()) if use_scaler else None
@@ -1375,6 +1882,7 @@ class Trainer:
                     self._save_checkpoint(step)
                     if profiler:
                         profiler.stop()
+                    signal.signal(signal.SIGINT, _original_sigint_handler)
                     metrics.end_time = time.time()
                     return metrics
 
@@ -1397,6 +1905,7 @@ class Trainer:
                         self.logger.warning(f"  ⚠️  Halt: failed to save state ({e})")
                     if profiler:
                         profiler.stop()
+                    signal.signal(signal.SIGINT, _original_sigint_handler)
                     metrics.end_time = time.time()
                     return metrics
 
@@ -1405,20 +1914,51 @@ class Trainer:
                     lr = lr_effective
                     self.logger.warning(f"  🔻 Spike response: mild LR cooldown x{_grad_spike_lr_factor}")
 
-            # Skip LR updates for Adafactor (uses internal 1/√t schedule)
+            # =================================================================
+            # MoE LR Re-Warmup Logic (for mid-run optimizer reset)
+            # =================================================================
+            # When resuming with new per-component LR groups (momentum states lost),
+            # linearly ramp LR from 0 to target over moe_lr_rewarmup_steps.
+            moe_rewarmup_steps = int(getattr(self.config, "moe_lr_rewarmup_steps", 0) or 0)
+            moe_rewarmup_start = int(getattr(self, "_moe_rewarmup_start_step", 0) or 0)
+            if moe_rewarmup_steps > 0 and moe_rewarmup_start > 0:
+                rel_step = step - moe_rewarmup_start
+                if 0 <= rel_step < moe_rewarmup_steps:
+                    # Linear ramp from 0 to 1
+                    rewarmup_frac = (rel_step + 1) / moe_rewarmup_steps
+                    lr = lr * rewarmup_frac
+                    if step % 25 == 0:
+                        self.logger.info(f"  [MoE Re-Warmup] step {rel_step+1}/{moe_rewarmup_steps} | LR frac: {rewarmup_frac:.3f}")
+
+            # =================================================================
+            # Per-Component LR Application
+            # =================================================================
+            # Apply LR to each parameter group with its configured scale factor.
+            # This ensures experts get slower LR and routers get faster LR.
             if not self._skip_lr_schedule:
-                embed_lr_scale = getattr(self, "_embed_lr_scale", 1.0)
-                for i, pg in enumerate(param_groups):
-                    # Param group 2 (index 2) is embeddings - apply lower LR scale
-                    if i == 2 and embed_lr_scale < 1.0:
-                        pg["lr"] = lr * embed_lr_scale
-                    else:
-                        pg["lr"] = lr
+                use_per_component = getattr(self, "_use_per_component_lr", False)
+                for pg in param_groups:
+                    # Each group has lr_scale stored from _setup_optimizer
+                    lr_scale = float(pg.get("lr_scale", 1.0))
+                    pg["lr"] = lr * lr_scale
             if use_scaler:
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 optimizer.step()
+
+            # Log peak VRAM for the first couple optimizer steps (avoid log spam)
+            if _track_peak_vram and step < (start_step + 2):
+                try:
+                    torch.cuda.synchronize(device=_cuda_device_idx)
+                    peak_alloc = float(torch.cuda.max_memory_allocated(device=_cuda_device_idx))
+                    peak_reserved = float(torch.cuda.max_memory_reserved(device=_cuda_device_idx))
+                    gib = 1024.0 ** 3
+                    self.logger.info(
+                        f"[VRAM] peak_alloc={peak_alloc / gib:.2f} GiB, peak_reserved={peak_reserved / gib:.2f} GiB (after optimizer step {step + 1})"
+                    )
+                except Exception:
+                    pass
             if self._adaptive_lr is not None:
                 base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
                 self._adaptive_lr.update_swa(base_model)
@@ -1455,58 +1995,32 @@ class Trainer:
                     f"(ce_ema={self._ce_ema:.4f})"
                 )
 
-            # Halt policy: sustained EMA degradation or spike explosion + EMA blow-up.
-            try:
-                if not math.isfinite(float(accum_loss)):
-                    raise ValueError("non-finite loss")
-            except Exception:
-                self.logger.warning(f"  🛑 HALT at step {step}: NaN/Inf loss")
+            # Halt policy: NaN/Inf loss or sustained EMA degradation
+            halt, halt_reason = _halt_controller.check_loss_finite(float(accum_loss))
+            if halt:
+                self.logger.warning(f"  🛑 HALT at step {step}: {halt_reason}")
                 self._save_checkpoint(step)
                 if profiler:
                     profiler.stop()
+                signal.signal(signal.SIGINT, _original_sigint_handler)
                 metrics.end_time = time.time()
                 metrics.final_loss = accum_loss
                 return metrics
 
             try:
-                _ema_hist.append(float(metrics.ema_loss))
-                ema_degrade = False
-                ema_delta = 0.0
-                if len(_ema_hist) >= _ema_hist.maxlen:
-                    ema_delta = float(_ema_hist[-1]) - float(_ema_hist[0])
-                    current_ema = float(_ema_hist[-1])
-                    # Only halt if:
-                    # 1. EMA increased by more than threshold over window, AND
-                    # 2. Current EMA is above the absolute threshold (model is actually struggling)
-                    # This prevents false halts during normal variance when loss is still reasonable
-                    delta_exceeded = math.isfinite(ema_delta) and (ema_delta > float(_halt_ema_delta))
-                    ema_is_high = current_ema > float(_halt_ema_abs)
-                    ema_degrade = delta_exceeded and ema_is_high
-                    
-                    # EMA debug: show halt check state
-                    if _ema_debug and step % 25 == 0:
-                        self.logger.info(
-                            f"  [EMA_DEBUG] halt_check: window_len={len(_ema_hist)} "
-                            f"oldest={_ema_hist[0]:.4f} newest={current_ema:.4f} "
-                            f"delta={ema_delta:.4f} (thr={_halt_ema_delta}) "
-                            f"ema_high={ema_is_high} (thr={_halt_ema_abs})"
-                        )
                 spikes_in_window = _spike_tracker.spike_count_in_window()
-                if ema_degrade:
-                    # Print full diagnostic before halting
-                    self.logger.warning(
-                        f"  [EMA_DEBUG] HALT TRIGGER: delta={ema_delta:.4f} > threshold={_halt_ema_delta} "
-                        f"window=[{_ema_hist[0]:.4f}...{_ema_hist[-1]:.4f}] "
-                        f"current_loss={accum_loss:.4f}"
-                    )
-                    if spikes_in_window >= int(_halt_spike_count):
-                        halt_reason = f"spike-rate explosion ({spikes_in_window}/{_halt_spike_window}) + EMA blow-up (Δ={ema_delta:.3f} over {_halt_ema_window})"
-                    else:
-                        halt_reason = f"sustained EMA degradation (Δ={ema_delta:.3f} over {_halt_ema_window} steps)"
+                halt, halt_reason = _halt_controller.update(
+                    step=step,
+                    ema_loss=metrics.ema_loss,
+                    spikes_in_window=spikes_in_window,
+                    logger=self.logger,
+                )
+                if halt:
                     self.logger.warning(f"  🛑 HALT at step {step}: {halt_reason}")
                     self._save_checkpoint(step)
                     if profiler:
                         profiler.stop()
+                    signal.signal(signal.SIGINT, _original_sigint_handler)
                     metrics.end_time = time.time()
                     metrics.final_loss = accum_loss
                     return metrics
@@ -1514,64 +2028,36 @@ class Trainer:
                 pass
             if use_mod_mor:
                 base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-                if hasattr(base_model, "update_mod_loss_ema"):
-                    # IMPORTANT: MoD enable threshold is based on EMA CE (not total loss),
-                    # so it mirrors eval and doesn't get dominated by routing auxiliaries.
-                    base_model.update_mod_loss_ema(self._ce_ema)
-                # Dynamic MoR enable: trigger when loss drops below threshold
-                # BUT respect mor_enable_min_steps as a hard floor (loss can't bypass it)
-                if not getattr(self, "_mor_triggered_by_loss", False):
-                    mor_loss_thr = getattr(self.config, "mor_enable_loss_threshold", 0.0) or 0.0
-                    mor_enable_step = getattr(self, "_mor_enable_step", 0)
-                    mor_min_steps = getattr(self.config, "mor_enable_min_steps", 1000)
-                    # Loss threshold can only trigger AFTER mor_enable_min_steps (hard floor)
-                    if (mor_loss_thr > 0 and self._ce_ema > 0 and self._ce_ema < mor_loss_thr 
-                        and step >= mor_min_steps and step < mor_enable_step):
-                        # Loss threshold reached before scheduled enable step - trigger MoR now
-                        rampup = min(1000, max(100, int(self.config.max_steps * 0.05)))
+                
+                # CurriculumController handles all MoR/MoD gating decisions
+                routing_stats = None
+                if step % 100 == 0 and hasattr(base_model, "get_routing_stats"):
+                    routing_stats = base_model.get_routing_stats()
+                
+                curriculum_actions = self._curriculum_controller.step(
+                    step=step,
+                    ce_ema=self._ce_ema,
+                    routing_stats=routing_stats,
+                )
+                
+                for action in curriculum_actions:
+                    if action.action_type == "update_mod_loss_ema":
+                        if hasattr(base_model, "update_mod_loss_ema"):
+                            base_model.update_mod_loss_ema(action.params["ce_ema"])
+                    elif action.action_type == "trigger_mor_early":
                         if hasattr(base_model, "trigger_mor_early"):
-                            base_model.trigger_mor_early(step, rampup_steps=rampup)
+                            base_model.trigger_mor_early(step, rampup_steps=action.params["rampup_steps"])
                             self._mor_enable_step = step
                             self._mor_triggered_by_loss = True
-                            self.logger.info(f"🚀 MoR EARLY TRIGGER: CE_EMA={self._ce_ema:.3f} < threshold={mor_loss_thr:.1f} at step {step}. Starting {rampup}-step rampup now.")
-                
-                # MoR-informed MoD: Enable MoD when MoR early_exit_ratio exceeds threshold
-                # This ensures MoD only activates once the model demonstrates it can route confidently
-                if not getattr(self, "_mod_triggered", False):
-                    mod_min_step = getattr(self.config, "mod_enable_min_step", 3000)
-                    mod_mor_threshold = getattr(self.config, "mod_enable_mor_early_exit_threshold", 0.38)
-                    mod_loss_thr = getattr(self.config, "mod_enable_loss_threshold", 4.5)
-                    # Check every 100 steps to avoid overhead
-                    # Require minimum steps for routing stats to stabilize
-                    if step % 100 == 0 and step >= mod_min_step and mod_mor_threshold < 1.0:
-                        # Get MoR early_exit_ratio from routing stats
-                        if hasattr(base_model, "get_routing_stats"):
-                            stats = base_model.get_routing_stats()
-                            mor_stats = stats.get("mor_layers", [])
-                            if mor_stats:
-                                # Aggregate depth histograms across all MoR layers
-                                all_hists = [s.get("depth_histogram", []) for s in mor_stats if s.get("depth_histogram")]
-                                if all_hists:
-                                    max_len = max(len(h) for h in all_hists)
-                                    agg_hist = [0.0] * max_len
-                                    for h in all_hists:
-                                        for i, v in enumerate(h):
-                                            agg_hist[i] += v
-                                    total = sum(agg_hist) or 1
-                                    # Early exit ratio = tokens that exit before max depth
-                                    # Last bucket is max depth, so early_exit = 1 - (last_bucket / total)
-                                    if max_len > 0:
-                                        early_exit_ratio = 1.0 - (agg_hist[-1] / total)
-                                        # Trigger MoD if: early_exit > threshold AND loss < loss_threshold
-                                        loss_ok = (mod_loss_thr <= 0) or (self._ce_ema > 0 and self._ce_ema < mod_loss_thr)
-                                        if early_exit_ratio > mod_mor_threshold and loss_ok:
-                                            if hasattr(base_model, "trigger_mod_from_mor"):
-                                                base_model.trigger_mod_from_mor(step)
-                                                self._mod_triggered = True
-                                                self.logger.info(
-                                                    f"🎯 MoD ENABLED: MoR early_exit_ratio={early_exit_ratio:.1%} > threshold={mod_mor_threshold:.0%}, "
-                                                    f"CE_EMA={self._ce_ema:.3f} < {mod_loss_thr:.1f} at step {step}"
-                                                )
+                        if action.log_message:
+                            self.logger.info(action.log_message)
+                    elif action.action_type == "trigger_mod_from_mor":
+                        # Deprecated: MoD enablement is step-based warmup, not MoR-informed.
+                        # Keep this branch as a no-op for backward compatibility with old
+                        # CurriculumController configs.
+                        if action.log_message:
+                            self.logger.info(action.log_message)
+                            
             if step >= 1000 and step % 500 == 0:
                 _checkpointing.maybe_save_best_checkpoint(
                     step=step,
@@ -1593,6 +2079,48 @@ class Trainer:
                 eval_debug=_eval_debug,
             )
             if eval_loss is not None:
+                # Per-component eval (only when eval preset is a mix and components were built)
+                if fixed_eval_batches_by_component:
+                    _base_for_eval = model._orig_mod if hasattr(model, "_orig_mod") else model
+                    _base_for_eval.eval()
+                    comp_losses: Dict[str, float] = {}
+                    for comp_name, comp_batches in fixed_eval_batches_by_component.items():
+                        try:
+                            comp_loss = evaluate_fixed_batches(
+                                base_model=_base_for_eval,
+                                fixed_eval_batches=comp_batches,
+                                device=device,
+                                dtype=dtype,
+                                config=self.config,
+                                use_mod_mor=use_mod_mor,
+                                eval_debug=False,
+                            )
+                            comp_losses[comp_name] = float(comp_loss)
+                        except Exception as e:
+                            self.logger.warning(
+                                f"⚠️  Eval component '{comp_name}' failed: {type(e).__name__}: {e}"
+                            )
+                    _base_for_eval.train()
+
+                    if comp_losses:
+                        # Stable, readable ordering
+                        comp_items = sorted(comp_losses.items(), key=lambda kv: kv[0])
+                        parts = []
+                        for n, v in comp_items:
+                            w = eval_component_weights.get(n)
+                            if w is None:
+                                parts.append(f"{n}={v:.4f}")
+                            else:
+                                parts.append(f"{n}({w:.2f})={v:.4f}")
+                        self.logger.info(f"[EVAL_COMPONENTS] step={step}  " + "  ".join(parts))
+                        if self.config.use_wandb and wandb_mod is not None:
+                            payload = {f"eval_loss/{k}": float(v) for k, v in comp_losses.items()}
+                            payload["step"] = step
+                            wandb_mod.log(payload)
+                        if tb_writer is not None:
+                            for k, v in comp_losses.items():
+                                tb_writer.add_scalar(f"eval/loss_{k}", float(v), step)
+
                 # One-time sanity check: run eval codepath on a training batch
                 if not _eval_sanity_done:
                     _eval_sanity_done = True
@@ -1615,8 +2143,10 @@ class Trainer:
                         current_train_loss=accum_loss,
                         current_ema=metrics.ema_loss,
                         logger=self.logger,
+                        last_ce_loss=float(self._last_ce_loss.item() if hasattr(self._last_ce_loss, "item") else self._last_ce_loss),
                     )
                     _base_for_sanity.train()
+
                 
                 # EMA debug: confirm eval does NOT update train EMA
                 if _ema_debug:
@@ -1631,16 +2161,28 @@ class Trainer:
                 if self.config.use_wandb and wandb_mod is not None:
                     wandb_mod.log({"eval_loss": float(eval_loss), "step": step})
             if step % log_interval == 0:
+                if self._source_name_counts:
+                    items = sorted(self._source_name_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+                    parts = [f"{k}={v}" for k, v in items[:12]]
+                    suffix = "" if len(items) <= 12 else f" (+{len(items) - 12} more)"
+                    self.logger.info("Batch sources (window): " + ", ".join(parts) + suffix)
+                    self._source_name_counts = {}
+
                 elapsed = time.time() - metrics.start_time
                 steps_this_session = step - start_step
                 tokens_this_session = steps_this_session * tokens_per_step
                 avg_tps = tokens_this_session / elapsed if elapsed > 0 else 0
                 steps_per_sec = steps_this_session / elapsed if elapsed > 0 else 0
+                # Build dynamic clip info string if enabled
+                clip_info = f"post {grad_norm:.2e}"
+                if _use_dynamic_clip:
+                    clip_info = f"post {grad_norm:.2e} (dyn={effective_clip:.0f})"
                 self.logger.info(
                     f"Step {step:5d}/{max_steps} | "
                     f"Loss: {accum_loss:.4f} (EMA: {metrics.ema_loss:.4f}) | "
+                    f"CE: {accum_ce_f:.4f} (EMA: {getattr(self, '_ce_ema', 0.0):.4f}) | "
                     f"LR: {lr:.2e} | "
-                    f"Grad: pre {pre_clip_norm:.2e} | post {grad_norm:.2e} | clipped {clip_pct:4.1f}% | "
+                    f"Grad: pre {pre_clip_norm:.2e} | {clip_info} | clipped {clip_pct:4.1f}% | "
                     f"{tps/1000:.1f}K tok/s | "
                     f"Avg: {avg_tps/1000:.1f}K tok/s ({steps_per_sec:.2f} steps/s)"
                 )
@@ -1653,25 +2195,65 @@ class Trainer:
                     tb_writer.add_scalar("train/grad_norm_pre_clip", float(pre_clip_norm), step)
                     tb_writer.add_scalar("train/grad_clip_pct", float(clip_pct), step)
                     tb_writer.add_scalar("train/grad_clipped", 1.0 if clipped_this_step else 0.0, step)
+                    if _use_dynamic_clip:
+                        tb_writer.add_scalar("train/grad_clip_dynamic", float(effective_clip), step)
+                        tb_writer.add_scalar("train/grad_norm_ema", float(_grad_norm_ema), step)
                     tb_writer.add_scalar("train/tps", float(tps), step)
+                    # Log MoE aux loss if MoE is enabled
+                    if self.config.moe_enabled:
+                        moe_val = float(self._last_moe_aux_loss.item() if hasattr(self._last_moe_aux_loss, "item") else self._last_moe_aux_loss)
+                        tb_writer.add_scalar("train/moe_aux_loss", moe_val, step)
                 
                 if self.config.use_wandb and wandb_mod is not None:
-                    wandb_mod.log(
-                        {
-                            "train_loss": float(accum_loss),
-                            "ema_loss": float(metrics.ema_loss),
-                            "lr": float(lr),
-                            "grad_norm": float(grad_norm),
-                            "grad_norm_pre_clip": float(pre_clip_norm),
-                            "grad_clip_pct": float(clip_pct),
-                            "grad_clipped": 1.0 if clipped_this_step else 0.0,
-                            "tps": float(tps),
-                            "avg_tps": float(avg_tps),
-                            "step": step,
-                        }
-                    )
+                    wandb_payload = {
+                        "train_loss": float(accum_loss),
+                        "ema_loss": float(metrics.ema_loss),
+                        "lr": float(lr),
+                        "grad_norm": float(grad_norm),
+                        "grad_norm_pre_clip": float(pre_clip_norm),
+                        "grad_clip_pct": float(clip_pct),
+                        "grad_clipped": 1.0 if clipped_this_step else 0.0,
+                        "tps": float(tps),
+                        "avg_tps": float(avg_tps),
+                        "step": step,
+                    }
+                    # Log MoE aux loss if MoE is enabled
+                    if self.config.moe_enabled:
+                        moe_val = float(self._last_moe_aux_loss.item() if hasattr(self._last_moe_aux_loss, "item") else self._last_moe_aux_loss)
+                        wandb_payload["moe_aux_loss"] = moe_val
+                    wandb_mod.log(wandb_payload)
                 if use_mod_mor and step % 100 == 0:
-                    self._log_layer_diagnostics(step, accum_loss, lr, grad_norm)
+                    self._log_layer_diagnostics(step, accum_loss, lr, grad_norm, ce_step=accum_ce_f)
+            
+            # MoE divergence tracking (optional, adds CPU overhead)
+            if (self.config.moe_enabled and 
+                getattr(self.config, "moe_track_divergence", False) and 
+                step % getattr(self.config, "moe_divergence_interval", 100) == 0):
+                try:
+                    divergence, entropy, util = self._compute_moe_divergence()
+                    util_str = "/".join([f"{u*100:.0f}" for u in util]) if util else "N/A"
+                    # Cosine distance: 0=identical, 1=orthogonal (good), 2=opposite
+                    # >0.5 means experts are reasonably different, >0.9 means nearly orthogonal
+                    status = "✅ Spec" if divergence > 0.5 else "⏳ Learn"
+                    self.logger.info(
+                        f"  [MoE] step={step} div={divergence:.4f} ent={entropy:.4f} util=[{util_str}%] {status}"
+                    )
+                    # Warn if divergence is falling significantly (experts reconverging)
+                    if hasattr(self, "_last_moe_divergence") and divergence < self._last_moe_divergence - 0.01:
+                        self.logger.warning(
+                            f"  ⚠️  MoE divergence FALLING: {self._last_moe_divergence:.4f} → {divergence:.4f} (experts reconverging!)"
+                        )
+                    self._last_moe_divergence = divergence
+                    
+                    # Log to tensorboard/wandb
+                    if tb_writer is not None:
+                        tb_writer.add_scalar("moe/divergence", divergence, step)
+                        tb_writer.add_scalar("moe/entropy", entropy, step)
+                    if self.config.use_wandb and wandb_mod is not None:
+                        wandb_mod.log({"moe_divergence": divergence, "moe_entropy": entropy, "step": step})
+                except Exception as e:
+                    self.logger.warning(f"  MoE divergence check failed: {e}")
+            
             if step % save_interval == 0:
                 self._save_checkpoint(step)
                 if self._should_early_stop(accum_loss if accum_loss > 0 else metrics.losses[-1], step, self._count_params()):
@@ -1679,8 +2261,19 @@ class Trainer:
                     self.logger.warning(f"   Loss has increased for {config.early_stop_patience} consecutive checkpoints")
                     self.logger.warning(f"   Checkpoint losses: {self._checkpoint_losses[-4:]}")
                     break
+            
+            # Check for graceful shutdown request (Ctrl+C)
+            if _interrupt_requested:
+                self.logger.info(f"\n🛑 Graceful shutdown at step {step}")
+                self._save_checkpoint(step)
+                self.logger.info(f"   Checkpoint saved. Exiting.")
+                break
+            
             accum_loss = 0.0
-
+        
+        # Restore original signal handler
+        signal.signal(signal.SIGINT, _original_sigint_handler)
+        
         if profiler:
             profiler.stop()
 
@@ -1714,7 +2307,9 @@ class Trainer:
                 pass
         return metrics
 
-    def _log_layer_diagnostics(self, step: int, loss: float, lr: float, grad_norm: float) -> None:
+    def _log_layer_diagnostics(
+        self, step: int, loss: float, lr: float, grad_norm: float, *, ce_step: float
+    ) -> None:
         model = self.model
         if hasattr(model, "_orig_mod"):
             model = model._orig_mod
@@ -1727,7 +2322,10 @@ class Trainer:
             "timestamp": datetime.now().isoformat(),
             "losses": {
                 "total": float(loss) if hasattr(loss, "item") else float(loss),
-                "ce": float(self._last_ce_loss.item()) if hasattr(self._last_ce_loss, "item") else float(self._last_ce_loss),
+                # Step-mean CE over the full grad-accum window (matches CE_EMA / curriculum objective).
+                "ce": float(ce_step),
+                # Last-microbatch CE for debugging only (can be noisy/misleading).
+                "ce_micro_last": float(self._last_ce_loss.item()) if hasattr(self._last_ce_loss, "item") else float(self._last_ce_loss),
                 "aux": float(self._last_aux_loss.item()) if hasattr(self._last_aux_loss, "item") else float(self._last_aux_loss),
                 "ponder": float(self._last_ponder_loss.item()) if hasattr(self._last_ponder_loss, "item") else float(self._last_ponder_loss),
                 "advantage": float(self._last_advantage_loss.item()) if hasattr(self._last_advantage_loss, "item") else float(self._last_advantage_loss),
@@ -1843,6 +2441,90 @@ class Trainer:
                 }
             )
         self._diagnostics_data.append(record)
+
+        # =========================
+        # MoR auto-nudge controller
+        # =========================
+        # If MoR collapses to min-depth in adaptive phases, temporarily damp the
+        # advantage loss (router gradients) for a short window, then restore.
+        # This is intentionally conservative: it does not change LR/optimizer
+        # state and it is applied outside compiled regions.
+        if bool(getattr(self.config, "mor_auto_nudge", True)) and bool(getattr(self.config, "mor_adaptive", False)):
+            # Auto-reset when the window ends.
+            if self._mor_advantage_nudge_active and step >= self._mor_advantage_nudge_until_step:
+                self.config.mor_advantage_loss_mult = 1.0
+                self._mor_advantage_nudge_active = False
+                self.logger.info(
+                    f"MoR auto-nudge ended at step {step:,}: mor_advantage_loss_mult reset to 1.0"
+                )
+
+            # Trigger if any layer shows collapse in adaptive phases.
+            # Handles both depth-0 collapse AND min-depth collapse (when mor_min_depth > 0).
+            collapse_thr = float(getattr(self.config, "mor_collapse_depth0_threshold", 0.90) or 0.90)
+            min_depth = int(getattr(self.config, "mor_min_depth", 0) or 0)
+            
+            # Check for any type of shallow collapse:
+            # - DEPTH_COLLAPSED_EARLY: stuck at depth 0
+            # - DEPTH_COLLAPSED: >90% at any single depth (including min_depth)
+            collapse_statuses = {"DEPTH_COLLAPSED_EARLY", "DEPTH_COLLAPSED"}
+            collapse_detected = any(
+                (layer.get("status") in collapse_statuses) for layer in record.get("mor_layers", [])
+            )
+            if (
+                collapse_detected
+                and (not self._mor_advantage_nudge_active)
+                and step >= self._mor_advantage_nudge_cooldown_until_step
+                and mor_phase_raw in ["full-adaptive", "rampup"]
+            ):
+                # Confirm collapse ratio if histogram present; this avoids nudging
+                # on weak/noisy stats. Check if collapsed to depth 0 or min_depth.
+                confirmed = False
+                collapse_depth = -1
+                for layer in record.get("mor_layers", []):
+                    if layer.get("status") not in collapse_statuses:
+                        continue
+                    hist = layer.get("depth_histogram", []) or []
+                    total = float(sum(hist) or 0.0)
+                    if total <= 0.0:
+                        continue
+                    # Check collapse at depth 0
+                    if len(hist) > 0 and float(hist[0]) / total >= collapse_thr:
+                        confirmed = True
+                        collapse_depth = 0
+                        break
+                    # Check collapse at min_depth (when min_depth > 0)
+                    if min_depth > 0 and len(hist) > min_depth:
+                        if float(hist[min_depth]) / total >= collapse_thr:
+                            confirmed = True
+                            collapse_depth = min_depth
+                            break
+                if confirmed:
+                    # Choose action based on collapse type:
+                    # - Depth-0 collapse: BOOST advantage to encourage deeper routing
+                    # - Min-depth collapse: DAMPEN advantage to reduce penalty on depth
+                    if collapse_depth == 0:
+                        nudge_mult = float(getattr(self.config, "mor_advantage_nudge_mult", 2.0) or 2.0)
+                        action = "boost"
+                    else:
+                        # Min-depth collapse: negative advantage penalizes depth
+                        nudge_mult = float(getattr(self.config, "mor_advantage_nudge_damp", 0.1) or 0.1)
+                        action = "damp"
+                    # Clamp to safe range
+                    nudge_mult = max(0.0, min(10.0, nudge_mult))
+                    duration = int(getattr(self.config, "mor_advantage_nudge_duration_steps", 200) or 200)
+                    cooldown = int(getattr(self.config, "mor_advantage_nudge_cooldown_steps", 500) or 500)
+                    duration = max(1, duration)
+                    cooldown = max(duration, cooldown)
+
+                    self.config.mor_advantage_loss_mult = nudge_mult
+                    self._mor_advantage_nudge_until_step = step + duration
+                    self._mor_advantage_nudge_cooldown_until_step = step + cooldown
+                    self._mor_advantage_nudge_active = True
+                    self.logger.warning(
+                        f"MoR auto-nudge: depth-{collapse_depth} collapse detected (phase={mor_phase_raw}). "
+                        f"{action.upper()}ing advantage loss: mor_advantage_loss_mult={nudge_mult:.2f} "
+                        f"for {duration} steps (cooldown {cooldown} steps)."
+                    )
         
         if mor_phase_raw == "fixed-depth":
             mor_phase = f"FIXED ({mor_status.get('rampup_progress', 0)*100:.0f}%)"
@@ -1886,28 +2568,19 @@ class Trainer:
                 ema_s = state.get("loss_ema_short", 0)
                 ema_l = state.get("loss_ema_long", 0)
                 trend = "↑" if ema_s > ema_l * 1.02 else ("↓" if ema_s < ema_l * 0.98 else "→")
-                adaptive_info = f" | EMA: {ema_s:.3f}/{ema_l:.3f} {trend}"
+                _metric = str(getattr(self.config, "adaptive_metric", "train") or "train")
+                adaptive_info = f" | LR_EMA({_metric}): {ema_s:.3f}/{ema_l:.3f} {trend}"
             adv_str = f" adv={self._last_advantage_loss:.4f}" if self._last_advantage_loss != 0 else ""
+            moe_str = f" moe_aux={self._last_moe_aux_loss:.4f}" if self.config.moe_enabled and self._last_moe_aux_loss != 0 else ""
             lr_info = f" | LR={lr:.2e} (min={self.config.min_lr:.2e})"
-            mod_min_step = getattr(self.config, "mod_enable_min_step", 3000)
-            mod_loss_thr = float(getattr(self.config, "mod_enable_loss_threshold", 4.5) or 0.0)
-            mod_mor_thr = getattr(self.config, "mod_enable_mor_early_exit_threshold", 0.38)
-            mod_triggered = getattr(self, "_mod_triggered", False)
-            # Build waiting condition string
-            if mod_triggered:
-                mod_status = "MoD:ON"
-            else:
-                conditions = []
-                if step < mod_min_step:
-                    conditions.append(f"step≥{mod_min_step}")
-                conditions.append(f"MoR>{mod_mor_thr:.0%}")
-                if mod_loss_thr > 0:
-                    conditions.append(f"loss<{mod_loss_thr:.1f}")
-                mod_status = f"MoD:wait({','.join(conditions)})"
+            warmup = int(getattr(self.config, "mod_mlp_warmup_steps", 1000) or 1000)
+            warmup = max(0, warmup)
+            is_on = (mod_mode not in ("N/A", "DISABLED")) and (float(getattr(self.config, "mod_capacity", 1.0)) < 1.0)
+            mod_status = "MoD:ON" if is_on else (f"MoD:WARMUP(<{warmup})" if step < warmup else "MoD:OFF")
             mod_gate = f" | CE_EMA={getattr(self, '_ce_ema', 0.0):.3f} {mod_status}"
             self.logger.info(
                 f"  [DIAG] MoD:{mod_mode} save={mod_savings:.0f}% | MoR:{mor_phase} d={mor_depth:.2f} [{depth_dist}%] | "
-                f"CE={self._last_ce_loss:.3f} aux={self._last_aux_loss:.4f} ponder={self._last_ponder_loss:.3f}{adv_str}{adaptive_info}{lr_info}{mod_gate}"
+                f"CE={float(ce_step):.3f} aux={self._last_aux_loss:.4f} ponder={self._last_ponder_loss:.3f}{adv_str}{moe_str}{adaptive_info}{lr_info}{mod_gate}"
             )
             self._save_diagnostics()
 
@@ -1934,6 +2607,7 @@ class Trainer:
             logger=self.logger,
             trainer_state={
                 "ce_ema": float(getattr(self, "_ce_ema", 0.0) or 0.0),
+                "grad_norm_ema": float(getattr(self, "_grad_norm_ema", 0.0) or 0.0),
             },
         )
 

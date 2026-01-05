@@ -76,9 +76,9 @@ def run_cli() -> None:
     parser.add_argument(
         "--attention",
         type=str,
-        default="la3",
-        choices=["la3", "ccgqa"],
-        help="Attention backend: 'la3' (Lightning Attention 3, O(n) linear, default) or 'ccgqa' (Compressed Convolutional GQA, fast + low memory)",
+        default="ccgqa",
+        choices=["ccgqa"],
+        help="Attention backend: ''ccgqa' (Compressed Convolutional GQA, fast + low memory)",
     )
     parser.add_argument("--mode", type=str, default="testing", choices=["testing", "production", "chinchilla_third"], help="Mode: testing (5K), production (100K), chinchilla_third (1/3 Chinchilla)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
@@ -122,14 +122,26 @@ def run_cli() -> None:
         default=0.0,
         help="Loss-aware MoD: supervise router to prioritize top-k hard tokens by per-token CE loss (0=off).",
     )
+    parser.add_argument(
+        "--mod_mlp_warmup_steps",
+        type=int,
+        default=1000,
+        help="MoD warmup: number of steps to run dense MLP before enabling hard routing (default 1000).",
+    )
     parser.add_argument("--mor_adaptive", type=str, default="true", choices=["true", "false"], help="MoR adaptive routing (true=on, false=fixed-depth only)")
     parser.add_argument("--aux_scale", type=float, default=0.1, help="MoD aux loss scale (0.1 default, 0.0=MoD loss OFF)")
     parser.add_argument("--ponder_scale", type=float, default=0.01, help="MoR ponder loss scale (0.01 default, 1e-4=weak reg)")
     parser.add_argument(
         "--mor_advantage_loss_scale",
         type=float,
-        default=0.1,
-        help="MoR routing: scale for loss-driven depth allocation (higher=more bimodal easy/exit vs hard/deep).",
+        default=0.02,
+        help="MoR routing: scale for loss-driven depth allocation. WARNING: >0.05 causes 'advantage gaming'. Default: 0.02.",
+    )
+    parser.add_argument(
+        "--mor_min_depth",
+        type=int,
+        default=1,
+        help="Minimum MoR recursion depth. 0=allow immediate exit, 1+=force iterations. Default: 1 (prevents depth-0 collapse).",
     )
 
     # Convenience flags
@@ -186,11 +198,35 @@ def run_cli() -> None:
     parser.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=True, help="Enable gradient checkpointing to trade compute for memory (default: ON)")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True, help="Enable torch.compile for graph optimization (default: ON)")
     parser.add_argument("--halt_on_spike", action="store_true", help="Debug: stop training immediately after first gradient spike and save a checkpoint")
+    parser.add_argument("--save_interval", type=int, default=500, help="Save checkpoint every N steps. 0=disable periodic saves. Default: 500.")
     parser.add_argument(
         "--grad_clip",
         type=float,
         default=None,
         help="Override global grad clipping max-norm (e.g. 10.0). If unset, uses the model-size preset.",
+    )
+    parser.add_argument(
+        "--grad_clip_dynamic",
+        action="store_true",
+        help="Enable dynamic gradient clipping (adapts to gradient norm EMA).",
+    )
+    parser.add_argument(
+        "--grad_clip_k",
+        type=float,
+        default=2.0,
+        help="Dynamic clip multiplier on EMA (default: 2.0 = allow 2x normal gradient).",
+    )
+    parser.add_argument(
+        "--grad_clip_min",
+        type=float,
+        default=5.0,
+        help="Dynamic clip floor (default: 5.0).",
+    )
+    parser.add_argument(
+        "--grad_clip_max",
+        type=float,
+        default=500.0,
+        help="Dynamic clip ceiling - SAFETY CAP (default: 500.0).",
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility. If set, training is deterministic (same seed = same results).")
     parser.add_argument("--ema_debug", action="store_true", help="Debug: print EMA updates every 25 steps to trace loss->EMA flow")
@@ -205,6 +241,127 @@ def run_cli() -> None:
     parser.add_argument("--tensorboard_dir", type=str, default=None, help="TensorBoard log dir (default: runs)")
     parser.add_argument("--profiler", action=argparse.BooleanOptionalAction, default=False, help="Enable torch.profiler traces (viewable in TensorBoard)")
     parser.add_argument("--profiler_dir", type=str, default=None, help="Profiler trace output dir (default: profiler_traces)")
+
+    # =========================================================================
+    # Mixture of Experts (MoE) - Sparse FFN Routing
+    # =========================================================================
+    parser.add_argument(
+        "--moe",
+        action="store_true",
+        dest="moe_enabled",
+        help="Enable Mixture of Experts (sparse FFN routing). OFF by default.",
+    )
+    parser.add_argument(
+        "--moe_num_experts",
+        type=int,
+        default=0,
+        help="Number of expert FFNs (0=auto-scale by model size). Default: 0.",
+    )
+    parser.add_argument(
+        "--moe_num_layers",
+        type=int,
+        default=0,
+        help="Number of MoE layers to insert (0=auto-scale by model size). Default: 0.",
+    )
+    parser.add_argument(
+        "--moe_top_k",
+        type=int,
+        default=1,
+        help="Number of experts per token (1=top-1 routing, 2=top-2). Default: 1.",
+    )
+    parser.add_argument(
+        "--moe_aux_weight",
+        type=float,
+        default=0.0001,
+        help="MoE load-balancing auxiliary loss weight. Default: 0.0001 (very low to allow specialization).",
+    )
+    parser.add_argument(
+        "--moe_router_jitter",
+        type=float,
+        default=0.15,
+        help="Router jitter noise for exploration. Default: 0.15 (helps break symmetry).",
+    )
+    parser.add_argument(
+        "--moe_expert_diversity_noise",
+        type=float,
+        default=0.05,
+        help="Additive weight noise to break expert symmetry. Default: 0.05.",
+    )
+    parser.add_argument(
+        "--moe_warmup_steps",
+        type=int,
+        default=1000,
+        help="MoE warmup steps (for checkpoint cloning). Default: 1000.",
+    )
+    parser.add_argument(
+        "--moe_no_identity_init",
+        action="store_true",
+        help="Disable identity-preserving init for MoE (use normal init).",
+    )
+    parser.add_argument(
+        "--moe_track_divergence",
+        action="store_true",
+        help="Track expert weight divergence during training (adds CPU overhead).",
+    )
+    parser.add_argument(
+        "--moe_divergence_interval",
+        type=int,
+        default=100,
+        help="Steps between divergence checks. Default: 100.",
+    )
+    parser.add_argument(
+        "--moe_forced_routing_steps",
+        type=int,
+        default=0,
+        help="Steps to force position-based routing for expert diversification. 0=disabled. Try 500-1000 to force experts apart.",
+    )
+    parser.add_argument(
+        "--moe_domain_expert_map",
+        type=str,
+        default="",
+        help="Comma-separated mapping from batch source_name to expert id. Example: 'math:0,code:1,chat:2,pleias_synth:3'.",
+    )
+    parser.add_argument(
+        "--moe_teacher_weight",
+        type=float,
+        default=0.0,
+        help="Alpha for domain-teacher routing loss: loss += alpha * CE(router_logits, target_expert). Default: 0 (off).",
+    )
+    parser.add_argument(
+        "--moe_teacher_until_step",
+        type=int,
+        default=0,
+        help="Apply teacher loss until this global step (absolute). 0=forever. Useful for short diversification warmup.",
+    )
+    
+    # =========================================================================
+    # MoE Gradient Stabilization - Per-Component LR Scaling
+    # =========================================================================
+    parser.add_argument(
+        "--moe_expert_lr_scale",
+        type=float,
+        default=1.0,
+        help="LR multiplier for expert/MLP weights (e.g., 0.1 to stabilize upcycled experts). Default: 1.0.",
+    )
+    parser.add_argument(
+        "--moe_router_lr_scale",
+        type=float,
+        default=1.0,
+        help="LR multiplier for router/gate weights (e.g., 3.0 to accelerate router learning). Default: 1.0.",
+    )
+    parser.add_argument(
+        "--moe_lr_rewarmup_steps",
+        type=int,
+        default=0,
+        help="Steps to linearly ramp LR from 0 to target after mid-run restart (e.g., 100). Default: 0 (disabled).",
+    )
+    parser.add_argument(
+        "--moe_expert_weight_decay_scale",
+        type=float,
+        default=1.0,
+        help="Weight decay multiplier for MoE experts (e.g., 10.0 to shrink blown-up expert weights). Default: 1.0.",
+    )
+
     args = parser.parse_args()
 
     # Apply convenience flags (override the individual knobs)
@@ -214,6 +371,8 @@ def run_cli() -> None:
         args.mod_enable_loss_threshold = 0.0
         args.mod_loss_aware_weight = 0.0
         args.aux_scale = 0.0
+        # Also prevent MoD from enabling via warmup.
+        args.mod_mlp_warmup_steps = 10**9
 
     if args.mor_off:
         args.mor_adaptive = "false"
@@ -253,6 +412,7 @@ def run_cli() -> None:
         mor_enable_loss_threshold=args.mor_enable_loss_threshold,
         mor_already_enabled=args.mor_already_enabled,
         mod_capacity=args.mod_capacity,
+        mod_mlp_warmup_steps=args.mod_mlp_warmup_steps,
         mod_enable_mor_early_exit_threshold=args.mod_enable_mor_early_exit_threshold,
         mod_enable_loss_threshold=args.mod_enable_loss_threshold,
         mod_loss_aware_weight=args.mod_loss_aware_weight,
@@ -260,6 +420,7 @@ def run_cli() -> None:
         aux_scale=0.0 if args.mod_off else size_config.get("aux_scale", args.aux_scale),
         ponder_scale=args.ponder_scale,
         mor_advantage_loss_scale=args.mor_advantage_loss_scale,
+        mor_min_depth=args.mor_min_depth,
         adaptive_lr=args.adaptive_lr,
         adaptive_metric=args.adaptive_metric,
         adaptive_min_trigger_pct=args.adaptive_min_trigger_pct,
@@ -292,7 +453,7 @@ def run_cli() -> None:
         use_8bit_adam=args.use_8bit_adam,
         use_adafactor=args.use_adafactor,
         log_interval=25,
-        save_interval=500,
+        save_interval=args.save_interval,
         seed=args.seed,
         use_wandb=args.wandb,
         wandb_project=(args.wandb_project or "hydra-llm"),
@@ -304,6 +465,32 @@ def run_cli() -> None:
         profiler_dir=(args.profiler_dir or "profiler_traces"),
         # Use model-size-specific grad_clip if provided, otherwise use default (5.0)
         grad_clip=(float(args.grad_clip) if (args.grad_clip is not None and args.grad_clip > 0) else size_config.get("grad_clip", 5.0)),
+        # Dynamic gradient clipping
+        grad_clip_dynamic=getattr(args, "grad_clip_dynamic", False),
+        grad_clip_k=getattr(args, "grad_clip_k", 2.0),
+        grad_clip_min=getattr(args, "grad_clip_min", 5.0),
+        grad_clip_max=getattr(args, "grad_clip_max", 500.0),
+        # MoE configuration
+        moe_enabled=getattr(args, "moe_enabled", False),
+        moe_num_experts=getattr(args, "moe_num_experts", 0),
+        moe_num_layers=getattr(args, "moe_num_layers", 0),
+        moe_top_k=getattr(args, "moe_top_k", 1),
+        moe_aux_weight=getattr(args, "moe_aux_weight", 0.0001),
+        moe_router_jitter=getattr(args, "moe_router_jitter", 0.15),
+        moe_expert_diversity_noise=getattr(args, "moe_expert_diversity_noise", 0.05),
+        moe_warmup_steps=getattr(args, "moe_warmup_steps", 1000),
+        moe_identity_init=not getattr(args, "moe_no_identity_init", False),
+        moe_track_divergence=getattr(args, "moe_track_divergence", False),
+        moe_divergence_interval=getattr(args, "moe_divergence_interval", 100),
+        moe_forced_routing_steps=getattr(args, "moe_forced_routing_steps", 0),
+        moe_domain_expert_map=getattr(args, "moe_domain_expert_map", ""),
+        moe_teacher_weight=getattr(args, "moe_teacher_weight", 0.0),
+        moe_teacher_until_step=getattr(args, "moe_teacher_until_step", 0),
+        # Per-component LR scaling for MoE gradient stabilization
+        moe_expert_lr_scale=getattr(args, "moe_expert_lr_scale", 1.0),
+        moe_router_lr_scale=getattr(args, "moe_router_lr_scale", 1.0),
+        moe_lr_rewarmup_steps=getattr(args, "moe_lr_rewarmup_steps", 0),
+        moe_expert_weight_decay_scale=getattr(args, "moe_expert_weight_decay_scale", 1.0),
     )
 
     # Auto-compute LR based on estimated params using μP scaling
@@ -356,10 +543,13 @@ def run_cli() -> None:
         config.decay_start_step = min(config.decay_start_step, max(0, config.max_steps - 1))
         config.decay_steps = max(1, config.max_steps - config.decay_start_step)
 
-        if config.max_steps >= 2000:
-            config.save_interval = 500
-        else:
-            config.save_interval = min(config.save_interval, max(100, config.max_steps // 5))
+        # Only override save_interval if user didn't explicitly set it (default is 500 in argparse)
+        user_set_save_interval = args.save_interval != 500
+        if not user_set_save_interval:
+            if config.max_steps >= 2000:
+                config.save_interval = 500
+            else:
+                config.save_interval = min(config.save_interval, max(100, config.max_steps // 5))
         print(f"\n⚠️  OVERRIDE: max_steps={config.max_steps:,}, save_interval={config.save_interval:,}")
 
     # Short-run heuristic: for very short diagnostic runs, delay MoR to avoid

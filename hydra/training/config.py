@@ -42,6 +42,12 @@ class TrainingConfig:
     mod_capacity: float = 0.5
     mor_adaptive: bool = True
 
+    # MoD Warmup (step-based)
+    # MoD runs dense MLP for the first `mod_mlp_warmup_steps`, then switches to
+    # hard top-k routing (compute skipping). This is intentionally step-based
+    # (not MoR/CE-gated) because the MoR-informed trigger was too brittle.
+    mod_mlp_warmup_steps: int = 1000
+
     # MoR Curriculum (enables first, informs MoD)
     # MoR enables when: step >= max(mor_enable_min_steps, mor_enable_pct * max_steps) OR loss < mor_enable_loss_threshold
     mor_enable_pct: float = 0.10  # Enable MoR after 10% of training
@@ -50,14 +56,12 @@ class TrainingConfig:
     mor_rampup_steps: int = 5000
     mor_already_enabled: bool = False
 
-    # MoD Curriculum (MoR-informed: waits for MoR to indicate readiness)
-    # MoD enables when ALL conditions are met:
-    #   1. step >= mod_enable_min_step (routing stats need time to stabilize)
-    #   2. MoR early_exit_ratio > threshold (model says tokens are easy)
-    #   3. CE_EMA < loss_threshold (model is learning)
-    mod_enable_min_step: int = 3000  # Minimum steps before MoD can trigger (routing stats noisy early)
-    mod_enable_mor_early_exit_threshold: float = 0.38  # MoD enables when MoR says 38%+ tokens exit early
-    mod_enable_loss_threshold: float = 4.5  # Safety floor: also require loss < 4.5
+    # NOTE: The previous MoR-informed MoD trigger (early-exit + loss thresholds)
+    # is kept for back-compat with older configs/CLI, but is no longer used to
+    # enable MoD. MoD is enabled purely by step warmup + mod_capacity.
+    mod_enable_min_step: int = 3000
+    mod_enable_mor_early_exit_threshold: float = 0.38
+    mod_enable_loss_threshold: float = 4.5
 
     # Loss-aware MoD supervision (teacher = top-k per-token CE loss)
     # 0.0 disables; typical starting point: 0.1 - 1.0
@@ -69,7 +73,69 @@ class TrainingConfig:
 
     # MoR: scales the loss-driven advantage signal that encourages deeper
     # recursions on hard tokens and shallower exits on easy tokens.
-    mor_advantage_loss_scale: float = 0.1
+    # WARNING: Values above 0.05 can cause "advantage gaming" where the model
+    # optimizes for efficiency over learning. Default 0.02 is conservative.
+    mor_advantage_loss_scale: float = 0.02  # Reduced from 0.1 to prevent gaming
+
+    # MoR minimum depth: prevents depth-0 collapse where model exits immediately.
+    # 0 = allow immediate exit (dangerous for learning)
+    # 1 = force at least one full recursion (recommended for MoE training)
+    mor_min_depth: int = 1  # Default to 1 to prevent collapse
+
+    # MoR runtime control: multiplier applied to the computed advantage loss.
+    # This allows the trainer to temporarily damp/router gradients without
+    # changing optimizer LR or recompiling.
+    mor_advantage_loss_mult: float = 1.0
+
+    # MoR auto-nudge: when routing collapses (>90% at any single depth),
+    # automatically adjust the advantage loss to help recover.
+    # 
+    # For DEPTH-0 collapse (early exit): advantage is positive (hard tokens),
+    # so we BOOST the advantage loss to encourage deeper routing.
+    #
+    # For MIN-DEPTH collapse (stuck at floor): advantage becomes negative
+    # (easy tokens dominate), and negative advantage + low depth = penalty
+    # for going deeper. We DAMPEN (set mult < 1.0) to reduce this conflict.
+    mor_auto_nudge: bool = True
+    mor_collapse_depth0_threshold: float = 0.90
+    mor_advantage_nudge_mult: float = 2.0  # Boost factor for depth-0 collapse
+    mor_advantage_nudge_damp: float = 0.1  # Dampen factor for min-depth collapse
+    mor_advantage_nudge_duration_steps: int = 50
+    mor_advantage_nudge_cooldown_steps: int = 500
+
+    # ==========================================================================
+    # Mixture of Experts (MoE) Configuration
+    # ==========================================================================
+    # MoE adds sparse FFN expert routing for higher model capacity at constant
+    # compute cost. MoE layers are inserted between existing transformer blocks.
+    #
+    # When moe_enabled=False (default), the model is identical to baseline.
+    # When enabled, MoE layers use top-k routing to select experts per token.
+    moe_enabled: bool = False
+    moe_num_experts: int = 4  # Number of expert FFN networks (auto-scaled if 0)
+    moe_num_layers: int = 2   # Number of MoE layers to insert (auto-scaled if 0)
+    moe_top_k: int = 1        # Experts per token (1=top-1 routing, 2=top-2)
+    moe_aux_weight: float = 0.0001  # Load-balancing aux loss weight (very low to allow specialization)
+    moe_warmup_steps: int = 1000  # Steps before full MoE contribution (for checkpoint cloning)
+    moe_capacity_factor: float = float("inf")  # Expert capacity (inf=no dropping)
+    moe_router_jitter: float = 0.15  # Noise for router exploration (helps break symmetry)
+    moe_expert_diversity_noise: float = 0.05  # Additive weight noise to break expert symmetry
+    moe_identity_init: bool = True  # Identity-preserving init for checkpoint cloning
+    moe_track_divergence: bool = True  # Log expert divergence every N steps (CPU cost)
+    moe_divergence_interval: int = 500  # Steps between divergence checks
+    moe_forced_routing_steps: int = 0  # Steps to force position-based routing for diversification (0=disabled)
+
+    # Optional domain teacher / domain forcing
+    moe_domain_expert_map: str = ""  # e.g. "math:0,code:1,chat:2,pleias_synth:3"
+    moe_teacher_weight: float = 0.0  # alpha in: loss += alpha * CE(router_logits, target_expert)
+    moe_teacher_until_step: int = 0  # 0=forever, else apply teacher until this global step
+
+    # Per-component LR scaling for MoE gradient stabilization
+    # Use when upcycled experts explode while routers learn too slowly.
+    moe_expert_lr_scale: float = 1.0  # LR multiplier for expert/MLP params (e.g. 0.1 to freeze)
+    moe_router_lr_scale: float = 3.0  # LR multiplier for router/gate params (routers need faster learning)
+    moe_lr_rewarmup_steps: int = 0    # Steps to re-warmup LR after mid-run optimizer reset (0=disabled)
+    moe_expert_weight_decay_scale: float = 2.0  # WD multiplier for experts (prevents weight explosion)
 
     # Model config
     dim: int = 768
@@ -105,6 +171,15 @@ class TrainingConfig:
     # NOTE: grad_clip=5.0 is calibrated for deep MoR models (8 blocks × 4 rec = 32 layers).
     # Pre-clip grad norms ~20-25 are normal; clip=1.0 throttled effective LR by 20x.
     grad_clip: float = 5.0
+
+    # Dynamic gradient clipping: adapts clip threshold based on gradient norm EMA.
+    # When enabled, clip = min(grad_clip_max, max(grad_clip_min, k * grad_norm_ema))
+    # This allows the model to adapt to regime changes (e.g., MoE router activation).
+    grad_clip_dynamic: bool = True  # Enable dynamic clipping (recommended for MoE)
+    grad_clip_k: float = 2.0  # Multiplier on EMA (allow 2x "normal" gradient)
+    grad_clip_min: float = 50.0  # Floor to prevent over-aggressive clipping
+    grad_clip_max: float = 3000.0  # Ceiling to prevent runaway (allows MoE adaptation)
+    grad_clip_ema_alpha: float = 0.05  # EMA decay (0.05 = ~20 step half-life)
 
     # WSD Scheduler
     lr_schedule: str = "wsd_adaptive"
@@ -145,6 +220,9 @@ class TrainingConfig:
 
     # Dataset
     dataset_name: str = "pretrain_default"
+    # Optional: explicit dataset preset for evaluation. If None, trainer picks a sensible
+    # default based on dataset_name (e.g. uses a pretrain-like eval mix for pretrain_* runs).
+    eval_dataset_name: Optional[str] = None
     tokenizer_name: str = "gpt2"
 
     # Optimization
@@ -213,6 +291,9 @@ class TrainingConfig:
     def __post_init__(self) -> None:
         from datetime import datetime
         
+        # Save user-provided save_interval before mode-based override
+        _user_save_interval = self.save_interval if self.save_interval != 1000 else None
+        
         # Auto-generate run_id if not provided
         if self.run_id is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -245,6 +326,10 @@ class TrainingConfig:
             self.save_interval = 1000
         else:
             raise ValueError(f"Unknown mode: {self.mode}. Use 'testing', 'production', or 'chinchilla_third'")
+        
+        # Restore user-provided save_interval if explicitly set (overrides mode default)
+        if _user_save_interval is not None:
+            self.save_interval = _user_save_interval
 
     def print_summary(self) -> None:
         _log.info("='" * 30)
@@ -292,6 +377,13 @@ class TrainingConfig:
                 _log.info(f"  MoD Curriculum: MoR-informed (waits for MoR early_exit > {mor_threshold:.0%})")
                 if loss_threshold and loss_threshold > 0:
                     _log.info(f"                  AND loss < {loss_threshold:.1f}")
+
+            # MoE info
+            if self.moe_enabled:
+                _log.info(f"  MoE:            ENABLED ({self.moe_num_experts} experts, {self.moe_num_layers} layers, top-{self.moe_top_k})")
+                _log.info(f"                  aux_weight={self.moe_aux_weight}, jitter={self.moe_router_jitter}, warmup={self.moe_warmup_steps}")
+            else:
+                _log.info("  MoE:            OFF")
 
             # MoR banner: distinguish adaptive routing from fixed-depth-only operation.
             if not self.mor_adaptive:

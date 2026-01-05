@@ -4,10 +4,9 @@ Deep diagnosis of CCGQA+MoD+MoR - check gradient flow layer by layer.
 Industry-standard gradient analysis for debugging training instability.
 Use with memory profiler: mprof run python diagnostics/deep_diagnosis.py
 
-Optional: Install memory-profiler for detailed analysis:
-    pip install memory-profiler
-    mprof run python diagnostics/deep_diagnosis.py  
-    mprof plot
+Notes:
+- RECOMMENDED: Run on a CUDA-enabled machine for realistic behavior and speed.
+- Optional dependency: `memory-profiler` for memory traces (mprof).
 """
 
 import os

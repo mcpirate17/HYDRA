@@ -1,8 +1,9 @@
-"""HYDRA routing components (MoD, MoR).
+"""HYDRA routing components (MoD, MoR, MoE).
 
 This package provides:
 - Mixture of Depths (MoD): Dynamic layer skipping via top-k token selection
 - Mixture of Recursions (MoR): Adaptive depth routing per token
+- Mixture of Experts (MoE): Sparse FFN routing to expert networks
 - Loss Tracker: Moving average baseline for loss-driven routing
 
 Usage:
@@ -11,6 +12,8 @@ Usage:
         MoDConfig, MoDRouter, MixtureOfDepthsBlock,
         # MoR  
         MoRConfig, MoRRouter, MoRExecutor,
+        # MoE
+        MoEConfig, MoERouter, MoEFFNBlock,
         # Loss tracking
         MovingAverageBaseline,
     )
@@ -33,6 +36,21 @@ from .mixture_of_recursions import (
     MoROutput,
     dim_to_depth_scale,
     compute_layer_target_prob,
+)
+
+# Mixture of Experts
+from .mixture_of_experts import (
+    MoEConfig,
+    MoERouter,
+    MoEDispatcher,
+    get_moe_scaling,
+    compute_moe_placement,
+)
+
+from .moe_block import (
+    MoEFFNBlock,
+    MoEExpertMLP,
+    MoELayerWrapper,
 )
 
 # Loss tracking for loss-driven routing
@@ -67,6 +85,15 @@ __all__ = [
     "MoROutput",
     "dim_to_depth_scale",
     "compute_layer_target_prob",
+    # MoE
+    "MoEConfig",
+    "MoERouter",
+    "MoEDispatcher",
+    "MoEFFNBlock",
+    "MoEExpertMLP",
+    "MoELayerWrapper",
+    "get_moe_scaling",
+    "compute_moe_placement",
     # Loss tracking
     "MovingAverageBaseline",
     "AdvantageScaledSTE",

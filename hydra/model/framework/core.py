@@ -1195,11 +1195,12 @@ class CCGQAMoRBlock(nn.Module):
         elif self._mor_rampup_steps <= 0:
             self._mor_rampup_scale_cached = 1.0
         else:
-            steps_since_enable = step - self._mor_enable_step
+            # +1 to avoid off-by-one: at step==enable_step, we want non-zero scale
+            steps_since_enable = step - self._mor_enable_step + 1
             raw_scale = min(1.0, steps_since_enable / self._mor_rampup_steps)
-            # Quantize to 10 discrete values: 0.0, 0.1, 0.2, ... 1.0
+            # Quantize to 10 discrete values, but ensure min 0.1 once enabled
             # This limits torch.compile to 11 possible graphs instead of thousands
-            self._mor_rampup_scale_cached = round(raw_scale * 10) / 10
+            self._mor_rampup_scale_cached = max(0.1, round(raw_scale * 10) / 10)
         # Propagate to MoD MLP wrapper if present
         if self.mod_mlp_wrapper is not None:
             self.mod_mlp_wrapper.set_global_step(step)

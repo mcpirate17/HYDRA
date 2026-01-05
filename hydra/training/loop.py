@@ -25,6 +25,70 @@ def resolve_micro_diag_tensors(micro_diag: list[dict]) -> None:
                 md[k] = v.item()
 
 
+@torch.no_grad()
+def compute_token_losses_from_hidden(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    ignore_index: int = -100,
+    token_chunk_size: int = 2048,
+    vocab_chunk_size: int = 4096,
+) -> torch.Tensor:
+    """Compute per-token cross-entropy losses without storing full logits.
+
+    This is used to support loss-driven routing (MoR) and loss-aware MoD
+    supervision when training uses chunked CE (logits may be omitted).
+    Returns [B, L] float32 losses with ignored positions set to 0.
+    """
+    B, L, D = hidden.shape
+    V = weight.shape[0]
+    N = B * L
+
+    h = hidden.view(N, D).float()
+    t = targets.view(N)
+    valid = t != ignore_index
+
+    # Defensive bounds check: clamp target IDs to valid vocab range.
+    # Out-of-bounds targets cause CUDA illegal memory access.
+    valid_targets = t[valid]
+    if valid_targets.numel() > 0:
+        oob_mask = (valid_targets < 0) | (valid_targets >= V)
+        if oob_mask.any():
+            n_oob = oob_mask.sum().item()
+            t_max = valid_targets.max().item()
+            t_min = valid_targets.min().item()
+            import logging
+            logging.getLogger("dmta.training").warning(
+                f"compute_token_losses_from_hidden: {n_oob} targets out of vocab range "
+                f"[0, {V}). min={t_min}, max={t_max}. Clamping to valid range."
+            )
+            # Clamp in-place on the flat view
+            t.clamp_(min=0, max=V - 1)
+            # Recompute valid mask after clamping (ignore_index might have changed)
+            valid = t != ignore_index
+
+    # Correct-class logits (only for valid positions)
+    correct_logits = torch.zeros((N,), device=hidden.device, dtype=torch.float32)
+    if valid.any():
+        w_y = weight[t[valid]].float()  # [M, D]
+        correct_logits[valid] = (h[valid] * w_y).sum(dim=1)
+
+    losses = torch.zeros((N,), device=hidden.device, dtype=torch.float32)
+    for t0 in range(0, N, token_chunk_size):
+        t1 = min(N, t0 + token_chunk_size)
+        h_chunk = h[t0:t1]  # [T, D]
+        lse = torch.full((t1 - t0,), -float("inf"), device=hidden.device, dtype=torch.float32)
+        for v0 in range(0, V, vocab_chunk_size):
+            v1 = min(V, v0 + vocab_chunk_size)
+            w_chunk = weight[v0:v1].float()  # [C, D]
+            logits_chunk = h_chunk @ w_chunk.t()  # [T, C]
+            lse = torch.logaddexp(lse, torch.logsumexp(logits_chunk, dim=1))
+        losses[t0:t1] = lse - correct_logits[t0:t1]
+
+    losses = losses * valid.float()
+    return losses.view(B, L)
+
+
 def compute_microbatch_loss(
     *,
     model,
@@ -37,11 +101,11 @@ def compute_microbatch_loss(
     use_mod_mor: bool,
     track_loss_scalars: bool,
     compute_token_losses_from_hidden: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Compute training loss for one micro-batch.
 
     Returns:
-      loss, ce_loss, logits, aux_loss, ponder_loss, advantage_loss
+      loss, ce_loss, logits, aux_loss, ponder_loss, advantage_loss, moe_aux_loss
 
     `logits` may be None when using chunked CE.
     The *_loss values returned are tensors (or None) suitable for detach() without sync.
@@ -86,10 +150,41 @@ def compute_microbatch_loss(
 
         aux_loss = aux_losses.get("aux_loss", 0.0)
         ponder_loss = aux_losses.get("ponder_loss", 0.0)
+        moe_aux_loss = aux_losses.get("moe_aux_loss", 0.0)
+        moe_teacher_loss = aux_losses.get("moe_teacher_loss", 0.0)
 
         base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
         if logits is not None and hasattr(base_model, "compute_advantage_loss"):
             advantage_loss_t = base_model.compute_advantage_loss(logits, y, ignore_index=-100)
+
+        # Curriculum consistency: ponder_loss is gated/ramped inside the model
+        # via MoR curriculum. Advantage loss is computed post-CE and must be
+        # ramped in the same way, otherwise router gradients can dominate right
+        # at MoR enable and cause depth-0 collapse.
+        if advantage_loss_t is not None and hasattr(base_model, "get_mor_status"):
+            try:
+                mor_status = base_model.get_mor_status()
+                phase = str(mor_status.get("phase", ""))
+                if phase == "fixed-depth":
+                    rampup_scale = 0.0
+                elif phase == "full-adaptive":
+                    rampup_scale = 1.0
+                else:
+                    # Match the model's quantized rampup behavior (10 discrete values)
+                    progress = float(mor_status.get("rampup_progress", 0.0) or 0.0)
+                    progress = max(0.0, min(1.0, progress))
+                    rampup_scale = max(0.1, round(progress * 10.0) / 10.0)
+                advantage_loss_t = advantage_loss_t * float(rampup_scale)
+            except Exception:
+                # If anything goes wrong, fall back to unscaled advantage.
+                pass
+
+        # Optional runtime multiplier (used by trainer auto-nudge).
+        if advantage_loss_t is not None:
+            try:
+                advantage_loss_t = advantage_loss_t * float(getattr(config, "mor_advantage_loss_mult", 1.0))
+            except Exception:
+                pass
 
         if hasattr(aux_loss, "clamp"):
             aux_loss = aux_loss.clamp(max=100.0)
@@ -97,9 +192,19 @@ def compute_microbatch_loss(
             ponder_loss = ponder_loss.clamp(max=100.0)
         if hasattr(advantage_loss_t, "clamp"):
             advantage_loss_t = advantage_loss_t.clamp(max=10.0)
+        if hasattr(moe_aux_loss, "clamp"):
+            moe_aux_loss = moe_aux_loss.clamp(max=100.0)
+        if hasattr(moe_teacher_loss, "clamp"):
+            moe_teacher_loss = moe_teacher_loss.clamp(max=100.0)
 
         aux_loss_t = aux_loss if isinstance(aux_loss, torch.Tensor) else torch.tensor(aux_loss, device=device)
         ponder_loss_t = ponder_loss if isinstance(ponder_loss, torch.Tensor) else torch.tensor(ponder_loss, device=device)
+        moe_aux_loss_t = moe_aux_loss if isinstance(moe_aux_loss, torch.Tensor) else torch.tensor(moe_aux_loss, device=device)
+        moe_teacher_loss_t = (
+            moe_teacher_loss
+            if isinstance(moe_teacher_loss, torch.Tensor)
+            else torch.tensor(moe_teacher_loss, device=device)
+        )
         advantage_loss_t = (
             advantage_loss_t
             if isinstance(advantage_loss_t, torch.Tensor)
@@ -108,7 +213,12 @@ def compute_microbatch_loss(
 
         # aux_loss_t is already scaled by aux_loss_weight in the model/router.
         # ponder_loss_t is unscaled (raw) from the router, so we scale it here.
-        loss = ce_loss + aux_loss_t + config.ponder_scale * ponder_loss_t
+        # moe_aux_loss_t is already scaled by moe_aux_weight in the MoE router.
+        loss = ce_loss + aux_loss_t + config.ponder_scale * ponder_loss_t + moe_aux_loss_t
+        # Domain-teacher loss: unscaled CE from router(s), scaled here by alpha.
+        teacher_alpha = float(getattr(config, "moe_teacher_weight", 0.0) or 0.0)
+        if teacher_alpha != 0.0:
+            loss = loss + teacher_alpha * moe_teacher_loss_t
         if advantage_loss_t is not None:
             loss = loss + advantage_loss_t
 
@@ -116,7 +226,7 @@ def compute_microbatch_loss(
             # Keep tensors; caller can store .detach() for later logging.
             pass
 
-        return loss, ce_loss, logits, aux_loss_t, ponder_loss_t, advantage_loss_t
+        return loss, ce_loss, logits, aux_loss_t, ponder_loss_t, advantage_loss_t, moe_aux_loss_t
 
     # Non-mod_mor
     if config.use_chunked_ce and hasattr(model, "forward_hidden"):
@@ -139,7 +249,7 @@ def compute_microbatch_loss(
             ignore_index=-100,
         )
 
-    return loss, loss, logits, None, None, None
+    return loss, loss, logits, None, None, None, None
 
 
 @torch.no_grad()
@@ -220,11 +330,16 @@ def eval_sanity_check_on_train_batch(
     current_train_loss: float,
     current_ema: float,
     logger: Any,
+    last_ce_loss: Optional[float] = None,
 ) -> dict:
     """Run eval codepath on a training batch to verify consistency.
     
-    This sanity check ensures the eval loss computation matches training.
-    Expected: eval_on_train_batch ≈ current_train_loss (within ~0.5).
+    This sanity check ensures the eval loss computation matches training CE.
+    Expected: eval_on_train_batch ≈ last_ce_loss (within ~0.3).
+    
+    NOTE: When MoR/MoD are active, total training loss includes auxiliary terms
+    (aux_loss, ponder_loss, advantage_loss) that eval does not compute.
+    This check compares CE-to-CE, not total_loss-to-CE.
     
     Returns dict with diagnostics.
     """
@@ -243,11 +358,14 @@ def eval_sanity_check_on_train_batch(
     with torch.amp.autocast(device_type=device_type, dtype=dtype):
         # Method 1: Eval path (same as evaluate_fixed_batches)
         if use_mod_mor:
-            if config.use_chunked_ce and hasattr(base_model, "forward_hidden"):
-                hidden = base_model.forward_hidden(x, mask)
+            if config.use_chunked_ce and hasattr(base_model, "forward_hidden_with_losses"):
+                # Match evaluate_fixed_batches: forward_hidden_with_losses is mask-aware.
+                hidden, _aux = base_model.forward_hidden_with_losses(x, mask=mask)
                 weight = base_model.output.weight
                 eval_loss = fused_chunked_cross_entropy(
-                    hidden, weight, y,
+                    hidden,
+                    weight,
+                    y,
                     ignore_index=-100,
                     chunk_size=config.chunked_ce_size,
                 )
@@ -300,8 +418,15 @@ def eval_sanity_check_on_train_batch(
             reduction="mean",
         ).item()
     
-    # Compute deltas
-    delta_train = abs(eval_loss_val - current_train_loss)
+    # IMPORTANT: `train_batch` is a fresh batch fetched after the training step.
+    # `last_ce_loss` (when provided) comes from the *previous* training step and
+    # generally corresponds to a different batch. Comparing eval CE on this batch
+    # against `last_ce_loss` will frequently (and falsely) fail.
+    #
+    # So the sanity check validates *internal CE consistency on the same batch*:
+    #   eval path CE  ≈  PyTorch mean CE  ≈  manual mean CE
+    delta_eval_vs_pytorch = abs(eval_loss_val - pytorch_mean)
+    delta_eval_vs_manual = abs(eval_loss_val - manual_mean)
     delta_ema = abs(eval_loss_val - current_ema)
     
     result = {
@@ -309,32 +434,38 @@ def eval_sanity_check_on_train_batch(
         "manual_mean": manual_mean,
         "pytorch_mean": pytorch_mean,
         "current_train_loss": current_train_loss,
+        "last_step_ce_loss": (float(last_ce_loss) if last_ce_loss is not None else None),
         "current_ema": current_ema,
         "n_valid_tokens": n_valid,
         "n_total_tokens": n_total,
-        "delta_vs_train": delta_train,
+        "delta_eval_vs_pytorch": delta_eval_vs_pytorch,
+        "delta_eval_vs_manual": delta_eval_vs_manual,
         "delta_vs_ema": delta_ema,
-        "sane": delta_train < 0.5 and delta_ema < 0.5,
+        "sane": (delta_eval_vs_pytorch < 1e-3) and (delta_eval_vs_manual < 1e-3),
     }
     
+    last_step_line = (
+        f"  last_step_ce_loss   = {float(last_ce_loss):.4f}\n" if last_ce_loss is not None else ""
+    )
     logger.info(
         f"\n{'='*70}\n"
-        f"[EVAL SANITY CHECK] Eval codepath on TRAINING batch:\n"
+        f"[EVAL SANITY CHECK] Eval codepath on TRAINING batch (CE-to-CE):\n"
         f"  eval_on_train_batch = {eval_loss_val:.4f}\n"
         f"  manual_mean (ref)   = {manual_mean:.4f}\n"
         f"  pytorch_mean        = {pytorch_mean:.4f}\n"
-        f"  current_train_loss  = {current_train_loss:.4f}\n"
+        f"{last_step_line}"
+        f"  current_total_loss  = {current_train_loss:.4f}\n"
         f"  current_EMA         = {current_ema:.4f}\n"
         f"  valid_tokens        = {n_valid}/{n_total} ({100*n_valid/max(1,n_total):.1f}%)\n"
-        f"  delta_vs_train      = {delta_train:.4f} {'✓' if delta_train < 0.5 else '⚠️ HIGH'}\n"
+        f"  delta_eval_vs_ref   = {delta_eval_vs_pytorch:.6f} {'✓' if delta_eval_vs_pytorch < 1e-3 else '⚠️ HIGH'}\n"
         f"  delta_vs_ema        = {delta_ema:.4f} {'✓' if delta_ema < 0.5 else '⚠️ HIGH'}\n"
         f"{'='*70}"
     )
     
     if not result["sane"]:
         logger.warning(
-            "⚠️  EVAL SANITY CHECK FAILED: eval_on_train_batch differs significantly from train_loss.\n"
-            "   This indicates a bug in the eval codepath (shift, mask, or normalization mismatch)."
+            "⚠️  EVAL SANITY CHECK FAILED: eval CE mismatch on the same batch.\n"
+            "   This suggests a bug in the eval codepath (shift, mask, or normalization mismatch)."
         )
     
     return result

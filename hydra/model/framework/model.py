@@ -22,7 +22,55 @@ from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from hydra.layers import RMSNorm
 from hydra.routing.loss_tracker import MovingAverageBaseline
 
-_log = logging.getLogger(__name__)
+# Use HYDRA logger for consistent output with trainer
+_log = logging.getLogger("HYDRA")
+
+# Track if we've already warned about OOB tokens (avoid log spam)
+_OOB_TOKEN_WARNED = False
+
+
+@torch.compiler.disable
+def _log_oob_warning(x: torch.Tensor, vocab_size: int) -> None:
+	"""Log OOB token warning (outside compiled region)."""
+	global _OOB_TOKEN_WARNED
+	if _OOB_TOKEN_WARNED:
+		return
+	oob_mask = (x < 0) | (x >= vocab_size)
+	if oob_mask.any():
+		n_oob = int(oob_mask.sum().item())
+		min_val = int(x.min().item())
+		max_val = int(x.max().item())
+		_log.warning(
+			f"OOB tokens detected in embedding input! "
+			f"Found {n_oob} tokens outside [0, {vocab_size}). "
+			f"Range: [{min_val}, {max_val}]. Clamping to valid range."
+		)
+		_OOB_TOKEN_WARNED = True
+
+
+def _safe_embedding_lookup(embedding: nn.Embedding, x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+	"""Embedding lookup with bounds validation to prevent Xid 13 GPU crashes.
+	
+	torch.compile compatible - clamping is always applied (no-op for valid tokens).
+	Warning logging is done outside the compiled region.
+	
+	Args:
+		embedding: nn.Embedding module
+		x: Token IDs tensor [batch, seq_len]
+		scale: Optional scaling factor (e.g., sqrt(dim) for LLaMA-style)
+	
+	Returns:
+		Embedded tensor [batch, seq_len, dim]
+	"""
+	vocab_size = embedding.num_embeddings
+	
+	# Log warning if OOB tokens detected (outside compiled region)
+	_log_oob_warning(x, vocab_size)
+	
+	# Always clamp - this is a no-op for valid tokens but prevents GPU crash for OOB
+	x = x.clamp(0, vocab_size - 1)
+	
+	return embedding(x) * scale
 
 from .blocks import HydraBlock, HydraMoRBlock
 
@@ -92,9 +140,19 @@ class HydraBaseModel(nn.Module):
 			elif isinstance(module, nn.Conv1d):
 				nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-	def forward(self, x: torch.Tensor) -> torch.Tensor:
+	def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+		"""Forward pass.
+		
+		Args:
+			x: Input token ids [batch, seq_len]
+			mask: Optional attention mask [batch, seq_len] (unused, for API compat)
+		
+		Returns:
+			Logits tensor [batch, seq_len, vocab_size]
+		"""
 		# Token embedding with sqrt(dim) scaling (LLaMA style)
-		h = self.tok_emb(x) * math.sqrt(self.dim)
+		# Uses safe lookup to prevent Xid 13 GPU crashes from OOB tokens
+		h = _safe_embedding_lookup(self.tok_emb, x, scale=math.sqrt(self.dim))
 		for layer in self.layers:
 			h = layer(h)
 		h = self.norm(h)
@@ -106,12 +164,13 @@ CCGQAModel = HydraBaseModel
 
 
 class HydraModel(nn.Module):
-	"""HYDRA Transformer with MoD + MoR.
+	"""HYDRA Transformer with MoD + MoR + optional MoE.
 	
 	Architecture:
 	- Attention backend: LA3 (default, O(n) linear) or CCGQA (compressed latent)
 	- Mixture-of-Depths (MoD): Skip MLP for easy tokens
 	- Mixture-of-Recursions (MoR): Variable-depth MLP processing
+	- Mixture-of-Experts (MoE): Optional sparse FFN routing (additive)
 	
 	This is the main production model for HYDRA.
 	"""
@@ -137,6 +196,21 @@ class HydraModel(nn.Module):
 		depth_alpha: float = 0.0,
 		depth_scale_max: float = 2.0,
 		attention_backend: str = "ccgqa",  # Only CCGQA is supported
+		# MoR configuration
+		mor_min_depth: int = 0,  # Minimum recursion depth (0=allow immediate exit, 1+=force iterations)
+		# MoE configuration
+		moe_enabled: bool = False,
+		moe_num_experts: int = 4,
+		moe_num_layers: int = 2,
+		moe_top_k: int = 1,
+		moe_aux_weight: float = 0.01,
+		moe_warmup_steps: int = 1000,
+		moe_capacity_factor: float = float("inf"),
+		moe_router_jitter: float = 0.0,
+		moe_expert_diversity_noise: float = 0.0,
+		moe_identity_init: bool = True,
+		moe_forced_routing_steps: int = 0,  # Steps to force position-based routing
+		moe_teacher_until_step: int = 0,
 		**kwargs,
 	):
 		super().__init__()
@@ -160,6 +234,21 @@ class HydraModel(nn.Module):
 		self.dim_ref = dim_ref
 		self.depth_alpha = depth_alpha
 		self.depth_scale_max = depth_scale_max
+
+		# MoE configuration
+		self.moe_enabled = moe_enabled
+		self.moe_num_experts = moe_num_experts
+		self.moe_num_layers = moe_num_layers
+		self.moe_top_k = moe_top_k
+		self.moe_aux_weight = moe_aux_weight
+		self.moe_warmup_steps = moe_warmup_steps
+		self.moe_capacity_factor = moe_capacity_factor
+		self.moe_router_jitter = moe_router_jitter
+		self.moe_expert_diversity_noise = moe_expert_diversity_noise
+		self.moe_identity_init = moe_identity_init
+		self.moe_forced_routing_steps = moe_forced_routing_steps
+		self.moe_teacher_until_step = moe_teacher_until_step
+		self.mor_min_depth = mor_min_depth
 
 		if aux_loss_weight is None:
 			depth_scale = max(1.0, self.effective_layers / 32)
@@ -211,8 +300,40 @@ class HydraModel(nn.Module):
 				dim_ref=dim_ref,
 				depth_alpha=depth_alpha,
 				depth_scale_max=depth_scale_max,
+				mor_min_depth=mor_min_depth,
 			)
 			self.layers.append(mor_block)
+
+		# MoE layers (optional, additive)
+		self.moe_layers = nn.ModuleList()
+		self._moe_placement = ()
+		if self.moe_enabled and self.moe_num_layers > 0:
+			from hydra.routing import MoEFFNBlock, compute_moe_placement
+			
+			# Compute deterministic MoE placement
+			self._moe_placement = compute_moe_placement(n_mor_blocks, self.moe_num_layers)
+			
+			_log.info(f"MoE: {self.moe_num_experts} experts, {len(self._moe_placement)} layers at positions {self._moe_placement}")
+			
+			# Create MoE blocks
+			for moe_idx in range(len(self._moe_placement)):
+				moe_block = MoEFFNBlock(
+					dim=dim,
+					hidden_dim=None,  # Auto-compute from mlp_ratio
+					num_experts=self.moe_num_experts,
+					top_k=self.moe_top_k,
+					aux_loss_weight=self.moe_aux_weight,
+					router_jitter=self.moe_router_jitter,
+					expert_diversity_noise=self.moe_expert_diversity_noise,
+					capacity_factor=self.moe_capacity_factor,
+					residual_scale=1.0,
+					identity_init=self.moe_identity_init,
+					warmup_steps=self.moe_warmup_steps,
+					mlp_ratio=mlp_ratio,
+					forced_routing_steps=self.moe_forced_routing_steps,
+					teacher_until_step=self.moe_teacher_until_step,
+				)
+				self.moe_layers.append(moe_block)
 
 		self.norm = RMSNorm(dim)
 		self.output = nn.Linear(dim, vocab_size, bias=False)
@@ -280,34 +401,80 @@ class HydraModel(nn.Module):
 	def is_gradient_checkpointing(self) -> bool:
 		return self._gradient_checkpointing
 
-	def forward(self, x: torch.Tensor, return_losses: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
+	def forward(
+		self,
+		x: torch.Tensor,
+		mask: Optional[torch.Tensor] = None,
+		return_losses: bool = False,
+	) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
+		"""Forward pass.
+		
+		Args:
+			x: Input token ids [batch, seq_len]
+			mask: Optional attention mask [batch, seq_len] (unused, for API compat)
+			return_losses: If True, return (logits, losses_dict) with aux/ponder losses
+		
+		Returns:
+			If return_losses=False: logits [batch, seq_len, vocab_size]
+			If return_losses=True: (logits, {"aux_loss": ..., "ponder_loss": ..., "moe_aux_loss": ...})
+		"""
 		# Token embedding with sqrt(dim) scaling (LLaMA style)
-		h = self.tok_emb(x) * math.sqrt(self.dim)
+		# Uses safe lookup to prevent Xid 13 GPU crashes from OOB tokens
+		h = _safe_embedding_lookup(self.tok_emb, x, scale=math.sqrt(self.dim))
+
+		# Build MoE placement lookup for efficient routing
+		moe_after_block = {}
+		if self.moe_enabled and self.moe_layers:
+			for moe_idx, block_idx in enumerate(self._moe_placement):
+				moe_after_block[block_idx] = moe_idx
 
 		if return_losses:
 			if self._gradient_checkpointing and self.training:
 				layer_results = []
+				moe_results = []
 				for i, layer in enumerate(self.layers):
 					if i % self._checkpoint_every_n == 0:
 						h, layer_losses = gradient_checkpoint(layer.forward_with_losses, h, use_reentrant=False)
 					else:
 						h, layer_losses = layer.forward_with_losses(h)
 					layer_results.append(layer_losses)
+					
+					# Apply MoE after this block if scheduled
+					if i in moe_after_block:
+						moe_idx = moe_after_block[i]
+						moe_block = self.moe_layers[moe_idx]
+						if i % self._checkpoint_every_n == 0:
+							h, moe_losses = gradient_checkpoint(moe_block.forward_with_losses, h, use_reentrant=False)
+						else:
+							h, moe_losses = moe_block.forward_with_losses(h)
+						moe_results.append(moe_losses)
 			else:
 				layer_results = []
-				for layer in self.layers:
+				moe_results = []
+				for i, layer in enumerate(self.layers):
 					h, layer_losses = layer.forward_with_losses(h)
 					layer_results.append(layer_losses)
+					
+					# Apply MoE after this block if scheduled
+					if i in moe_after_block:
+						moe_idx = moe_after_block[i]
+						moe_block = self.moe_layers[moe_idx]
+						h, moe_losses = moe_block.forward_with_losses(h)
+						moe_results.append(moe_losses)
 
 			aux_losses = [losses["aux_loss"] for losses in layer_results if "aux_loss" in losses]
 			ponder_losses = [losses["ponder_loss"] for losses in layer_results if "ponder_loss" in losses]
+			moe_aux_losses = [losses.get("moe_aux_loss", self._zero_scalar) for losses in moe_results]
+			moe_teacher_losses = [losses.get("moe_teacher_loss", self._zero_scalar) for losses in moe_results]
 
 			h = self.norm(h)
 			logits = self.output(h)
 
 			aux_loss = sum(aux_losses) if aux_losses else self._zero_scalar
 			ponder_loss = sum(ponder_losses) if ponder_losses else self._zero_scalar
-			return logits, {"aux_loss": aux_loss, "ponder_loss": ponder_loss}
+			moe_aux_loss = sum(moe_aux_losses) if moe_aux_losses else self._zero_scalar
+			moe_teacher_loss = sum(moe_teacher_losses) if moe_teacher_losses else self._zero_scalar
+			return logits, {"aux_loss": aux_loss, "ponder_loss": ponder_loss, "moe_aux_loss": moe_aux_loss, "moe_teacher_loss": moe_teacher_loss}
 
 		if self._gradient_checkpointing and self.training:
 			for i, layer in enumerate(self.layers):
@@ -315,16 +482,47 @@ class HydraModel(nn.Module):
 					h = gradient_checkpoint(layer, h, use_reentrant=False)
 				else:
 					h = layer(h)
+				# Apply MoE after this block if scheduled
+				if i in moe_after_block:
+					moe_idx = moe_after_block[i]
+					moe_block = self.moe_layers[moe_idx]
+					if i % self._checkpoint_every_n == 0:
+						h = gradient_checkpoint(moe_block, h, use_reentrant=False)
+					else:
+						h = moe_block(h)
 		else:
 			for i, layer in enumerate(self.layers):
 				h = layer(h)
+				# Apply MoE after this block if scheduled
+				if i in moe_after_block:
+					moe_idx = moe_after_block[i]
+					h = self.moe_layers[moe_idx](h)
 
 		h = self.norm(h)
 		return self.output(h)
 
-	def forward_hidden(self, x: torch.Tensor) -> torch.Tensor:
+	def forward_hidden(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+		"""Return post-norm hidden states (pre-logits).
+
+		Used for memory-efficient loss functions (e.g., chunked CE) that avoid
+		materializing the full logits tensor.
+
+		Args:
+			x: Input token ids [batch, seq_len]
+			mask: Optional attention mask [batch, seq_len] (1=valid, 0=pad)
+
+		Returns:
+			Hidden states after final norm, shape [batch, seq_len, dim]
+		"""
 		# Token embedding with sqrt(dim) scaling (LLaMA style)
-		h = self.tok_emb(x) * math.sqrt(self.dim)
+		# Uses safe lookup to prevent Xid 13 GPU crashes from OOB tokens
+		h = _safe_embedding_lookup(self.tok_emb, x, scale=math.sqrt(self.dim))
+
+		# Build MoE placement lookup
+		moe_after_block = {}
+		if self.moe_enabled and self.moe_layers:
+			for moe_idx, block_idx in enumerate(self._moe_placement):
+				moe_after_block[block_idx] = moe_idx
 
 		if self._gradient_checkpointing and self.training:
 			for i, layer in enumerate(self.layers):
@@ -332,9 +530,19 @@ class HydraModel(nn.Module):
 					h = gradient_checkpoint(layer, h, use_reentrant=False)
 				else:
 					h = layer(h)
+				# Apply MoE after this block if scheduled
+				if i in moe_after_block:
+					moe_idx = moe_after_block[i]
+					moe_block = self.moe_layers[moe_idx]
+					if i % self._checkpoint_every_n == 0:
+						h = gradient_checkpoint(moe_block, h, use_reentrant=False)
+					else:
+						h = moe_block(h)
 		else:
-			for layer in self.layers:
+			for i, layer in enumerate(self.layers):
 				h = layer(h)
+				if i in moe_after_block:
+					h = self.moe_layers[moe_after_block[i]](h)
 
 		return self.norm(h)
 
@@ -351,31 +559,57 @@ class HydraModel(nn.Module):
 		Returns:
 			Tuple of:
 				- hidden: Hidden states after final norm [batch, seq_len, dim]
-				- losses: Dict with 'aux_loss' and 'ponder_loss'
+				- losses: Dict with 'aux_loss', 'ponder_loss', 'moe_aux_loss'
 		"""
 		# Token embedding with sqrt(dim) scaling (LLaMA style)
-		h = self.tok_emb(x) * math.sqrt(self.dim)
+		# Uses safe lookup to prevent Xid 13 GPU crashes from OOB tokens
+		h = _safe_embedding_lookup(self.tok_emb, x, scale=math.sqrt(self.dim))
+
+		# Build MoE placement lookup
+		moe_after_block = {}
+		if self.moe_enabled and self.moe_layers:
+			for moe_idx, block_idx in enumerate(self._moe_placement):
+				moe_after_block[block_idx] = moe_idx
 
 		if self._gradient_checkpointing and self.training:
 			layer_results = []
+			moe_results = []
 			for i, layer in enumerate(self.layers):
 				if i % self._checkpoint_every_n == 0:
 					h, layer_losses = gradient_checkpoint(layer.forward_with_losses, h, mask, use_reentrant=False)
 				else:
 					h, layer_losses = layer.forward_with_losses(h, mask)
 				layer_results.append(layer_losses)
+				# Apply MoE after this block if scheduled
+				if i in moe_after_block:
+					moe_idx = moe_after_block[i]
+					moe_block = self.moe_layers[moe_idx]
+					if i % self._checkpoint_every_n == 0:
+						h, moe_losses = gradient_checkpoint(moe_block.forward_with_losses, h, use_reentrant=False)
+					else:
+						h, moe_losses = moe_block.forward_with_losses(h)
+					moe_results.append(moe_losses)
 		else:
 			layer_results = []
-			for layer in self.layers:
+			moe_results = []
+			for i, layer in enumerate(self.layers):
 				h, layer_losses = layer.forward_with_losses(h, mask)
 				layer_results.append(layer_losses)
+				if i in moe_after_block:
+					moe_idx = moe_after_block[i]
+					h, moe_losses = self.moe_layers[moe_idx].forward_with_losses(h)
+					moe_results.append(moe_losses)
 
 		aux_losses = [losses["aux_loss"] for losses in layer_results if "aux_loss" in losses]
 		ponder_losses = [losses["ponder_loss"] for losses in layer_results if "ponder_loss" in losses]
+		moe_aux_losses = [losses.get("moe_aux_loss", self._zero_scalar) for losses in moe_results]
+		moe_teacher_losses = [losses.get("moe_teacher_loss", self._zero_scalar) for losses in moe_results]
 
 		aux_loss = sum(aux_losses) if aux_losses else self._zero_scalar
 		ponder_loss = sum(ponder_losses) if ponder_losses else self._zero_scalar
-		return self.norm(h), {"aux_loss": aux_loss, "ponder_loss": ponder_loss}
+		moe_aux_loss = sum(moe_aux_losses) if moe_aux_losses else self._zero_scalar
+		moe_teacher_loss = sum(moe_teacher_losses) if moe_teacher_losses else self._zero_scalar
+		return self.norm(h), {"aux_loss": aux_loss, "ponder_loss": ponder_loss, "moe_aux_loss": moe_aux_loss, "moe_teacher_loss": moe_teacher_loss}
 
 	def get_aux_losses(self) -> dict:
 		mod_aux_loss = self._zero_scalar
@@ -461,6 +695,10 @@ class HydraModel(nn.Module):
 		for layer in self.layers:
 			if hasattr(layer, "set_global_step"):
 				layer.set_global_step(step)
+		# Update MoE layers
+		for moe_layer in self.moe_layers:
+			if hasattr(moe_layer, "set_global_step"):
+				moe_layer.set_global_step(step)
 
 	@torch.compiler.disable
 	def update_mod_loss_ema(self, loss_ema: float) -> None:
@@ -540,6 +778,13 @@ class HydraModel(nn.Module):
 			if isinstance(layer, HydraMoRBlock):
 				mor_stats.append({"layer": i, **layer.get_routing_stats()})
 
+		# MoE stats
+		moe_stats = []
+		for i, moe_layer in enumerate(self.moe_layers):
+			if hasattr(moe_layer, "get_routing_stats"):
+				block_idx = self._moe_placement[i] if i < len(self._moe_placement) else -1
+				moe_stats.append({"moe_idx": i, "after_block": block_idx, **moe_layer.get_routing_stats()})
+
 		summary = {}
 		if mod_stats:
 			probs = [s.get("probs_mean", 0) for s in mod_stats]
@@ -548,8 +793,16 @@ class HydraModel(nn.Module):
 			avg_depths = [s.get("avg_depth", 0) for s in mor_stats if "avg_depth" in s]
 			if avg_depths:
 				summary["mor_avg_depth"] = sum(avg_depths) / len(avg_depths)
+		if moe_stats:
+			expert_utils = [s.get("expert_utilization", []) for s in moe_stats]
+			aux_losses = [s.get("aux_loss", 0) for s in moe_stats]
+			summary["moe_enabled"] = True
+			summary["moe_num_layers"] = len(moe_stats)
+			summary["moe_avg_aux_loss"] = sum(aux_losses) / len(aux_losses) if aux_losses else 0
+		else:
+			summary["moe_enabled"] = False
 
-		return {"mod_layers": mod_stats, "mor_layers": mor_stats, "summary": summary}
+		return {"mod_layers": mod_stats, "mor_layers": mor_stats, "moe_layers": moe_stats, "summary": summary}
 
 
 # Backward compatibility alias

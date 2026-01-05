@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
+from .loop import update_scalar_ema
+
 
 @dataclass
 class TrainingMetrics:
@@ -32,10 +34,8 @@ class TrainingMetrics:
         self.tokens_per_sec.append(tps)
         self.step_times.append(step_time)
 
-        if self.ema_loss == 0.0:
-            self.ema_loss = loss
-        else:
-            self.ema_loss = self.ema_alpha * loss + (1 - self.ema_alpha) * self.ema_loss
+        # Use canonical EMA helper from loop.py
+        self.ema_loss = update_scalar_ema(ema=self.ema_loss, value=loss, alpha=self.ema_alpha)
 
         if loss < self.best_loss:
             self.best_loss = loss

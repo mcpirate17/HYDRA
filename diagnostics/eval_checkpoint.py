@@ -6,6 +6,9 @@ Usage:
     python diagnostics/eval_checkpoint.py checkpoints/hydra_250m_step_10000.pt
     python diagnostics/eval_checkpoint.py checkpoints/hydra_250m_step_10000.pt --prompt "Once upon a time"
     python diagnostics/eval_checkpoint.py checkpoints/hydra_250m_step_10000.pt --eval-loss --samples 5
+
+Notes:
+- Default device is `cuda`; set `--device cpu` to force CPU evaluation. GPU recommended for generation and eval speed.
 """
 
 from __future__ import annotations

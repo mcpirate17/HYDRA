@@ -66,14 +66,20 @@ TRITON_VERSION = tuple(int(x) for x in triton.__version__.split(".")[:2])
 USE_TRITON_KERNELS = TRITON_AVAILABLE and os.environ.get("HYDRA_DISABLE_TRITON", "0") != "1"
 
 # Per-kernel switches (for debugging)
-# NOTE: RoPE kernel disabled by default (can trigger illegal memory access on some GPUs/stacks).
-# NOTE: Fused RMSNorm is currently DISABLED by default because its backward has been observed
-#       to produce massively incorrect gradients on some stacks. Opt in explicitly via
-#       HYDRA_ENABLE_FUSED_RMS_NORM=1.
-USE_FUSED_ROPE = USE_TRITON_KERNELS and os.environ.get("HYDRA_ENABLE_FUSED_ROPE", "0") == "1"
+# Defaults:
+# - RoPE: enabled by default (disable with HYDRA_DISABLE_FUSED_ROPE=1)
+# - RMSNorm: enabled by default (disable with HYDRA_DISABLE_FUSED_RMS_NORM=1)
+#
+# If you want to force-enable/force-disable explicitly, you can also set
+# HYDRA_ENABLE_FUSED_ROPE / HYDRA_ENABLE_FUSED_RMS_NORM to 1/0.
+_enable_fused_rope = os.environ.get("HYDRA_ENABLE_FUSED_ROPE", "1") == "1"
+_disable_fused_rope = os.environ.get("HYDRA_DISABLE_FUSED_ROPE", "0") == "1"
+USE_FUSED_ROPE = USE_TRITON_KERNELS and _enable_fused_rope and not _disable_fused_rope
 USE_FUSED_QK_NORM = USE_TRITON_KERNELS  # Now autograd-compatible!
 USE_FUSED_SWIGLU = USE_TRITON_KERNELS  # Now autograd-compatible!
-USE_FUSED_RMS_NORM = USE_TRITON_KERNELS and os.environ.get("HYDRA_ENABLE_FUSED_RMS_NORM", "0") == "1"
+_enable_fused_rms_norm = os.environ.get("HYDRA_ENABLE_FUSED_RMS_NORM", "1") == "1"
+_disable_fused_rms_norm = os.environ.get("HYDRA_DISABLE_FUSED_RMS_NORM", "0") == "1"
+USE_FUSED_RMS_NORM = USE_TRITON_KERNELS and _enable_fused_rms_norm and not _disable_fused_rms_norm
 
 
 def set_use_triton_kernels(enabled: bool):
@@ -84,12 +90,14 @@ def set_use_triton_kernels(enabled: bool):
         raise RuntimeError("Triton is not available. Install with: pip install triton")
     
     USE_TRITON_KERNELS = enabled
-    # Fused RoPE stays opt-in even when enabling Triton globally.
-    USE_FUSED_ROPE = enabled and os.environ.get("HYDRA_ENABLE_FUSED_ROPE", "0") == "1"
+    _enable_fused_rope = os.environ.get("HYDRA_ENABLE_FUSED_ROPE", "1") == "1"
+    _disable_fused_rope = os.environ.get("HYDRA_DISABLE_FUSED_ROPE", "0") == "1"
+    USE_FUSED_ROPE = enabled and _enable_fused_rope and not _disable_fused_rope
     USE_FUSED_QK_NORM = enabled
     USE_FUSED_SWIGLU = enabled
-    # Fused RMSNorm stays opt-in even when enabling Triton globally.
-    USE_FUSED_RMS_NORM = enabled and os.environ.get("HYDRA_ENABLE_FUSED_RMS_NORM", "0") == "1"
+    _enable_fused_rms_norm = os.environ.get("HYDRA_ENABLE_FUSED_RMS_NORM", "1") == "1"
+    _disable_fused_rms_norm = os.environ.get("HYDRA_DISABLE_FUSED_RMS_NORM", "0") == "1"
+    USE_FUSED_RMS_NORM = enabled and _enable_fused_rms_norm and not _disable_fused_rms_norm
 
 
 def get_kernel_status() -> dict:
@@ -176,6 +184,7 @@ if TRITON_AVAILABLE:
             tl.store(out_ptr + x2_offs, out2, mask=mask)
 
 
+@compiler_disable
 def fused_rope(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -649,6 +658,7 @@ if TRITON_AVAILABLE:
             tl.store(out_ptr + row_start + offs, out, mask=mask)
 
 
+@compiler_disable
 def fused_rms_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -890,14 +900,33 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
         chunk_size: int,
     ) -> torch.Tensor:
         batch_size, seq_len, dim = hidden_states.shape
+        vocab_size = weight.shape[0]
         
         # Flatten for computation - use reshape() to handle non-contiguous tensors
         hidden_flat = hidden_states.reshape(-1, dim)
         targets_flat = targets.reshape(-1)
         total_tokens = hidden_flat.shape[0]
         
+        # Defensive bounds check: clamp target IDs to valid vocab range.
+        # Out-of-bounds targets cause CUDA illegal memory access in cross_entropy.
+        valid_mask_full = targets_flat != ignore_index
+        if valid_mask_full.any():
+            valid_targets = targets_flat[valid_mask_full]
+            oob_mask = (valid_targets < 0) | (valid_targets >= vocab_size)
+            if oob_mask.any():
+                n_oob = oob_mask.sum().item()
+                t_max = valid_targets.max().item()
+                t_min = valid_targets.min().item()
+                import logging
+                logging.getLogger("dmta.kernels").warning(
+                    f"ChunkedCrossEntropyFunction: {n_oob} targets out of vocab range "
+                    f"[0, {vocab_size}). min={t_min}, max={t_max}. Clamping to valid range."
+                )
+                targets_flat = targets_flat.clamp(min=0, max=vocab_size - 1)
+        
         # Save for backward (recompute logits to save memory)
-        ctx.save_for_backward(hidden_states, weight, targets)
+        # Save the clamped targets to avoid re-clamping in backward
+        ctx.save_for_backward(hidden_states, weight, targets_flat.view_as(targets))
         ctx.ignore_index = ignore_index
         ctx.chunk_size = chunk_size
         

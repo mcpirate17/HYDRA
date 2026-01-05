@@ -7,7 +7,11 @@ This script provides performance benchmarking for:
 - HydraModel full efficiency stack (LA3 + MoD + MoR)
 
 Run with:
-    python -m diagnostics.benchmark_ccgqa
+        python -m diagnostics.benchmark_ccgqa
+
+Notes:
+- REQUIRES: CUDA for full GPU benchmarks. Running on CPU will work for very small shapes
+    but results are not indicative of GPU throughput.
 """
 
 import torch

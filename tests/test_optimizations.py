@@ -230,6 +230,99 @@ class TestTritonKernels:
         
         assert torch.allclose(out_fused, out_pytorch, atol=1e-4)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_fused_rope_torch_compile_smoke_when_enabled(self, monkeypatch):
+        """Smoke-test that fused RoPE can run under torch.compile when enabled."""
+        if not hasattr(torch, "compile"):
+            pytest.skip("torch.compile not available")
+
+        from hydra.kernels import TRITON_AVAILABLE, set_use_triton_kernels, fused_rope
+
+        if not TRITON_AVAILABLE:
+            pytest.skip("Triton not available")
+
+        monkeypatch.setenv("HYDRA_ENABLE_FUSED_ROPE", "1")
+
+        # Enable Triton and re-read env-gated per-kernel flags.
+        prev_status = None
+        try:
+            from hydra.kernels import get_kernel_status
+            prev_status = get_kernel_status()
+        except Exception:
+            prev_status = None
+
+        set_use_triton_kernels(True)
+
+        class _RoPEOnly(torch.nn.Module):
+            def forward(self, x, cos, sin):
+                return fused_rope(x, cos, sin)
+
+        m = _RoPEOnly().cuda()
+        cm = torch.compile(m, mode="reduce-overhead")
+
+        x = torch.randn(2, 8, 64, 32, device="cuda", dtype=torch.bfloat16)
+        cos = torch.randn(1, 1, 64, 16, device="cuda", dtype=torch.bfloat16)
+        sin = torch.randn(1, 1, 64, 16, device="cuda", dtype=torch.bfloat16)
+
+        out = cm(x, cos, sin)
+        assert out.shape == x.shape
+        assert not torch.isnan(out).any()
+
+        # Best-effort restore global state for other tests
+        if prev_status is not None:
+            try:
+                set_use_triton_kernels(bool(prev_status.get("use_triton_kernels", False)))
+            except Exception:
+                pass
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_fused_rms_norm_torch_compile_smoke_when_enabled(self, monkeypatch):
+        """Smoke-test that fused RMSNorm (incl backward) can run under torch.compile when enabled."""
+        if not hasattr(torch, "compile"):
+            pytest.skip("torch.compile not available")
+
+        from hydra.kernels import TRITON_AVAILABLE, set_use_triton_kernels, fused_rms_norm
+
+        if not TRITON_AVAILABLE:
+            pytest.skip("Triton not available")
+
+        monkeypatch.setenv("HYDRA_ENABLE_FUSED_RMS_NORM", "1")
+
+        prev_status = None
+        try:
+            from hydra.kernels import get_kernel_status
+            prev_status = get_kernel_status()
+        except Exception:
+            prev_status = None
+
+        set_use_triton_kernels(True)
+
+        class _RMSNormOnly(torch.nn.Module):
+            def __init__(self, dim: int):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.ones(dim, device="cuda", dtype=torch.bfloat16))
+
+            def forward(self, x):
+                return fused_rms_norm(x, self.weight, 1e-6)
+
+        dim = 256
+        m = _RMSNormOnly(dim).cuda()
+        cm = torch.compile(m, mode="reduce-overhead")
+
+        x = torch.randn(2, 64, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        out = cm(x)
+        loss = out.float().sum()
+        loss.backward()
+
+        assert m.weight.grad is not None
+        assert not torch.isnan(m.weight.grad).any()
+
+        if prev_status is not None:
+            try:
+                set_use_triton_kernels(bool(prev_status.get("use_triton_kernels", False)))
+            except Exception:
+                pass
+
 
 # =============================================================================
 # Flexible Attention Tests

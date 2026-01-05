@@ -227,7 +227,20 @@ class ProgressAwareLRManager:
 
 
 class AdaptiveLRManager:
+    """
+    DEPRECATED: Use ProgressAwareLRManager instead.
+    
+    This class is kept for backward compatibility but is not used internally.
+    It will be removed in a future release.
+    """
     def __init__(self, config: TrainingConfig):
+        import warnings
+        warnings.warn(
+            "AdaptiveLRManager is deprecated and will be removed. "
+            "Use ProgressAwareLRManager instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         self.config = config
         self.base_max_lr = config.max_lr
         self.current_max_lr = config.max_lr

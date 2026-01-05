@@ -2,6 +2,10 @@
 Diagnostic test suite for lightning-attention library.
 Tests kernel compilation, shared memory usage, backward pass stability,
 and integration with HYDRA model.
+
+Notes:
+- REQUIRES: CUDA and the `lightning_attn` package/kernels to run full tests.
+- The script gracefully skips tests when `lightning_attn` is not importable.
 """
 
 import os
