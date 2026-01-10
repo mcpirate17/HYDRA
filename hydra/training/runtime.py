@@ -9,6 +9,12 @@ import sys
 import signal
 from pathlib import Path
 
+# Set CUDA allocator config BEFORE importing torch for reduced fragmentation.
+# expandable_segments: Reduces memory fragmentation from ~80% to ~10%.
+# Must be set before any CUDA initialization.
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import torch
 import torch._inductor.config as inductor_config
 

@@ -150,6 +150,12 @@ class CCGQAAttention(nn.Module):
             self._init_rope(max_seq_len)
 
         self.scale = self.head_dim**-0.5
+        self.max_seq_len = max_seq_len
+
+        # Pre-compute causal mask to avoid regenerating per forward
+        # Shape: [max_seq_len, max_seq_len], True = masked (upper triangle)
+        causal_mask = torch.ones((max_seq_len, max_seq_len), dtype=torch.bool).triu(diagonal=1)
+        self.register_buffer("causal_mask_cached", causal_mask, persistent=False)
 
     def _init_rope(self, max_seq_len: int):
         head_dim = self.head_dim
@@ -267,13 +273,13 @@ class CCGQAAttention(nn.Module):
             # Combine causal mask with padding mask
             # mask is (B, S), 1=valid, 0=pad
             # We need boolean mask where True = masked out
-            
-            # Causal part: True for j > i
-            causal_mask = torch.ones((S, S), device=x.device, dtype=torch.bool).triu(diagonal=1)
-            
+
+            # Use cached causal mask (sliced to current sequence length)
+            causal_mask = self.causal_mask_cached[:S, :S]
+
             # Padding part: True where mask == 0
             padding_mask = (mask == 0).view(B, 1, 1, S)
-            
+
             attn_mask = causal_mask.unsqueeze(0).unsqueeze(0) | padding_mask
 
         # Fast path: on CUDA, prefer PyTorch SDPA (Flash/MemEff) for both MHA and GQA.
