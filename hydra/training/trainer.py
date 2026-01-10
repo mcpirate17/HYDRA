@@ -43,6 +43,8 @@ from .policy import SeqLenPolicy
 from .curriculum import CurriculumController
 from . import step_diagnostics as _step_diag
 from . import db as _db
+from .safe_optimizations import SafeOptimizations, OptimizationConfig
+from .pretest_hook import PretestHook
 
 _RUNTIME_STATUS = configure_runtime()
 
@@ -116,6 +118,8 @@ class Trainer:
         "_source_name_counts",
         "_source_name_counts_total",
         "_grad_norm_ema",  # For dynamic gradient clipping
+        "_safe_opts",  # SafeOptimizations wrapper for experimental optimizations
+        "_pretest_hook",  # Hook for automatic pretest runs on config/checkpoint changes
     )
 
     def __init__(self, config: TrainingConfig):
@@ -232,6 +236,17 @@ class Trainer:
             self._kernel_status = get_kernel_status()
         except Exception as e:
             self.logger.warning(f"Failed to configure Triton kernels ({e})")
+
+        # Initialize SafeOptimizations with config-based settings
+        self._safe_opts = self._setup_safe_optimizations(config)
+
+        # Initialize pretest hook for automatic pretest runs on config/checkpoint changes
+        self._pretest_hook = PretestHook(
+            log_dir=str(Path(config.checkpoint_dir) / "pretest_logs"),
+            cache_results=True,
+            verbose=True,
+            logger=self.logger,
+        )
 
         self._checkpoint_seq_len = None
         self._checkpoint_config = {}
@@ -392,6 +407,52 @@ class Trainer:
                 f"heads={result.get('mod_mor_n_heads')}"
             )
         return result
+
+    def _setup_safe_optimizations(self, config: TrainingConfig) -> SafeOptimizations:
+        """Initialize SafeOptimizations with config-based settings.
+
+        Creates OptimizationConfig from TrainingConfig experimental flags,
+        handling attributes that may not exist on older configs.
+        """
+        opt_config = OptimizationConfig(
+            # FA3 (Flash Attention 3)
+            enable_fa3=bool(getattr(config, "experimental_fa3", True)),
+            fa3_fallback_to_fa2=True,
+            # CUDA Graphs
+            enable_cuda_graphs=bool(getattr(config, "experimental_cuda_graphs", True)),
+            cuda_graphs_warmup_steps=int(getattr(config, "cuda_graphs_warmup", 50)),
+            # Blackwell Triton tuning
+            enable_blackwell_tuning=bool(getattr(config, "experimental_blackwell_tuning", True)),
+            triton_block_size_q=int(getattr(config, "triton_block_q", 128)),
+            triton_block_size_kv=int(getattr(config, "triton_block_kv", 64)),
+            triton_num_warps=int(getattr(config, "triton_num_warps", 8)),
+            # Prefetch
+            enable_prefetch_threads=int(getattr(config, "experimental_prefetch_threads", 4)),
+            prefetch_buffer_size=int(getattr(config, "prefetch_buffer_size", 8)),
+            # FP8
+            enable_fp8=bool(getattr(config, "experimental_fp8", False)),
+            fp8_format=str(getattr(config, "fp8_format", "e4m3")),
+            # Safety monitoring
+            safety_window_steps=int(getattr(config, "experimental_safety_window", 100)),
+            loss_spike_threshold=float(getattr(config, "experimental_loss_spike_threshold", 2.0)),
+            throughput_drop_threshold=float(getattr(config, "experimental_throughput_drop_threshold", 0.5)),
+            # Pretest
+            pretest_steps=int(getattr(config, "experimental_pretest_steps", 10)),
+        )
+
+        safe_opts = SafeOptimizations(
+            config=opt_config,
+            device=self.device,
+            logger=self.logger,
+        )
+
+        # Log optimization status
+        status = safe_opts.get_status_summary()
+        active_opts = [k for k, v in status.items() if v in ("ENABLED", "MONITORING", "PRETESTING")]
+        if active_opts:
+            self.logger.info(f"SafeOptimizations: {', '.join(active_opts)}")
+
+        return safe_opts
 
     def _peek_checkpoint_seq_len(self, checkpoint_path: str) -> int:
         try:
@@ -1052,7 +1113,30 @@ class Trainer:
                                     param.add_(noise)
                                 perturbed_count += 1
                 self.logger.info(f"  ⚡ Applied diversity noise (std={noise_std}) to {perturbed_count} MoE experts to break symmetry")
-        
+
+        # Run pretest hook on checkpoint load (if enabled)
+        if self._pretest_hook is not None:
+            try:
+                # Create sample batch for pretest
+                sample_batch = torch.randint(
+                    0, self.config.vocab_size, (2, 512), device=self.device
+                )
+                base_model = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+                pretest_record = self._pretest_hook.on_checkpoint_loaded(
+                    model=base_model,
+                    config=self.config,
+                    checkpoint_path=checkpoint_path,
+                    sample_batch=sample_batch,
+                )
+                if pretest_record is not None:
+                    self.logger.info(
+                        f"  Pretests: {pretest_record.passed_count} passed, "
+                        f"{pretest_record.failed_count} failed, "
+                        f"{pretest_record.skipped_count} skipped"
+                    )
+            except Exception as e:
+                self.logger.warning(f"  ⚠️  Pretest hook failed: {e}")
+
         self.logger.info(f"{'='*70}\n")
 
     def _compute_moe_divergence(self) -> tuple[float, float, list[float]]:
@@ -1446,6 +1530,52 @@ class Trainer:
                 self.logger.info(
                     f"📈 TensorBoard enabled. Logs will be saved to {getattr(config, 'tensorboard_dir', 'runs')}"
                 )
+
+                # Log SafeOptimizations status to TensorBoard
+                if self._safe_opts is not None:
+                    try:
+                        opt_status = self._safe_opts.get_status_summary()
+                        triton_cfg = self._safe_opts.get_triton_config()
+
+                        # Log optimization status as text
+                        opt_text = "## SafeOptimizations Status\n\n"
+                        opt_text += "| Optimization | Status |\n|---|---|\n"
+                        for opt, status in opt_status.items():
+                            emoji = "✓" if status in ("ENABLED", "MONITORING") else "✗"
+                            opt_text += f"| {opt} | {emoji} {status} |\n"
+
+                        opt_text += "\n## Triton Configuration\n\n"
+                        opt_text += "| Parameter | Value |\n|---|---|\n"
+                        for param, value in triton_cfg.items():
+                            opt_text += f"| {param} | {value} |\n"
+
+                        tb_writer.add_text("optimizations/status", opt_text, 0)
+
+                        # Log pretest results if available
+                        if self._pretest_hook is not None:
+                            history = self._pretest_hook.get_history(
+                                model_size=str(config.model_size), limit=1
+                            )
+                            if history:
+                                latest = history[0]
+                                pretest_text = "## Pretest Results\n\n"
+                                pretest_text += f"- **Timestamp**: {latest.get('timestamp', 'N/A')}\n"
+                                pretest_text += f"- **GPU**: {latest.get('gpu_name', 'N/A')} ({latest.get('gpu_arch', 'N/A')})\n"
+                                pretest_text += f"- **Passed**: {latest.get('passed_count', 0)}\n"
+                                pretest_text += f"- **Failed**: {latest.get('failed_count', 0)}\n\n"
+
+                                pretest_text += "| Optimization | Status | Time (ms) |\n|---|---|---|\n"
+                                for r in latest.get("results", []):
+                                    status = r.get("status", "unknown")
+                                    emoji = "✓" if status == "passed" else ("○" if status == "skipped" else "✗")
+                                    time_ms = r.get("time_ms", 0)
+                                    pretest_text += f"| {r.get('optimization', '')} | {emoji} {status} | {time_ms:.1f} |\n"
+
+                                tb_writer.add_text("optimizations/pretests", pretest_text, 0)
+
+                        self.logger.info("📊 Logged optimization status to TensorBoard")
+                    except Exception:
+                        pass
             except Exception as e:
                 self.logger.warning(
                     f"⚠️  TensorBoard requested but unavailable: {type(e).__name__}: {e}"
@@ -1454,6 +1584,14 @@ class Trainer:
 
         wandb_mod = None
         wandb_run = None
+
+        # Get SafeOptimizations status for logging
+        _safe_opts_status = {}
+        _safe_opts_config = {}
+        if self._safe_opts is not None:
+            _safe_opts_status = self._safe_opts.get_status_summary()
+            _safe_opts_config = self._safe_opts.get_triton_config()
+
         if getattr(config, "use_wandb", False):
             try:
                 import wandb as wandb_mod  # type: ignore
@@ -1472,9 +1610,40 @@ class Trainer:
                         "dataset_name": config.dataset_name,
                         "max_lr": config.max_lr,
                         "min_lr": config.min_lr,
+                        # SafeOptimizations status
+                        "optimizations": _safe_opts_status,
+                        "triton_config": _safe_opts_config,
+                        "opt_fa3": _safe_opts_status.get("fa3", "DISABLED"),
+                        "opt_cuda_graphs": _safe_opts_status.get("cuda_graphs", "DISABLED"),
+                        "opt_blackwell_tuning": _safe_opts_status.get("blackwell_tuning", "DISABLED"),
+                        "opt_prefetch_threads": _safe_opts_status.get("prefetch_threads", "DISABLED"),
+                        "opt_fp8": _safe_opts_status.get("fp8", "DISABLED"),
                     },
                 )
                 self.logger.info("📡 W&B enabled.")
+
+                # Log pretest results as a table if available
+                if self._pretest_hook is not None:
+                    try:
+                        history = self._pretest_hook.get_history(
+                            model_size=str(config.model_size), limit=1
+                        )
+                        if history:
+                            latest = history[0]
+                            pretest_table = wandb_mod.Table(
+                                columns=["optimization", "status", "time_ms", "error"]
+                            )
+                            for r in latest.get("results", []):
+                                pretest_table.add_data(
+                                    r.get("optimization", ""),
+                                    r.get("status", ""),
+                                    r.get("time_ms", 0),
+                                    r.get("error_message", "")[:50],
+                                )
+                            wandb_run.log({"pretest_results": pretest_table})
+                            self.logger.info("📊 Logged pretest results to W&B")
+                    except Exception:
+                        pass
             except Exception as e:
                 self.logger.warning(
                     f"⚠️  W&B requested but unavailable: {type(e).__name__}: {e}"
@@ -1556,6 +1725,32 @@ class Trainer:
         
         signal.signal(signal.SIGINT, _handle_interrupt)
 
+        # Run SafeOptimizations pretests via hook (optional, can be skipped via config)
+        # The hook automatically detects config changes and caches results
+        _skip_pretest = bool(getattr(self.config, "experimental_skip_pretest", False))
+        if not _skip_pretest and self._pretest_hook is not None:
+            try:
+                # Get a sample batch for pretesting
+                sample_x, sample_y, _ = self._get_batch()
+                base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+
+                # Use on_config_changed which checks if config differs from last run
+                pretest_record = self._pretest_hook.on_config_changed(
+                    model=base_model,
+                    config=self.config,
+                    sample_batch=sample_x,
+                )
+
+                if pretest_record is not None:
+                    self.logger.info(
+                        f"SafeOptimizations pretests: {pretest_record.passed_count} passed, "
+                        f"{pretest_record.failed_count} failed"
+                    )
+                else:
+                    self.logger.info("SafeOptimizations pretests: using cached results")
+            except Exception as e:
+                self.logger.warning(f"SafeOptimizations pretest skipped: {e}")
+
         while step < max_steps:
             step_start = time.time()
             optimizer.zero_grad(set_to_none=True)
@@ -1618,7 +1813,13 @@ class Trainer:
                 except Exception:
                     pass
 
-                if self.device == "cuda" and self.config.use_compile:
+                # Mark CUDA graph step begin if CUDA graphs are enabled and SafeOptimizations allows it
+                _use_cuda_graphs = (
+                    self.device == "cuda" and
+                    self.config.use_compile and
+                    (self._safe_opts is None or self._safe_opts.should_use_cuda_graphs())
+                )
+                if _use_cuda_graphs:
                     torch.compiler.cudagraph_mark_step_begin()
                 with autocast(device, dtype=dtype):
                     loss, ce_loss, logits, aux_loss_t, ponder_loss_t, advantage_loss_t, moe_aux_loss_t = compute_microbatch_loss(
@@ -1994,6 +2195,44 @@ class Trainer:
             metrics.update(step, accum_loss, lr, grad_norm, tps, step_time)
             metrics.total_tokens += tokens_per_step
 
+            # Record step for SafeOptimizations monitoring (auto-disables failing optimizations)
+            if self._safe_opts is not None:
+                try:
+                    safe_anomalies = self._safe_opts.record_step(
+                        step=step,
+                        loss=float(accum_loss),
+                        grad_norm=float(grad_norm) if math.isfinite(grad_norm) else None,
+                        tokens_per_sec=float(tps),
+                    )
+                    # Log anomalies that triggered optimization fallbacks
+                    for anomaly in safe_anomalies:
+                        if anomaly.anomaly_type in ("loss_spike", "nan_grad", "inf_grad"):
+                            self.logger.warning(
+                                f"  [SafeOpts] {anomaly.optimization} anomaly: "
+                                f"{anomaly.anomaly_type} (value={anomaly.value:.4f})"
+                            )
+                            # Log to W&B
+                            if wandb_run is not None and wandb_mod is not None:
+                                try:
+                                    wandb_mod.log({
+                                        f"safe_opts/{anomaly.optimization}_anomaly": 1,
+                                        f"safe_opts/{anomaly.optimization}_anomaly_value": anomaly.value,
+                                    }, step=step)
+                                except Exception:
+                                    pass
+                            # Log to TensorBoard
+                            if tb_writer is not None:
+                                try:
+                                    tb_writer.add_scalar(
+                                        f"safe_opts/{anomaly.optimization}_anomaly",
+                                        anomaly.value,
+                                        step,
+                                    )
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass  # Non-fatal, don't interrupt training
+
             # EMA debug: trace loss -> EMA flow
             _ema_debug = getattr(self.config, "ema_debug", False)
             if _ema_debug and step % 25 == 0:
@@ -2289,6 +2528,17 @@ class Trainer:
 
         self.logger.info("-" * 70)
         self.logger.info("Training complete!")
+
+        # Log SafeOptimizations final status
+        if self._safe_opts is not None:
+            try:
+                status = self._safe_opts.get_status_summary()
+                anomalies = self._safe_opts.get_anomaly_summary()
+                self.logger.info(f"SafeOptimizations status: {status}")
+                if anomalies:
+                    self.logger.info(f"SafeOptimizations anomalies: {anomalies}")
+            except Exception:
+                pass
 
         if self._adaptive_lr is not None and self._adaptive_lr.swa_n > 0:
             base_model = self.model

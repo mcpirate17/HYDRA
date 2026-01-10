@@ -17,6 +17,19 @@ from .metrics import TrainingMetrics
 from .trainer import Trainer
 from .runtime import configure_runtime
 from .db import TrainingDB
+from .safe_optimizations import (
+    SafeOptimizations,
+    OptimizationConfig,
+    OptimizationStatus,
+    create_safe_optimizations_from_args,
+)
+from .pretest_hook import (
+    PretestHook,
+    PretestLogger,
+    PretestRecord,
+    PretestResult,
+    run_pretests_for_checkpoint,
+)
 
 __all__ = [
     # Config
@@ -42,4 +55,15 @@ __all__ = [
     "Trainer",
     "configure_runtime",
     "TrainingDB",
+    # Safe Optimizations
+    "SafeOptimizations",
+    "OptimizationConfig",
+    "OptimizationStatus",
+    "create_safe_optimizations_from_args",
+    # Pretest Hook
+    "PretestHook",
+    "PretestLogger",
+    "PretestRecord",
+    "PretestResult",
+    "run_pretests_for_checkpoint",
 ]

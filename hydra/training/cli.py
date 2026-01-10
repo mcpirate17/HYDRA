@@ -103,6 +103,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     _add_training_args(parser)
     _add_observability_args(parser)
     _add_moe_args(parser)
+    _add_experimental_args(parser)
     return parser
 
 
@@ -657,6 +658,123 @@ def _add_moe_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=1.0,
         help="Weight decay multiplier for MoE experts",
+    )
+
+
+def _add_experimental_args(parser: argparse.ArgumentParser) -> None:
+    """Add experimental optimization arguments.
+
+    These optimizations use SafeOptimizations wrapper with auto-fallback
+    if anomalies (loss spikes, NaN grads, throughput drops) are detected.
+    """
+    # Flash Attention 3
+    parser.add_argument(
+        "--experimental_fa3",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable Flash Attention 3 (Hopper/Blackwell). Auto-falls back to FA2 on failure.",
+    )
+
+    # CUDA Graphs
+    parser.add_argument(
+        "--experimental_cuda_graphs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable CUDA graph capture for reduced kernel launch overhead.",
+    )
+    parser.add_argument(
+        "--cuda_graphs_warmup",
+        type=int,
+        default=50,
+        help="Steps before CUDA graph capture (warmup period)",
+    )
+
+    # Blackwell-specific Triton tuning
+    parser.add_argument(
+        "--experimental_blackwell_tuning",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable Blackwell-optimized Triton kernel configs (block sizes, warps).",
+    )
+    parser.add_argument(
+        "--triton_block_q",
+        type=int,
+        default=128,
+        help="Triton query block size (Blackwell: 128, others: 64)",
+    )
+    parser.add_argument(
+        "--triton_block_kv",
+        type=int,
+        default=64,
+        help="Triton KV block size",
+    )
+    parser.add_argument(
+        "--triton_num_warps",
+        type=int,
+        default=8,
+        help="Triton warp count (Blackwell: 8, others: 4)",
+    )
+
+    # Multi-threaded prefetch
+    parser.add_argument(
+        "--experimental_prefetch_threads",
+        type=int,
+        default=4,
+        help="Number of data prefetch threads (0=disabled)",
+    )
+    parser.add_argument(
+        "--prefetch_buffer_size",
+        type=int,
+        default=8,
+        help="Number of batches to prefetch",
+    )
+
+    # FP8 (conservative default)
+    parser.add_argument(
+        "--experimental_fp8",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable FP8 compute (experimental, Hopper/Blackwell only)",
+    )
+    parser.add_argument(
+        "--fp8_format",
+        type=str,
+        default="e4m3",
+        choices=["e4m3", "e5m2"],
+        help="FP8 format: e4m3 (more precision) or e5m2 (more range)",
+    )
+
+    # Safety monitoring
+    parser.add_argument(
+        "--experimental_safety_window",
+        type=int,
+        default=100,
+        help="Steps to monitor after enabling experimental optimization",
+    )
+    parser.add_argument(
+        "--experimental_loss_spike_threshold",
+        type=float,
+        default=2.0,
+        help="Disable optimization if loss > threshold * EMA",
+    )
+    parser.add_argument(
+        "--experimental_throughput_drop_threshold",
+        type=float,
+        default=0.5,
+        help="Disable optimization if throughput < threshold * EMA",
+    )
+
+    # Pretest
+    parser.add_argument(
+        "--experimental_pretest_steps",
+        type=int,
+        default=10,
+        help="Steps to run for optimization pretest",
+    )
+    parser.add_argument(
+        "--experimental_skip_pretest",
+        action="store_true",
+        help="Skip pretests and enable all optimizations immediately (risky)",
     )
 
 
