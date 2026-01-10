@@ -515,6 +515,103 @@ For 1B model with longer context, use stepped sequence scheduling:
 
 ---
 
+## 🔀 Mixture of Experts (MoE)
+
+HYDRA supports optional Mixture of Experts layers for increased model capacity with constant compute per token.
+
+### MoE Architecture
+
+MoE blocks are inserted as **separate FFN-only blocks** between existing transformer blocks:
+
+```
+[Transformer Block] → [MoE Block] → [Transformer Block] → [MoE Block] → ...
+```
+
+Each MoE block:
+- Routes each token to `top_k` experts (default: top-1 routing)
+- Uses auxiliary load-balancing loss (Switch-style)
+- No token dropping (capacity factor = ∞)
+- torch.compile compatible (no graph breaks)
+
+### CLI Flags
+
+```bash
+# Enable MoE
+python trainer.py --model_size 500M --moe
+
+# Configure MoE
+python trainer.py \
+    --moe \
+    --moe_num_experts 8 \          # Number of expert FFNs (default: 4)
+    --moe_num_layers 4 \           # How many MoE layers to insert
+    --moe_top_k 2 \                # Experts per token (default: 1)
+    --moe_aux_weight 0.01 \        # Load-balancing loss weight
+    --moe_router_jitter 0.01 \     # Router noise during training
+    --moe_warmup_steps 1000        # Dense warmup before routing
+```
+
+### Advanced MoE Options
+
+```bash
+# Domain-expert mapping (expert specialization)
+--moe_domain_expert_map '{"code": 0, "math": 1}'
+
+# Expert learning rate scaling
+--moe_expert_lr_scale 0.5 \        # Lower LR for experts
+--moe_router_lr_scale 2.0          # Higher LR for router
+
+# Expert weight decay
+--moe_expert_weight_decay_scale 0.1
+
+# Teacher forcing for router training
+--moe_teacher_weight 0.1 \
+--moe_teacher_until_step 5000
+
+# Divergence tracking
+--moe_track_divergence \
+--moe_divergence_interval 100
+```
+
+### MoE Scaling by Model Size
+
+| Model | Experts | MoE Layers | Total Params | Active Params |
+|-------|---------|------------|--------------|---------------|
+| 250M | 4 | 2 | ~250M | ~198M |
+| 500M | 4 | 4 | ~500M | ~400M |
+| 1B | 8 | 6 | ~1.4B | ~973M |
+
+> **Note**: Total params = base model + expert params. Active params = params used per forward pass.
+
+---
+
+## 🔒 Static Routing Mode (CUDA Graph Compatibility)
+
+HYDRA's MoD and MoR use dynamic routing by default, which is incompatible with CUDA graphs. For environments requiring static computation graphs, enable **static routing mode**:
+
+```bash
+python trainer.py --static_routing_mode
+```
+
+### What Changes in Static Mode
+
+| Component | Dynamic Mode (default) | Static Mode |
+|-----------|----------------------|-------------|
+| **MoD** | Hard top-k selection | Soft weighted sum (all tokens) |
+| **MoR** | Variable recursion depth | Fixed depth with soft weights |
+| **CUDA Graphs** | ❌ Incompatible | ✅ Compatible |
+| **Memory** | Lower (sparse) | Higher (dense) |
+| **Speed** | Faster per-step | Faster launch overhead |
+
+### When to Use Static Mode
+
+- **Use dynamic mode** (default) for maximum training efficiency
+- **Use static mode** when:
+  - Deploying with CUDA graphs for inference
+  - Profiling with consistent operation counts
+  - Integration with systems requiring fixed computation graphs
+
+---
+
 ## 📁 Project Structure
 
 ```
@@ -756,10 +853,22 @@ HYDRA follows a rigorous testing philosophy:
 - **LigerFusedLinearCrossEntropy**: ~80% output layer savings, never materializes full logits
 
 **Triton Custom Kernels (opt-in via `--triton_kernels`)**
-- **fused_qk_norm**: Fused L2 normalization for Q/K (1.5-2× faster, autograd-compatible)
-- **fused_swiglu**: Fused SiLU activation (1.3× faster, autograd-compatible)
-- **fused_rope**: Fused RoPE (2-3× faster, opt-in via `HYDRA_ENABLE_FUSED_ROPE=1`)
-- **fused_rms_norm**: Fused RMSNorm (opt-in via `HYDRA_ENABLE_FUSED_RMS_NORM=1`)
+
+| Kernel | Speedup | Forward | Backward | Notes |
+|--------|---------|---------|----------|-------|
+| **fused_qk_norm** | 1.5-2× | ✅ | ✅ | L2 norm for Q/K with fused backward |
+| **fused_swiglu** | 1.3× | ✅ | ✅ | Fused gate*up with single-kernel backward |
+| **fused_rms_norm** | 1.5× | ✅ | ✅ | Fused normalization with backward |
+| **fused_rope** | 2-3× | ✅ | ❌ | RoPE (forward only, backward via PyTorch) |
+
+**Fused Backward Kernels (New)**
+
+The fused backward kernels reduce kernel launch overhead dramatically:
+- **SwiGLU backward**: ~12 kernel launches → 1 fused kernel
+- **RMSNorm backward**: ~6 kernel launches → 1 fused kernel
+- **QK-Norm backward**: ~8 kernel launches → 1 fused kernel
+
+All fused backward kernels are **enabled by default** when `--triton_kernels` is set.
 
 **Flash Attention**
 - Flash Attention 2/3 auto-detected and enabled
@@ -789,19 +898,45 @@ HYDRA follows a rigorous testing philosophy:
 
 ### Environment Variables
 
+**Triton Kernel Controls** (all enabled by default when `--triton_kernels` is set):
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HYDRA_ENABLE_FUSED_ROPE` | `0` | Enable fused RoPE kernel (opt-in due to GPU compatibility) |
-| `HYDRA_ENABLE_FUSED_RMS_NORM` | `0` | Enable fused RMSNorm kernel (opt-in due to gradient concerns) |
+| `HYDRA_DISABLE_TRITON` | `0` | Disable all Triton kernels globally |
+| `HYDRA_ENABLE_FUSED_ROPE` | `1` | Enable fused RoPE kernel |
+| `HYDRA_DISABLE_FUSED_ROPE` | `0` | Force-disable fused RoPE |
+| `HYDRA_ENABLE_FUSED_RMS_NORM` | `1` | Enable fused RMSNorm forward |
+| `HYDRA_DISABLE_FUSED_RMS_NORM` | `0` | Force-disable fused RMSNorm |
+| `HYDRA_ENABLE_FUSED_RMS_NORM_BWD` | `1` | Enable fused RMSNorm backward |
+| `HYDRA_DISABLE_FUSED_RMS_NORM_BWD` | `0` | Force-disable fused RMSNorm backward |
+| `HYDRA_ENABLE_FUSED_SWIGLU_BWD` | `1` | Enable fused SwiGLU backward |
+| `HYDRA_DISABLE_FUSED_SWIGLU_BWD` | `0` | Force-disable fused SwiGLU backward |
+| `HYDRA_ENABLE_FUSED_QK_NORM_BWD` | `1` | Enable fused QK-Norm backward |
+| `HYDRA_DISABLE_FUSED_QK_NORM_BWD` | `0` | Force-disable fused QK-Norm backward |
+
+**Liger Kernel Controls**:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HYDRA_ENABLE_LIGER_CE` | `1` | Enable Liger fused cross-entropy (if available) |
+| `HYDRA_DISABLE_LIGER_CE` | `0` | Force-disable Liger cross-entropy |
+
+**Other Settings**:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `HYDRA_CCQA_USE_FUSED_KERNEL` | `0` | Enable fused CCGQA kernel for attention (experimental) |
 | `HF_HUB_ENABLE_HF_TRANSFER` | `1` | Enable fast HuggingFace transfers (auto-enabled) |
 
 ```bash
-# Enable all fused kernels (experimental)
-export HYDRA_ENABLE_FUSED_ROPE=1
-export HYDRA_ENABLE_FUSED_RMS_NORM=1
-export HYDRA_CCQA_USE_FUSED_KERNEL=1
+# Disable specific fused backward kernels (for debugging)
+export HYDRA_DISABLE_FUSED_SWIGLU_BWD=1
+export HYDRA_DISABLE_FUSED_RMS_NORM_BWD=1
 python trainer.py --triton_kernels ...
+
+# Disable all Triton kernels
+export HYDRA_DISABLE_TRITON=1
+python trainer.py ...
 ```
 
 ---

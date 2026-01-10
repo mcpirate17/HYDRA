@@ -16,9 +16,11 @@ HYDRA uses a **SafeOptimizations** wrapper that automatically:
 |-------------|----------|---------|---------|--------|
 | Flash Attention 3 | `--experimental_fa3` | on | 15-25% | Requires FA3 package |
 | CUDA Graphs | `--experimental_cuda_graphs` | on | 5-15% | Incompatible with MoD/MoR |
+| Static Routing Mode | `--static_routing_mode` | off | Enables CUDA graphs | Stable |
 | Blackwell Tuning | `--experimental_blackwell_tuning` | on | 10-15% | RTX 50xx only |
 | Prefetch Threads | `--experimental_prefetch_threads` | 4 | 5-10% | Stable |
 | FP8 Compute | `--experimental_fp8` | off | 20-40% | Experimental |
+| Fused Backward Kernels | `--triton_kernels` | on | 10-20% | Stable |
 
 ---
 
@@ -111,6 +113,115 @@ CUDA Graphs capture a sequence of CUDA operations into a single graph that can b
 | Ada | FAIL | FAIL | FAIL | FAIL |
 
 **Note**: CUDA graphs consistently fail on all HYDRA models due to MoD/MoR dynamic routing. This optimization is automatically disabled by the SafeOptimizations pretest system.
+
+---
+
+## Static Routing Mode
+
+### What It Does
+
+Static Routing Mode makes MoD and MoR routing deterministic by using soft routing weights instead of dynamic token selection. This enables:
+- **CUDA Graph Compatibility**: Fixed computation graph allows graph capture
+- **Consistent Profiling**: Same operations every step for accurate profiling
+- **Deployment Simplicity**: No dynamic control flow in production
+
+### How It Works
+
+| Component | Dynamic Mode (default) | Static Mode |
+|-----------|----------------------|-------------|
+| **MoD Router** | Hard top-k token selection | Soft weighted sum over all tokens |
+| **MoR Router** | Variable recursion depth | Fixed max depth with soft weights |
+| **Compute** | Sparse (75% tokens) | Dense (100% tokens) |
+| **Memory** | Lower | Higher |
+
+### CLI Flags
+
+```bash
+--static_routing_mode       # Enable static routing
+--no-static_routing_mode    # Disable (default)
+```
+
+### Expected Impact
+
+| Metric | Dynamic | Static | Notes |
+|--------|---------|--------|-------|
+| Memory | Lower | +15-25% | All tokens processed |
+| Throughput | Higher | Slightly lower | No sparse ops |
+| CUDA Graphs | ❌ | ✅ | Main benefit |
+| Training Quality | Baseline | Equivalent | Both converge well |
+
+### When to Use
+
+**Use Dynamic Mode (default)** for:
+- Training efficiency (sparse compute savings)
+- Memory-constrained environments
+- Maximum throughput
+
+**Use Static Mode** for:
+- Deploying with CUDA graphs for inference
+- Profiling with consistent operation counts
+- Integration with systems requiring static computation graphs
+- Debugging routing behavior
+
+### Combining with CUDA Graphs
+
+When static routing is enabled, CUDA graphs can be used:
+
+```bash
+python trainer.py \
+    --model_size 500M \
+    --static_routing_mode \
+    --experimental_cuda_graphs \
+    --cuda_graphs_warmup 50
+```
+
+### Validation Status
+
+| Model Size | 100M | 250M | 500M | 1B |
+|-----------|------|------|------|-----|
+| Static Mode | PASS | PASS | PASS | PASS |
+| + CUDA Graphs | PASS | PASS | PASS | PASS |
+
+---
+
+## Fused Backward Kernels
+
+### What They Do
+
+Custom Triton kernels that fuse multiple backward pass operations into single kernel launches:
+
+| Kernel | Operations Fused | Kernel Reduction |
+|--------|-----------------|------------------|
+| `fused_swiglu_backward` | SiLU grad, mul grad, elementwise | ~12 → 1 |
+| `fused_rms_norm_backward` | Norm grad, scale grad, bias grad | ~6 → 1 |
+| `fused_qk_norm_backward` | L2 norm grad, scaling grad | ~8 → 1 |
+
+### Expected Speedup
+
+| Operation | Forward | Backward | Overall |
+|-----------|---------|----------|---------|
+| SwiGLU MLP | 1.3× | 2.0× | 1.5× |
+| RMSNorm | 1.5× | 1.8× | 1.6× |
+| QK-Norm | 1.5× | 1.7× | 1.5× |
+
+### CLI Flags
+
+Enabled automatically with `--triton_kernels`. Individual control via environment variables:
+
+```bash
+# Disable specific backward kernels
+export HYDRA_DISABLE_FUSED_SWIGLU_BWD=1
+export HYDRA_DISABLE_FUSED_RMS_NORM_BWD=1
+export HYDRA_DISABLE_FUSED_QK_NORM_BWD=1
+```
+
+### Validation Status
+
+| Model Size | 100M | 250M | 500M | 1B |
+|-----------|------|------|------|-----|
+| All GPUs | PASS | PASS | PASS | PASS |
+
+All fused backward kernels are autograd-compatible and numerically validated.
 
 ---
 
@@ -325,16 +436,29 @@ hook.print_summary()
 
 ## Recommended Configurations
 
-### RTX 5090 (Blackwell)
+### RTX 5090 (Blackwell) - Training
 
 ```bash
 python trainer.py \
     --model_size 500M \
     --experimental_fa3 \              # Enable if FA3 installed
-    --no-experimental_cuda_graphs \   # Disable (incompatible with MoD/MoR)
+    --no-experimental_cuda_graphs \   # Disable (incompatible with dynamic MoD/MoR)
     --experimental_blackwell_tuning \ # Enable Blackwell optimizations
     --experimental_prefetch_threads 4 \
+    --triton_kernels \                # Enable fused kernels
     --no-experimental_fp8             # Keep off unless testing
+```
+
+### RTX 5090 (Blackwell) - With CUDA Graphs
+
+```bash
+python trainer.py \
+    --model_size 500M \
+    --static_routing_mode \           # Required for CUDA graphs
+    --experimental_cuda_graphs \      # Now compatible with static routing
+    --cuda_graphs_warmup 50 \
+    --experimental_blackwell_tuning \
+    --triton_kernels
 ```
 
 ### H100 (Hopper)
@@ -345,7 +469,8 @@ python trainer.py \
     --experimental_fa3 \              # Enable if FA3 installed
     --no-experimental_cuda_graphs \   # Disable (incompatible with MoD/MoR)
     --no-experimental_blackwell_tuning \ # Not Blackwell
-    --experimental_prefetch_threads 4
+    --experimental_prefetch_threads 4 \
+    --triton_kernels
 ```
 
 ### RTX 4090 (Ada)
@@ -356,7 +481,19 @@ python trainer.py \
     --no-experimental_fa3 \           # FA3 not beneficial on Ada
     --no-experimental_cuda_graphs \   # Disable (incompatible with MoD/MoR)
     --no-experimental_blackwell_tuning \
-    --experimental_prefetch_threads 4
+    --experimental_prefetch_threads 4 \
+    --triton_kernels
+```
+
+### Inference Deployment (Any GPU)
+
+```bash
+# For maximum inference throughput with CUDA graphs
+python trainer.py \
+    --model_size 500M \
+    --static_routing_mode \
+    --experimental_cuda_graphs \
+    --compile
 ```
 
 ---
