@@ -39,7 +39,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from hydra.layers import RMSNorm, SwiGLUMLP
+from ..layers import RMSNorm, SwiGLUMLP
 from .mixture_of_experts import MoEConfig, MoERouter, MoEDispatcher
 
 __all__ = [

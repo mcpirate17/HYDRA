@@ -1,9 +1,28 @@
+"""HYDRA attention module factory.
+
+Provides a single entry point for instantiating attention backends.
+Currently only CCGQA is supported.
+"""
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, TypedDict
 
 import torch.nn as nn
+
+
+class CCGQAKwargs(TypedDict, total=False):
+    """Optional keyword arguments for CCGQAAttention.
+
+    All fields are optional (total=False).
+    """
+    use_rope: bool
+    use_qk_norm: bool
+    use_convs: bool
+    use_qk_mean: bool
+    use_value_shift: bool
+    conv_kernel_size: int
+    use_fused_kernel: bool
 
 
 def build_hybrid_attention_module(
@@ -14,11 +33,24 @@ def build_hybrid_attention_module(
     n_kv_heads: int,
     max_seq_len: int,
     compression_factor: int,
-    attention_kwargs: dict[str, Any],
+    attention_kwargs: dict[str, Any] | CCGQAKwargs,
 ) -> nn.Module:
     """Instantiate CCGQA attention module.
 
-    Only CCGQA is supported. LA3 was removed due to gradient spike issues.
+    Args:
+        requested: Backend name ("ccgqa" or "ccqa")
+        dim: Model hidden dimension
+        n_heads: Number of attention heads
+        n_kv_heads: Number of key-value heads (for GQA)
+        max_seq_len: Maximum sequence length
+        compression_factor: Compression ratio for CCGQA
+        attention_kwargs: Backend-specific arguments (see CCGQAKwargs)
+
+    Returns:
+        Initialized CCGQAAttention module
+
+    Raises:
+        ValueError: If requested backend is not supported
     """
     # Normalize requested backend name
     req = str(requested).strip().lower()
@@ -27,7 +59,7 @@ def build_hybrid_attention_module(
             f"Unknown attention backend '{requested}'. Only 'ccgqa' is supported."
         )
 
-    from hydra.attention.backends.ccgqa.attention import CCGQAAttention
+    from .backends.ccgqa.attention import CCGQAAttention
 
     # Only forward kwargs recognized by CCGQAAttention
     allowed_ccqa_keys = {

@@ -75,23 +75,23 @@ _log = logging.getLogger(__name__)
 # MoD: gather/scatter compute-skipping for token selection
 # MoR: Mixture-of-Recursions for adaptive depth per token
 # =============================================================================
-from hydra.routing.mixture_of_depths import MoDRouter
-from hydra.routing.mixture_of_recursions import (
+from ...routing.mixture_of_depths import MoDRouter
+from ...routing.mixture_of_recursions import (
     MoRConfig,
     MoRRouter,
     MoRExecutor,
     dim_to_depth_scale,
 )
-from hydra.routing.loss_tracker import MovingAverageBaseline
+from ...routing.loss_tracker import MovingAverageBaseline
 
 # =============================================================================
 # Optional attention variants (hybrid backends).
 # =============================================================================
-from hydra.attention.backends.ccgqa.attention import CCGQAAttention
-from hydra.attention.factory import build_hybrid_attention_module
+from ...attention.backends.ccgqa.attention import CCGQAAttention
+from ...attention.factory import build_hybrid_attention_module
 
 # Import shared layers from hydra.layers (canonical implementations)
-from hydra.layers import RMSNorm, SwiGLUMLPFused as SwiGLUMLP
+from ...layers import RMSNorm, SwiGLUMLPFused as SwiGLUMLP
 
 # Validate MoDRouter import at module load time
 assert hasattr(MoDRouter, 'forward'), "MoDRouter must have forward method"

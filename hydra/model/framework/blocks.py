@@ -17,12 +17,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from hydra.attention.backends.ccgqa.attention import CCGQAAttention
-from hydra.attention.factory import build_hybrid_attention_module
-from hydra.layers import RMSNorm, SwiGLUMLPFused as SwiGLUMLP
-from hydra.routing.loss_tracker import MovingAverageBaseline
-from hydra.routing.mixture_of_depths import MoDRouter
-from hydra.routing.mixture_of_recursions import (
+from ...attention.backends.ccgqa.attention import CCGQAAttention
+from ...attention.factory import build_hybrid_attention_module
+from ...layers import RMSNorm, SwiGLUMLPFused as SwiGLUMLP
+from ...routing.loss_tracker import MovingAverageBaseline
+from ...routing.mixture_of_depths import MoDRouter
+from ...routing.mixture_of_recursions import (
     MoRConfig,
     MoRExecutor,
     MoRRouter,
