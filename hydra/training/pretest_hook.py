@@ -392,13 +392,25 @@ class PretestHook:
                 continue
 
             if state.status != OptimizationStatus.PRETESTING:
-                results.append(PretestResult(
-                    optimization=name,
-                    status="skipped",
-                    time_ms=0.0,
-                    error_message=state.disable_reason or "Not enabled",
-                ))
-                skipped += 1
+                # Handle already-enabled optimizations (no pretest needed)
+                if state.status == OptimizationStatus.ENABLED:
+                    results.append(PretestResult(
+                        optimization=name,
+                        status="passed",
+                        time_ms=0.0,
+                        error_message="No pretest needed",
+                    ))
+                    passed += 1
+                    if self.verbose:
+                        self.logger.info(f"  [{name}] ✓ ENABLED (no pretest needed)")
+                else:
+                    results.append(PretestResult(
+                        optimization=name,
+                        status="skipped",
+                        time_ms=0.0,
+                        error_message=state.disable_reason or "Not enabled",
+                    ))
+                    skipped += 1
                 continue
 
             if self.verbose:

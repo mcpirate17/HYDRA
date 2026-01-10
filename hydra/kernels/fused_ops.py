@@ -77,27 +77,49 @@ _disable_fused_rope = os.environ.get("HYDRA_DISABLE_FUSED_ROPE", "0") == "1"
 USE_FUSED_ROPE = USE_TRITON_KERNELS and _enable_fused_rope and not _disable_fused_rope
 USE_FUSED_QK_NORM = USE_TRITON_KERNELS  # Now autograd-compatible!
 USE_FUSED_SWIGLU = USE_TRITON_KERNELS  # Now autograd-compatible!
+# Fused backward for SwiGLU - major performance win (reduces ~12 kernel launches to 1)
+_enable_fused_swiglu_bwd = os.environ.get("HYDRA_ENABLE_FUSED_SWIGLU_BWD", "1") == "1"
+_disable_fused_swiglu_bwd = os.environ.get("HYDRA_DISABLE_FUSED_SWIGLU_BWD", "0") == "1"
+USE_FUSED_SWIGLU_BACKWARD = USE_TRITON_KERNELS and _enable_fused_swiglu_bwd and not _disable_fused_swiglu_bwd
 _enable_fused_rms_norm = os.environ.get("HYDRA_ENABLE_FUSED_RMS_NORM", "1") == "1"
 _disable_fused_rms_norm = os.environ.get("HYDRA_DISABLE_FUSED_RMS_NORM", "0") == "1"
 USE_FUSED_RMS_NORM = USE_TRITON_KERNELS and _enable_fused_rms_norm and not _disable_fused_rms_norm
+# Fused backward for RMSNorm - fuses grad_x computation into single kernel
+_enable_fused_rms_norm_bwd = os.environ.get("HYDRA_ENABLE_FUSED_RMS_NORM_BWD", "1") == "1"
+_disable_fused_rms_norm_bwd = os.environ.get("HYDRA_DISABLE_FUSED_RMS_NORM_BWD", "0") == "1"
+USE_FUSED_RMS_NORM_BACKWARD = USE_TRITON_KERNELS and _enable_fused_rms_norm_bwd and not _disable_fused_rms_norm_bwd
+# Fused backward for QK-Norm - fuses L2 norm gradient computation
+_enable_fused_qk_norm_bwd = os.environ.get("HYDRA_ENABLE_FUSED_QK_NORM_BWD", "1") == "1"
+_disable_fused_qk_norm_bwd = os.environ.get("HYDRA_DISABLE_FUSED_QK_NORM_BWD", "0") == "1"
+USE_FUSED_QK_NORM_BACKWARD = USE_TRITON_KERNELS and _enable_fused_qk_norm_bwd and not _disable_fused_qk_norm_bwd
 
 
 def set_use_triton_kernels(enabled: bool):
     """Enable or disable Triton kernels globally."""
-    global USE_TRITON_KERNELS, USE_FUSED_ROPE, USE_FUSED_QK_NORM, USE_FUSED_SWIGLU, USE_FUSED_RMS_NORM
-    
+    global USE_TRITON_KERNELS, USE_FUSED_ROPE, USE_FUSED_QK_NORM, USE_FUSED_SWIGLU
+    global USE_FUSED_SWIGLU_BACKWARD, USE_FUSED_RMS_NORM, USE_FUSED_RMS_NORM_BACKWARD, USE_FUSED_QK_NORM_BACKWARD
+
     if enabled and not TRITON_AVAILABLE:
         raise RuntimeError("Triton is not available. Install with: pip install triton")
-    
+
     USE_TRITON_KERNELS = enabled
     _enable_fused_rope = os.environ.get("HYDRA_ENABLE_FUSED_ROPE", "1") == "1"
     _disable_fused_rope = os.environ.get("HYDRA_DISABLE_FUSED_ROPE", "0") == "1"
     USE_FUSED_ROPE = enabled and _enable_fused_rope and not _disable_fused_rope
     USE_FUSED_QK_NORM = enabled
     USE_FUSED_SWIGLU = enabled
+    _enable_fused_swiglu_bwd = os.environ.get("HYDRA_ENABLE_FUSED_SWIGLU_BWD", "1") == "1"
+    _disable_fused_swiglu_bwd = os.environ.get("HYDRA_DISABLE_FUSED_SWIGLU_BWD", "0") == "1"
+    USE_FUSED_SWIGLU_BACKWARD = enabled and _enable_fused_swiglu_bwd and not _disable_fused_swiglu_bwd
     _enable_fused_rms_norm = os.environ.get("HYDRA_ENABLE_FUSED_RMS_NORM", "1") == "1"
     _disable_fused_rms_norm = os.environ.get("HYDRA_DISABLE_FUSED_RMS_NORM", "0") == "1"
     USE_FUSED_RMS_NORM = enabled and _enable_fused_rms_norm and not _disable_fused_rms_norm
+    _enable_fused_rms_norm_bwd = os.environ.get("HYDRA_ENABLE_FUSED_RMS_NORM_BWD", "1") == "1"
+    _disable_fused_rms_norm_bwd = os.environ.get("HYDRA_DISABLE_FUSED_RMS_NORM_BWD", "0") == "1"
+    USE_FUSED_RMS_NORM_BACKWARD = enabled and _enable_fused_rms_norm_bwd and not _disable_fused_rms_norm_bwd
+    _enable_fused_qk_norm_bwd = os.environ.get("HYDRA_ENABLE_FUSED_QK_NORM_BWD", "1") == "1"
+    _disable_fused_qk_norm_bwd = os.environ.get("HYDRA_DISABLE_FUSED_QK_NORM_BWD", "0") == "1"
+    USE_FUSED_QK_NORM_BACKWARD = enabled and _enable_fused_qk_norm_bwd and not _disable_fused_qk_norm_bwd
 
 
 def get_kernel_status() -> dict:
@@ -108,8 +130,11 @@ def get_kernel_status() -> dict:
         "use_triton_kernels": USE_TRITON_KERNELS,
         "fused_rope": USE_FUSED_ROPE,
         "fused_qk_norm": USE_FUSED_QK_NORM,
+        "fused_qk_norm_backward": USE_FUSED_QK_NORM_BACKWARD,
         "fused_swiglu": USE_FUSED_SWIGLU,
+        "fused_swiglu_backward": USE_FUSED_SWIGLU_BACKWARD,
         "fused_rms_norm": USE_FUSED_RMS_NORM,
+        "fused_rms_norm_backward": USE_FUSED_RMS_NORM_BACKWARD,
     }
 
 
@@ -316,6 +341,108 @@ if TRITON_AVAILABLE:
             tl.store(out_ptr + base + offs, out, mask=mask)
 
 
+    # -------------------------------------------------------------------------
+    # Fused QK-Norm Backward Kernel
+    # -------------------------------------------------------------------------
+    # L2 normalization backward for a single vector.
+    # Forward: out = x / ||x|| * scale
+    # Backward: grad_x = scale / ||x|| * (grad_out - x_normalized * dot(x_normalized, grad_out))
+    #
+    # This kernel processes Q and K together (like forward) for efficiency.
+    # -------------------------------------------------------------------------
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_SIZE": 32}, num_warps=2, num_stages=1),
+            triton.Config({"BLOCK_SIZE": 64}, num_warps=4, num_stages=1),
+        ],
+        key=["head_dim"],
+    )
+    @triton.jit
+    def _fused_qk_norm_backward_kernel(
+        # Inputs (original values from forward)
+        q_ptr,
+        k_ptr,
+        # Upstream gradients
+        grad_q_out_ptr,
+        grad_k_out_ptr,
+        # Outputs
+        grad_q_ptr,
+        grad_k_ptr,
+        # Params
+        scale,
+        temperature,
+        head_dim: tl.constexpr,
+        n_q_elements,
+        n_k_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Fused L2 norm backward for Q and K.
+
+        For each vector x:
+            norm = ||x||
+            x_normalized = x / norm
+            grad_x = scale / norm * (grad_out - x_normalized * dot(x_normalized, grad_out))
+
+        All math in FP32 for stability, with gradient clamping.
+        """
+        pid = tl.program_id(0)
+
+        # Determine if we're processing Q or K
+        is_k = pid >= n_q_elements
+        actual_pid = pid - n_q_elements if is_k else pid
+
+        if is_k and actual_pid >= n_k_elements:
+            return
+
+        # Select pointers
+        in_ptr = k_ptr if is_k else q_ptr
+        grad_out_ptr = grad_k_out_ptr if is_k else grad_q_out_ptr
+        out_ptr = grad_k_ptr if is_k else grad_q_ptr
+        base = actual_pid * head_dim
+
+        # Effective scale (K includes temperature)
+        eff_scale = scale * temperature if is_k else scale
+
+        # Pass 1: Compute ||x||^2
+        sq_sum = tl.zeros([1], dtype=tl.float32)
+        for d in range(0, head_dim, BLOCK_SIZE):
+            offs = d + tl.arange(0, BLOCK_SIZE)
+            mask = offs < head_dim
+            x = tl.load(in_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+            sq_sum += tl.sum(x * x)
+
+        # norm = ||x||, clamped to avoid division by zero
+        norm = tl.sqrt(sq_sum)
+        norm = tl.maximum(norm, 1e-6)
+        norm_inv = 1.0 / norm
+
+        # Pass 2: Compute dot(x_normalized, grad_out)
+        dot_sum = tl.zeros([1], dtype=tl.float32)
+        for d in range(0, head_dim, BLOCK_SIZE):
+            offs = d + tl.arange(0, BLOCK_SIZE)
+            mask = offs < head_dim
+            x = tl.load(in_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+            grad_out = tl.load(grad_out_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+            x_normalized = x * norm_inv
+            dot_sum += tl.sum(x_normalized * grad_out)
+
+        # Pass 3: Compute gradient
+        # grad_x = scale / norm * (grad_out - x_normalized * dot)
+        for d in range(0, head_dim, BLOCK_SIZE):
+            offs = d + tl.arange(0, BLOCK_SIZE)
+            mask = offs < head_dim
+            x = tl.load(in_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+            grad_out = tl.load(grad_out_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+
+            x_normalized = x * norm_inv
+            grad_x = eff_scale * norm_inv * (grad_out - x_normalized * dot_sum)
+
+            # Clamp gradient
+            grad_x = tl.maximum(tl.minimum(grad_x, 100.0), -100.0)
+
+            tl.store(out_ptr + base + offs, grad_x, mask=mask)
+
+
 def fused_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -379,46 +506,17 @@ class FusedQKNormFunction(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, grad_q_out: torch.Tensor, grad_k_out: torch.Tensor):
-        """Backward pass for L2 normalization.
-        
-        Forward: out = x / ||x|| * scale
-        
-        Backward: d_out/d_x = scale * (I - x*x^T / ||x||^2) / ||x||
-                            = scale / ||x|| * (grad - x * (x dot grad) / ||x||^2)
-        
-        Note: We compute in float32 for numerical stability, then cast back.
-        """
+        """Backward pass - uses fused Triton kernel when available."""
         q, k = ctx.saved_tensors
         scale = ctx.scale
         temperature = ctx.temperature
-        
-        # Q gradient (float32 for stability)
-        q_f32 = q.float()
-        grad_q_f32 = grad_q_out.float()
-        q_norm_sq = (q_f32 * q_f32).sum(dim=-1, keepdim=True)
-        q_norm = q_norm_sq.sqrt().clamp(min=1e-6)  # Clamp to avoid division by zero
-        q_normalized = q_f32 / q_norm
-        
-        # Gradient: scale * (grad - normalized * dot(normalized, grad)) / norm
-        q_dot_grad = (q_normalized * grad_q_f32).sum(dim=-1, keepdim=True)
-        grad_q = scale * (grad_q_f32 - q_normalized * q_dot_grad) / q_norm
-        # Clamp gradient magnitude to prevent explosions
-        grad_q = grad_q.clamp(-100.0, 100.0)
-        grad_q = grad_q.to(q.dtype)
-        
-        # K gradient (includes temperature, float32 for stability)
-        k_f32 = k.float()
-        grad_k_f32 = grad_k_out.float()
-        k_norm_sq = (k_f32 * k_f32).sum(dim=-1, keepdim=True)
-        k_norm = k_norm_sq.sqrt().clamp(min=1e-6)
-        k_normalized = k_f32 / k_norm
-        
-        k_dot_grad = (k_normalized * grad_k_f32).sum(dim=-1, keepdim=True)
-        grad_k = scale * temperature * (grad_k_f32 - k_normalized * k_dot_grad) / k_norm
-        grad_k = grad_k.clamp(-100.0, 100.0)
-        grad_k = grad_k.to(k.dtype)
-        
-        return grad_q, grad_k, None, None
+
+        # Use fused Triton backward when available
+        if USE_FUSED_QK_NORM_BACKWARD and TRITON_AVAILABLE and q.is_cuda:
+            return _fused_qk_norm_backward_triton(q, k, grad_q_out, grad_k_out, scale, temperature)
+
+        # Fallback to PyTorch
+        return _qk_norm_backward_pytorch(q, k, grad_q_out, grad_k_out, scale, temperature)
 
 
 @compiler_disable
@@ -470,6 +568,96 @@ def _qk_norm_pytorch(
     return q_norm, k_norm
 
 
+@compiler_disable
+def _fused_qk_norm_backward_triton(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    grad_q_out: torch.Tensor,
+    grad_k_out: torch.Tensor,
+    scale: float,
+    temperature: float,
+) -> Tuple[torch.Tensor, torch.Tensor, None, None]:
+    """Triton fused backward pass for QK normalization.
+
+    Computes gradients for L2 normalization:
+        grad_q = scale / ||q|| * (grad_q_out - q_norm * dot(q_norm, grad_q_out))
+        grad_k = scale * temp / ||k|| * (grad_k_out - k_norm * dot(k_norm, grad_k_out))
+
+    Returns (grad_q, grad_k, None, None) to match forward signature.
+    """
+    B_q, H_q, S_q, D = q.shape
+    B_k, H_k, S_k, _ = k.shape
+
+    # Ensure contiguous
+    q = q.contiguous()
+    k = k.contiguous()
+    grad_q_out = grad_q_out.contiguous()
+    grad_k_out = grad_k_out.contiguous()
+
+    # Allocate outputs
+    grad_q = torch.empty_like(q)
+    grad_k = torch.empty_like(k)
+
+    n_q_elements = B_q * H_q * S_q
+    n_k_elements = B_k * H_k * S_k
+
+    # Process Q and K in single kernel launch
+    grid = (n_q_elements + n_k_elements,)
+
+    _fused_qk_norm_backward_kernel[grid](
+        q.view(-1),
+        k.view(-1),
+        grad_q_out.view(-1),
+        grad_k_out.view(-1),
+        grad_q.view(-1),
+        grad_k.view(-1),
+        scale,
+        temperature,
+        D,
+        n_q_elements,
+        n_k_elements,
+    )
+
+    return grad_q, grad_k, None, None
+
+
+def _qk_norm_backward_pytorch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    grad_q_out: torch.Tensor,
+    grad_k_out: torch.Tensor,
+    scale: float,
+    temperature: float,
+) -> Tuple[torch.Tensor, torch.Tensor, None, None]:
+    """PyTorch reference backward for QK normalization (float32 for stability).
+
+    L2 norm backward:
+        grad_x = scale / ||x|| * (grad_out - x_norm * dot(x_norm, grad_out))
+    """
+    # Compute in float32 for stability
+    q_f32 = q.float()
+    k_f32 = k.float()
+    grad_q_out_f32 = grad_q_out.float()
+    grad_k_out_f32 = grad_k_out.float()
+
+    # Q gradient
+    q_norm_val = torch.norm(q_f32, p=2, dim=-1, keepdim=True).clamp(min=1e-6)
+    q_normalized = q_f32 / q_norm_val
+    q_dot = (q_normalized * grad_q_out_f32).sum(dim=-1, keepdim=True)
+    grad_q = scale / q_norm_val * (grad_q_out_f32 - q_normalized * q_dot)
+    grad_q = grad_q.clamp(-100.0, 100.0).to(q.dtype)
+
+    # K gradient
+    k_norm_val = torch.norm(k_f32, p=2, dim=-1, keepdim=True).clamp(min=1e-6)
+    k_normalized = k_f32 / k_norm_val
+    k_dot = (k_normalized * grad_k_out_f32).sum(dim=-1, keepdim=True)
+    eff_scale_k = scale * temperature
+    grad_k = eff_scale_k / k_norm_val * (grad_k_out_f32 - k_normalized * k_dot)
+    grad_k = grad_k.clamp(-100.0, 100.0).to(k.dtype)
+
+    return grad_q, grad_k, None, None
+
+
 # =============================================================================
 # 3. Fused SwiGLU Kernel
 # =============================================================================
@@ -507,6 +695,86 @@ if TRITON_AVAILABLE:
         out = silu_gate * up
         
         tl.store(out_ptr + offs, out, mask=mask)
+
+
+    # -------------------------------------------------------------------------
+    # Fused SwiGLU Backward Kernel
+    # -------------------------------------------------------------------------
+    # This kernel fuses the entire backward pass into a single launch:
+    # - 3 loads (gate, up, grad_out) vs. many intermediate tensors
+    # - 2 stores (grad_gate, grad_up) vs. ~12 kernel launches in PyTorch
+    # - All intermediate computations happen in registers
+    #
+    # Memory traffic reduction: ~6x fewer bytes transferred
+    # Kernel launch reduction: ~12x fewer launches
+    # -------------------------------------------------------------------------
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_SIZE": 512}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_SIZE": 1024}, num_warps=8, num_stages=1),
+        ],
+        key=["n_elements"],
+    )
+    @triton.jit
+    def _fused_swiglu_backward_kernel(
+        # Inputs (from forward)
+        gate_ptr,
+        up_ptr,
+        # Gradient from upstream
+        grad_out_ptr,
+        # Outputs
+        grad_gate_ptr,
+        grad_up_ptr,
+        # Size
+        n_elements,
+        # Constexpr
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Fused SwiGLU backward pass.
+
+        Forward: out = silu(gate) * up = gate * sigmoid(gate) * up
+
+        Backward:
+            d_out/d_gate = up * d(silu)/d(gate)
+                         = up * sigmoid(gate) * (1 + gate * (1 - sigmoid(gate)))
+            d_out/d_up   = silu(gate) = gate * sigmoid(gate)
+
+        All computation in FP32 for numerical stability, outputs cast to input dtype.
+        Gradients are clamped to [-100, 100] to prevent explosions.
+        """
+        pid = tl.program_id(0)
+        offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offs < n_elements
+
+        # Load all inputs - cast to FP32 for stability
+        # Memory: 3 loads total (vs. many intermediate tensor allocations in PyTorch)
+        gate = tl.load(gate_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(up_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        grad_out = tl.load(grad_out_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+
+        # Compute sigmoid once, reuse for both silu and dsilu
+        sigmoid_gate = tl.sigmoid(gate)
+
+        # silu(gate) = gate * sigmoid(gate)
+        silu_gate = gate * sigmoid_gate
+
+        # d(silu)/d(gate) = sigmoid(gate) * (1 + gate * (1 - sigmoid(gate)))
+        # Numerically stable form: sigmoid * (1 + gate - gate * sigmoid)
+        one_minus_sigmoid = 1.0 - sigmoid_gate
+        dsilu = sigmoid_gate * (1.0 + gate * one_minus_sigmoid)
+
+        # Compute gradients in registers
+        grad_gate = grad_out * up * dsilu
+        grad_up = grad_out * silu_gate
+
+        # Clamp to prevent gradient explosions (matches PyTorch impl)
+        grad_gate = tl.maximum(tl.minimum(grad_gate, 100.0), -100.0)
+        grad_up = tl.maximum(tl.minimum(grad_up, 100.0), -100.0)
+
+        # Store outputs - 2 stores total
+        tl.store(grad_gate_ptr + offs, grad_gate, mask=mask)
+        tl.store(grad_up_ptr + offs, grad_up, mask=mask)
 
 
 def fused_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
@@ -548,37 +816,22 @@ class FusedSwiGLUFunction(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        """Backward pass computed in PyTorch (float32 for stability).
-        
+        """Backward pass - uses fused Triton kernel when available.
+
         Forward: out = silu(gate) * up = gate * sigmoid(gate) * up
-        
+
         d_out/d_gate = up * (sigmoid(gate) + gate * sigmoid(gate) * (1 - sigmoid(gate)))
                      = up * sigmoid(gate) * (1 + gate * (1 - sigmoid(gate)))
         d_out/d_up = silu(gate)
         """
         gate, up = ctx.saved_tensors
-        
-        # Compute in float32 for stability
-        gate_f32 = gate.float()
-        up_f32 = up.float()
-        grad_out_f32 = grad_output.float()
-        
-        sigmoid_gate = torch.sigmoid(gate_f32)
-        silu_gate = gate_f32 * sigmoid_gate
-        
-        # Gradient w.r.t. gate
-        # d(silu)/d(gate) = sigmoid(gate) + gate * sigmoid(gate) * (1 - sigmoid(gate))
-        #                 = sigmoid(gate) * (1 + gate - gate * sigmoid(gate))
-        dsilu = sigmoid_gate * (1.0 + gate_f32 * (1.0 - sigmoid_gate))
-        grad_gate = grad_out_f32 * up_f32 * dsilu
-        # Clamp to prevent explosions
-        grad_gate = grad_gate.clamp(-100.0, 100.0).to(gate.dtype)
-        
-        # Gradient w.r.t. up
-        grad_up = grad_out_f32 * silu_gate
-        grad_up = grad_up.clamp(-100.0, 100.0).to(up.dtype)
-        
-        return grad_gate, grad_up
+
+        # Use fused Triton backward when available
+        if USE_FUSED_SWIGLU_BACKWARD and TRITON_AVAILABLE and gate.is_cuda:
+            return _fused_swiglu_backward_triton(gate, up, grad_output)
+
+        # Fallback to PyTorch (float32 for stability)
+        return _swiglu_backward_pytorch(gate, up, grad_output)
 
 
 @compiler_disable
@@ -600,6 +853,74 @@ def _fused_swiglu_triton(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 def _swiglu_pytorch(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """PyTorch reference implementation for SwiGLU."""
     return F.silu(gate) * up
+
+
+@compiler_disable
+def _fused_swiglu_backward_triton(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    grad_output: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Triton fused backward pass for SwiGLU.
+
+    Fuses all backward computations into a single kernel launch:
+    - 3 loads (gate, up, grad_output)
+    - All math in FP32 registers
+    - 2 stores (grad_gate, grad_up)
+
+    This replaces ~12 separate kernel launches in the PyTorch version.
+    """
+    orig_shape = gate.shape
+
+    # Flatten for kernel
+    gate_flat = gate.contiguous().view(-1)
+    up_flat = up.contiguous().view(-1)
+    grad_out_flat = grad_output.contiguous().view(-1)
+
+    # Allocate outputs in input dtype (kernel computes in FP32, stores in input dtype)
+    grad_gate = torch.empty_like(gate_flat)
+    grad_up = torch.empty_like(up_flat)
+
+    n_elements = gate_flat.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+
+    _fused_swiglu_backward_kernel[grid](
+        gate_flat,
+        up_flat,
+        grad_out_flat,
+        grad_gate,
+        grad_up,
+        n_elements,
+    )
+
+    return grad_gate.view(orig_shape), grad_up.view(orig_shape)
+
+
+def _swiglu_backward_pytorch(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    grad_output: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """PyTorch reference backward for SwiGLU (float32 for stability)."""
+    # Compute in float32 for stability
+    gate_f32 = gate.float()
+    up_f32 = up.float()
+    grad_out_f32 = grad_output.float()
+
+    sigmoid_gate = torch.sigmoid(gate_f32)
+    silu_gate = gate_f32 * sigmoid_gate
+
+    # Gradient w.r.t. gate
+    # d(silu)/d(gate) = sigmoid(gate) * (1 + gate * (1 - sigmoid(gate)))
+    dsilu = sigmoid_gate * (1.0 + gate_f32 * (1.0 - sigmoid_gate))
+    grad_gate = grad_out_f32 * up_f32 * dsilu
+    grad_gate = grad_gate.clamp(-100.0, 100.0).to(gate.dtype)
+
+    # Gradient w.r.t. up
+    grad_up = grad_out_f32 * silu_gate
+    grad_up = grad_up.clamp(-100.0, 100.0).to(up.dtype)
+
+    return grad_gate, grad_up
 
 
 # =============================================================================
@@ -658,6 +979,110 @@ if TRITON_AVAILABLE:
             tl.store(out_ptr + row_start + offs, out, mask=mask)
 
 
+    # -------------------------------------------------------------------------
+    # Fused RMSNorm Backward Kernel
+    # -------------------------------------------------------------------------
+    # This kernel fuses the grad_x computation into a single kernel per row.
+    # grad_weight is computed separately (simple reduction) since it requires
+    # summing across all rows.
+    #
+    # Forward: out = x * rsqrt(mean(x^2) + eps) * weight
+    #              = x * rms_inv * weight
+    #              = x_norm * weight   where x_norm = x * rms_inv
+    #
+    # Backward:
+    #   correction = mean(grad_out * weight * x_norm)
+    #   grad_x = grad_out * weight * rms_inv - x_norm * correction
+    #
+    # We also output x_norm for efficient grad_weight computation.
+    # -------------------------------------------------------------------------
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_SIZE": 64}, num_warps=2, num_stages=1),
+            triton.Config({"BLOCK_SIZE": 128}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=1),
+        ],
+        key=["dim"],
+    )
+    @triton.jit
+    def _fused_rms_norm_backward_kernel(
+        # Inputs
+        x_ptr,           # [n_rows, dim] - original input
+        weight_ptr,      # [dim] - scale weights
+        grad_out_ptr,    # [n_rows, dim] - upstream gradient
+        # Outputs
+        grad_x_ptr,      # [n_rows, dim] - gradient w.r.t. input
+        x_norm_ptr,      # [n_rows, dim] - normalized x (for grad_weight)
+        # Params
+        eps,
+        dim: tl.constexpr,
+        n_rows,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Fused RMSNorm backward pass for grad_x.
+
+        Computes:
+        1. rms_inv = rsqrt(mean(x^2) + eps)
+        2. x_norm = x * rms_inv
+        3. correction = mean(grad_out * weight * x_norm)
+        4. grad_x = grad_out * weight * rms_inv - x_norm * correction
+
+        Also stores x_norm for grad_weight computation.
+        All math in FP32 for stability.
+        """
+        row_idx = tl.program_id(0)
+        if row_idx >= n_rows:
+            return
+
+        row_start = row_idx * dim
+
+        # Pass 1: Compute sum of squares for RMS
+        sq_sum = tl.zeros([1], dtype=tl.float32)
+        for d in range(0, dim, BLOCK_SIZE):
+            offs = d + tl.arange(0, BLOCK_SIZE)
+            mask = offs < dim
+            x = tl.load(x_ptr + row_start + offs, mask=mask, other=0.0).to(tl.float32)
+            sq_sum += tl.sum(x * x)
+
+        # RMS inverse
+        rms_inv = tl.rsqrt(sq_sum / dim + eps)
+
+        # Pass 2: Compute correction term = mean(grad_out * weight * x_norm)
+        # which equals mean(grad_out * weight * x * rms_inv)
+        correction_sum = tl.zeros([1], dtype=tl.float32)
+        for d in range(0, dim, BLOCK_SIZE):
+            offs = d + tl.arange(0, BLOCK_SIZE)
+            mask = offs < dim
+            x = tl.load(x_ptr + row_start + offs, mask=mask, other=0.0).to(tl.float32)
+            w = tl.load(weight_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+            grad_out = tl.load(grad_out_ptr + row_start + offs, mask=mask, other=0.0).to(tl.float32)
+
+            x_norm = x * rms_inv
+            correction_sum += tl.sum(grad_out * w * x_norm)
+
+        correction = correction_sum / dim
+
+        # Pass 3: Compute grad_x and store x_norm
+        # Formula: grad_x = grad_out * w * rms_inv - x_norm * correction
+        for d in range(0, dim, BLOCK_SIZE):
+            offs = d + tl.arange(0, BLOCK_SIZE)
+            mask = offs < dim
+            x = tl.load(x_ptr + row_start + offs, mask=mask, other=0.0).to(tl.float32)
+            w = tl.load(weight_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+            grad_out = tl.load(grad_out_ptr + row_start + offs, mask=mask, other=0.0).to(tl.float32)
+
+            x_norm = x * rms_inv
+
+            # grad_x = grad_out * w * rms_inv - x_norm * correction
+            grad_x = grad_out * w * rms_inv - x_norm * correction
+
+            # Clamp gradient
+            grad_x = tl.maximum(tl.minimum(grad_x, 100.0), -100.0)
+
+            tl.store(grad_x_ptr + row_start + offs, grad_x, mask=mask)
+            tl.store(x_norm_ptr + row_start + offs, x_norm, mask=mask)
+
+
 @compiler_disable
 def fused_rms_norm(
     x: torch.Tensor,
@@ -681,7 +1106,7 @@ def fused_rms_norm(
 
 class FusedRMSNormFunction(torch.autograd.Function):
     """Autograd-compatible wrapper for fused RMSNorm Triton kernel."""
-    
+
     @staticmethod
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
         """Forward pass using Triton kernel."""
@@ -689,67 +1114,35 @@ class FusedRMSNormFunction(torch.autograd.Function):
         dim = orig_shape[-1]
         x_flat = x.contiguous().view(-1, dim)
         n_rows = x_flat.shape[0]
-        
+
         out = torch.empty_like(x_flat)
         weight = weight.contiguous()
-        
-        # Compute RMS for backward pass
-        x_float = x_flat.float()
-        rms_inv = torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + eps)
-        
+
         grid = (n_rows,)
         _fused_rms_norm_kernel[grid](
             x_flat, weight, out, eps, dim, n_rows,
         )
-        
-        # Save for backward
-        ctx.save_for_backward(x_flat, weight, rms_inv)
+
+        # Save for backward (no need to store rms_inv - we recompute in kernel)
+        ctx.save_for_backward(x_flat, weight)
         ctx.eps = eps
         ctx.orig_shape = orig_shape
-        
+
         return out.view(orig_shape)
-    
+
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        """Backward pass computed in PyTorch (Triton backward is complex).
-        
-        Forward: out = x * rsqrt(mean(x^2) + eps) * weight
-        
-        Computed in float32 for numerical stability with gradient clamping.
-        """
-        x, weight, rms_inv = ctx.saved_tensors
+        """Backward pass - uses fused Triton kernel when available."""
+        x, weight = ctx.saved_tensors
         eps = ctx.eps
         orig_shape = ctx.orig_shape
-        dim = x.shape[-1]
 
-        # grad_output may be non-contiguous (e.g., due to preceding transpose/view patterns).
-        # Use reshape to avoid RuntimeError and ensure correct flattening.
-        grad_output_flat = grad_output.reshape(-1, dim)
-        
-        # All computations in float32 for stability
-        x_f32 = x.float()
-        weight_f32 = weight.float()
-        grad_out_f32 = grad_output_flat.float()
-        rms_inv_f32 = rms_inv.float()
-        
-        # Gradient w.r.t. weight: sum over batch of (x * rms_inv * grad_output)
-        x_norm = x_f32 * rms_inv_f32
-        grad_weight = (x_norm * grad_out_f32).sum(dim=0)
-        # Clamp weight gradient
-        grad_weight = grad_weight.clamp(-100.0, 100.0).to(weight.dtype)
-        
-        # Gradient w.r.t. x
-        # d/dx [x * rsqrt(mean(x^2) + eps) * w]
-        # = w * rsqrt(...) - w * x * x * rsqrt(...)^3 / dim
-        # = w * rsqrt(...) * (1 - x^2 / (dim * (mean(x^2) + eps)))
-        grad_x = grad_out_f32 * weight_f32 * rms_inv_f32
-        # Correction term for the derivative of rsqrt
-        correction = (grad_out_f32 * weight_f32 * x_norm).mean(dim=-1, keepdim=True)
-        grad_x = grad_x - x_norm * correction
-        # Clamp gradient magnitude
-        grad_x = grad_x.clamp(-100.0, 100.0).to(x.dtype)
-        
-        return grad_x.view(orig_shape), grad_weight, None
+        # Use fused Triton backward when available
+        if USE_FUSED_RMS_NORM_BACKWARD and TRITON_AVAILABLE and x.is_cuda:
+            return _fused_rms_norm_backward_triton(x, weight, grad_output, eps, orig_shape)
+
+        # Fallback to PyTorch
+        return _rms_norm_backward_pytorch(x, weight, grad_output, eps, orig_shape)
 
 
 @compiler_disable
@@ -782,6 +1175,82 @@ def _rms_norm_pytorch(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torc
     x = x.float()
     rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
     return (x * rms).to(dtype) * weight
+
+
+@compiler_disable
+def _fused_rms_norm_backward_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    grad_output: torch.Tensor,
+    eps: float,
+    orig_shape: tuple,
+) -> Tuple[torch.Tensor, torch.Tensor, None]:
+    """Triton fused backward pass for RMSNorm.
+
+    Uses fused kernel for grad_x (the expensive per-row computation),
+    and PyTorch for grad_weight (simple reduction across rows).
+    """
+    dim = x.shape[-1]
+    n_rows = x.shape[0]
+
+    # Handle non-contiguous grad_output
+    grad_output_flat = grad_output.reshape(-1, dim).contiguous()
+
+    # Allocate outputs
+    grad_x = torch.empty_like(x)
+    x_norm = torch.empty_like(x)  # Store normalized x for grad_weight
+
+    grid = (n_rows,)
+    _fused_rms_norm_backward_kernel[grid](
+        x,
+        weight,
+        grad_output_flat,
+        grad_x,
+        x_norm,
+        eps,
+        dim,
+        n_rows,
+    )
+
+    # grad_weight = sum over rows of (x_norm * grad_out)
+    # Compute in float32 for numerical stability (x_norm stored as bf16)
+    grad_weight = (x_norm.float() * grad_output_flat.float()).sum(dim=0)
+    grad_weight = grad_weight.clamp(-100.0, 100.0).to(weight.dtype)
+
+    return grad_x.view(orig_shape), grad_weight, None
+
+
+def _rms_norm_backward_pytorch(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    grad_output: torch.Tensor,
+    eps: float,
+    orig_shape: tuple,
+) -> Tuple[torch.Tensor, torch.Tensor, None]:
+    """PyTorch reference backward for RMSNorm (float32 for stability)."""
+    dim = x.shape[-1]
+    grad_output_flat = grad_output.reshape(-1, dim)
+
+    # All computations in float32 for stability
+    x_f32 = x.float()
+    weight_f32 = weight.float()
+    grad_out_f32 = grad_output_flat.float()
+
+    # Recompute rms_inv
+    rms_inv_f32 = torch.rsqrt(x_f32.pow(2).mean(-1, keepdim=True) + eps)
+
+    # Gradient w.r.t. weight: sum over batch of (x * rms_inv * grad_output)
+    x_norm = x_f32 * rms_inv_f32
+    grad_weight = (x_norm * grad_out_f32).sum(dim=0)
+    grad_weight = grad_weight.clamp(-100.0, 100.0).to(weight.dtype)
+
+    # Gradient w.r.t. x
+    grad_x = grad_out_f32 * weight_f32 * rms_inv_f32
+    correction = (grad_out_f32 * weight_f32 * x_norm).mean(dim=-1, keepdim=True)
+    grad_x = grad_x - x_norm * correction
+    grad_x = grad_x.clamp(-100.0, 100.0).to(x.dtype)
+
+    return grad_x.view(orig_shape), grad_weight, None
 
 
 # =============================================================================

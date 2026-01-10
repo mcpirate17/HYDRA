@@ -180,23 +180,47 @@ class SafeOptimizations:
         return "older"
 
     def _check_fa3_available(self) -> bool:
-        """Check if Flash Attention 3 is available."""
+        """Check if Flash Attention 3 is available.
+
+        FA3 requires:
+        1. Hopper (SM90) or Blackwell (SM100+) GPU architecture
+        2. flash-attn >= 2.6.0 with cute/hopper modules
+        3. CUTLASS Python DSL (cutlass module with cute submodule)
+        """
         try:
-            # FA3 requires Hopper+ and specific package
+            # FA3 requires Hopper+ GPU
             if self._gpu_arch not in ("blackwell", "hopper"):
+                self.logger.debug("FA3: GPU arch not Hopper/Blackwell")
                 return False
 
-            # Try importing flash_attn with FA3 support
+            # Check flash_attn version >= 2.6
             try:
-                from flash_attn import flash_attn_func
-                # Check version for FA3 support
                 import flash_attn
                 version = getattr(flash_attn, "__version__", "0.0.0")
-                major = int(version.split(".")[0])
-                return major >= 3
+                parts = version.split(".")
+                major, minor = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+                if major < 2 or (major == 2 and minor < 6):
+                    self.logger.debug(f"FA3: flash_attn {version} < 2.6.0")
+                    return False
             except ImportError:
+                self.logger.debug("FA3: flash_attn not installed")
                 return False
-        except Exception:
+
+            # Check for CUTLASS Python DSL (required for FA3 kernels)
+            try:
+                import cutlass
+                import cutlass.cute  # FA3 uses CUTLASS cute DSL
+                self.logger.debug("FA3: cutlass with cute DSL available")
+                return True
+            except ImportError:
+                self.logger.debug(
+                    "FA3: cutlass Python DSL not available. "
+                    "Install from CUTLASS source: "
+                    "https://github.com/NVIDIA/cutlass (python/ directory)"
+                )
+                return False
+        except Exception as e:
+            self.logger.debug(f"FA3: check failed with {e}")
             return False
 
     def _check_cuda_graphs_available(self) -> bool:
@@ -210,12 +234,17 @@ class SafeOptimizations:
         """Initialize optimization states based on config and hardware."""
         cfg = self.config
 
-        # FA3: Only on Hopper+ with package available
+        # FA3: Only on Hopper+ with CUTLASS Python DSL
         if cfg.enable_fa3 and self._has_fa3:
             self._states["fa3"].status = OptimizationStatus.PRETESTING
             self.logger.info(f"FA3: Enabled for pretest (GPU arch: {self._gpu_arch})")
         else:
-            reason = "not available" if not self._has_fa3 else "disabled by config"
+            if not cfg.enable_fa3:
+                reason = "disabled by config"
+            elif self._gpu_arch not in ("blackwell", "hopper"):
+                reason = f"requires Hopper/Blackwell GPU (have {self._gpu_arch})"
+            else:
+                reason = "cutlass DSL not installed (build from CUTLASS source)"
             self._states["fa3"].status = OptimizationStatus.DISABLED
             self._states["fa3"].disable_reason = reason
             self.logger.info(f"FA3: Disabled ({reason})")
@@ -338,6 +367,7 @@ class SafeOptimizations:
         sample_batch: torch.Tensor,
     ) -> bool:
         """Pretest CUDA graph capture."""
+        original_training = model.training
         try:
             # Test graph capture
             model.eval()
@@ -356,10 +386,25 @@ class SafeOptimizations:
             g.replay()
             torch.cuda.synchronize()
 
-            model.train()
+            model.train(original_training)
             return True
         except Exception as e:
             self.logger.warning(f"CUDA graphs pretest exception: {e}")
+            # CRITICAL: Clean up CUDA state after graph capture failure.
+            # cudaErrorStreamCaptureInvalidated can poison subsequent operations
+            # if not properly cleared.
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            # Reset model to original training mode
+            model.train(original_training)
+            # Clear any pending CUDA errors by doing a simple operation
+            try:
+                _ = torch.zeros(1, device=self.device)
+                torch.cuda.synchronize()
+            except Exception:
+                pass
             return False
 
     def _pretest_blackwell_tuning(
