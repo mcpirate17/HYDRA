@@ -1819,6 +1819,11 @@ class Trainer:
                                 moe_block.set_forced_expert(forced_expert_id)
                             if hasattr(moe_block, "set_teacher_target"):
                                 moe_block.set_teacher_target(teacher_target_id)
+                            # Pre-generate jitter noise outside CUDA graph capture
+                            if hasattr(moe_block, "router") and hasattr(moe_block.router, "refresh_jitter_noise"):
+                                # Shape: [batch, seq_len, num_experts]
+                                jitter_shape = (x.shape[0], x.shape[1], moe_block.router.num_experts)
+                                moe_block.router.refresh_jitter_noise(jitter_shape)
                 except Exception:
                     pass
 

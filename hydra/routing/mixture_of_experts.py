@@ -246,6 +246,10 @@ class MoERouter(nn.Module):
         self.register_buffer("_forced_expert_id", torch.full((), -1, dtype=torch.int64))
         self.register_buffer("_teacher_target_expert", torch.full((), -1, dtype=torch.int64))
         self.register_buffer("_teacher_loss", torch.tensor(0.0))
+        
+        # Pre-generated jitter noise buffer (updated outside CUDA graph capture)
+        # Shape will be set on first use; stores noise for [B, L, num_experts]
+        self.register_buffer("_jitter_noise", torch.empty(0), persistent=False)
     
     def set_global_step(self, step: int) -> None:
         """Update global step for forced routing schedule."""
@@ -261,6 +265,22 @@ class MoERouter(nn.Module):
 
     def get_teacher_loss(self) -> torch.Tensor:
         return self._teacher_loss
+    
+    @torch.compiler.disable
+    def refresh_jitter_noise(self, shape: tuple) -> None:
+        """Pre-generate jitter noise outside CUDA graph capture.
+        
+        Call this before each forward pass when using CUDA graphs.
+        The noise is stored in a buffer and reused during forward.
+        
+        Args:
+            shape: Expected logits shape (B, L, num_experts)
+        """
+        if self.router_jitter > 0 and self.training:
+            if self._jitter_noise.shape != shape:
+                self._jitter_noise = torch.empty(shape, device=self.gate.weight.device, 
+                                                  dtype=self.gate.weight.dtype)
+            self._jitter_noise.normal_()
         
     @classmethod
     def from_config(cls, config: MoEConfig) -> "MoERouter":
@@ -276,9 +296,17 @@ class MoERouter(nn.Module):
         )
     
     def _apply_jitter(self, logits: torch.Tensor) -> torch.Tensor:
-        """Add noise to logits during training for exploration."""
+        """Add pre-generated noise to logits during training for exploration.
+        
+        Uses pre-generated noise from _jitter_noise buffer to avoid
+        random number generation during CUDA graph capture.
+        """
         if self.training and self.router_jitter > 0:
-            return logits + torch.randn_like(logits) * self.router_jitter
+            # Use pre-generated noise if available and shape matches
+            if self._jitter_noise.numel() > 0 and self._jitter_noise.shape == logits.shape:
+                return logits + self._jitter_noise * self.router_jitter
+            # Fallback: no jitter (safe for CUDA graphs)
+            return logits
         return logits
     
     def forward(
