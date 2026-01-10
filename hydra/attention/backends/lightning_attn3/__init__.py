@@ -39,6 +39,22 @@ def get_lightning_attn_func() -> Callable[..., Any]:
 	return lightning_attn_func
 
 
-from .ops import *  # noqa: E402,F403
-from .utils import *  # noqa: E402,F403
+# Explicit imports for public API (replaces wildcard imports)
+from .ops import (
+    lightning_attn_func,
+    validate_lightning_attn3,
+    validate_at_init,
+    LightningAttn3ValidationError,
+)
+from .utils import get_memory
+
+__all__ = [
+    "is_available",
+    "get_lightning_attn_func",
+    "lightning_attn_func",
+    "validate_lightning_attn3",
+    "validate_at_init",
+    "LightningAttn3ValidationError",
+    "get_memory",
+]
 
