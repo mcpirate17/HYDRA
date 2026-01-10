@@ -169,6 +169,9 @@ __all__ = [
     "liger_fused_linear_cross_entropy",
     "liger_rope",
     "patch_hydra_with_liger",
+    "apply_liger_kernel_to_model",
+    "LigerCrossEntropyLoss",
+    "LigerFusedLinearCrossEntropyLoss",
     # Transformer Engine integration
     "TE_AVAILABLE",
     "FP8_AVAILABLE",

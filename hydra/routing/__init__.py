@@ -75,9 +75,8 @@ __all__ = [
     "MoDConfig",
     "MoDRouter",
     "MixtureOfDepthsBlock",
-    "MoDMLPBlock",
-    "MoDAttentionMLPBlock",
-    "MoDConditionalBlock",
+    "MoDTransformerLayer",
+    "MoDAttention",
     # MoR
     "MoRConfig",
     "MoRRouter",

@@ -113,27 +113,3 @@ hydra/attention/backends/*/docs/profile_results.json
 
 # Full benchmark logs
 hydra/attention/backends/*/full_benchmark.log
-# ============================================================
-# ADDITIONS TO .gitignore - Append these to existing .gitignore
-# ============================================================
-
-# Root level artifacts (often created accidentally)
-nohup.out
-*.deb
-scaling_analysis_results.json
-venv_install.log
-recover_venv_complete.sh
-
-# Diagnostics output (keep scripts in diagnostics/, ignore output)
-diagnostics/output/
-
-# Nested benchmark results (keep canonical benchmark_results.json only)
-# Already partially covered, but be explicit:
-hydra/attention/backends/*/docs/benchmark_results_*.json
-hydra/attention/backends/*/docs/profile_results.json
-
-# Triton autotune cache (machine-specific)
-**/.autotune_cache/
-
-# Full benchmark logs
-hydra/attention/backends/*/full_benchmark.log
