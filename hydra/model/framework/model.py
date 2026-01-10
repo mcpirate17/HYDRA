@@ -198,6 +198,8 @@ class HydraModel(nn.Module):
 		attention_backend: str = "ccgqa",  # Only CCGQA is supported
 		# MoR configuration
 		mor_min_depth: int = 0,  # Minimum recursion depth (0=allow immediate exit, 1+=force iterations)
+		# Static routing mode for CUDA graph compatibility
+		static_routing_mode: bool = False,
 		# MoE configuration
 		moe_enabled: bool = False,
 		moe_num_experts: int = 4,
@@ -249,6 +251,7 @@ class HydraModel(nn.Module):
 		self.moe_forced_routing_steps = moe_forced_routing_steps
 		self.moe_teacher_until_step = moe_teacher_until_step
 		self.mor_min_depth = mor_min_depth
+		self.static_routing_mode = static_routing_mode
 
 		if aux_loss_weight is None:
 			depth_scale = max(1.0, self.effective_layers / 32)
@@ -301,6 +304,7 @@ class HydraModel(nn.Module):
 				depth_alpha=depth_alpha,
 				depth_scale_max=depth_scale_max,
 				mor_min_depth=mor_min_depth,
+				static_routing_mode=static_routing_mode,
 			)
 			self.layers.append(mor_block)
 

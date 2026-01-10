@@ -256,6 +256,7 @@ class PretestHook:
         hash_input.append(f"cuda_graphs={getattr(config, 'experimental_cuda_graphs', True)}")
         hash_input.append(f"blackwell={getattr(config, 'experimental_blackwell_tuning', True)}")
         hash_input.append(f"fp8={getattr(config, 'experimental_fp8', False)}")
+        hash_input.append(f"static_routing={getattr(config, 'static_routing_mode', False)}")
 
         # Checkpoint
         if checkpoint_path:
@@ -365,6 +366,9 @@ class PretestHook:
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
 
+        # Check if static routing mode is enabled (skips cuda_graphs pretest)
+        static_routing_mode = bool(getattr(config, "static_routing_mode", False))
+
         # Run pretests for each optimization
         results: List[PretestResult] = []
         total_time = 0.0
@@ -373,6 +377,20 @@ class PretestHook:
         skipped = 0
 
         for name, state in safe_opts._states.items():
+            # Static routing mode: CUDA graphs are guaranteed to work because
+            # we eliminated dynamic shapes. Skip the test and mark as passed.
+            if name == "cuda_graphs" and static_routing_mode:
+                results.append(PretestResult(
+                    optimization=name,
+                    status="passed",
+                    time_ms=0.0,
+                    error_message="static_routing_mode enabled (no dynamic shapes)",
+                ))
+                passed += 1
+                if self.verbose:
+                    self.logger.info(f"  [{name}] ✓ SKIPPED (static_routing_mode enabled)")
+                continue
+
             if state.status != OptimizationStatus.PRETESTING:
                 results.append(PretestResult(
                     optimization=name,

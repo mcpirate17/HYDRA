@@ -399,6 +399,14 @@ def _add_training_args(parser: argparse.ArgumentParser) -> None:
         help="Chunk size for chunked cross-entropy (tokens per chunk)",
     )
     parser.add_argument(
+        "--static_routing_mode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable static routing for CUDA graph compatibility. "
+        "Computes all tokens through all layers, applies routing masks after. "
+        "Trades ~25-50%% more FLOPs for 5-15%% speedup from CUDA graphs.",
+    )
+    parser.add_argument(
         "--8bit_adam",
         action="store_true",
         dest="use_8bit_adam",

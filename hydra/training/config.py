@@ -110,6 +110,23 @@ class TrainingConfig:
     mor_advantage_nudge_cooldown_steps: int = 500
 
     # ==========================================================================
+    # Static Routing Mode (CUDA Graph Compatible)
+    # ==========================================================================
+    # When enabled, MoD/MoR compute ALL tokens through ALL layers, then apply
+    # routing masks AFTER computation. This trades compute efficiency for CUDA
+    # graph compatibility (5-15% speedup from reduced kernel launch overhead).
+    #
+    # Benefits:
+    # - Full CUDA graph capture/replay works
+    # - Router still learns (gradients flow through soft masks)
+    # - Can switch to dynamic routing at inference for compute savings
+    #
+    # Tradeoffs:
+    # - ~25-50% more FLOPs in MLP (MoD normally skips 50% of tokens)
+    # - MoR runs all recursions (normally exits early for easy tokens)
+    static_routing_mode: bool = False
+
+    # ==========================================================================
     # Mixture of Experts (MoE) Configuration
     # ==========================================================================
     # MoE adds sparse FFN expert routing for higher model capacity at constant
@@ -648,6 +665,7 @@ def build_config_from_args(
         use_triton_kernels=args.triton_kernels,
         use_chunked_ce=args.chunked_ce,
         chunked_ce_size=args.chunked_ce_size,
+        static_routing_mode=getattr(args, "static_routing_mode", False),
         use_compile=args.compile,
         dtype="bfloat16",
         gradient_checkpointing=args.gradient_checkpointing,

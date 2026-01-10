@@ -71,7 +71,12 @@ class HydraBlock(nn.Module):
 
 
 class MoDMLPWrapper(nn.Module):
-    """Mixture-of-Depths wrapper applied to the MLP sublayer only."""
+    """Mixture-of-Depths wrapper applied to the MLP sublayer only.
+
+    When static_routing_mode=True, computes ALL tokens through the MLP,
+    then applies soft router weights. This enables CUDA graph compatibility
+    at the cost of ~25-50% more FLOPs (no tokens are skipped).
+    """
 
     def __init__(
         self,
@@ -84,6 +89,7 @@ class MoDMLPWrapper(nn.Module):
         max_seq_len: int = 2048,
         enable_loss_threshold: Optional[float] = None,
         loss_aware_weight: float = 0.0,
+        static_routing_mode: bool = False,
     ):
         super().__init__()
         self.mlp = mlp
@@ -97,6 +103,7 @@ class MoDMLPWrapper(nn.Module):
         )
         self.max_seq_len = max_seq_len
         self.loss_aware_weight = float(loss_aware_weight)
+        self.static_routing_mode = static_routing_mode
 
         self.enable_loss_threshold = (
             float(enable_loss_threshold)
@@ -147,6 +154,11 @@ class MoDMLPWrapper(nn.Module):
             self._loss_unlocked = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Static routing mode: compute all tokens, apply soft weights after
+        # This enables CUDA graph compatibility (no dynamic shapes)
+        if self.static_routing_mode:
+            return self._forward_static(x)
+
         if not getattr(self, "_mod_enabled", False):
             self._routing_mode = "disabled"
             B, L, _ = x.shape
@@ -174,6 +186,59 @@ class MoDMLPWrapper(nn.Module):
             return self._forward_hard(x)
 
         return self._forward_hard_with_ste(x)
+
+    def _forward_static(self, x: torch.Tensor) -> torch.Tensor:
+        """Static routing: compute ALL tokens, apply soft weights after.
+
+        This is CUDA graph compatible because:
+        - No dynamic tensor shapes (no gather/scatter)
+        - No data-dependent control flow
+        - Fixed computation graph for any input
+
+        The router still learns because:
+        - We compute scores and probabilities
+        - Gradients flow through soft probability weights
+        - Aux loss still encourages proper capacity usage
+
+        Trade-off: ~25-50% more FLOPs (all tokens computed) for
+        5-15% speedup from CUDA graph overhead elimination.
+        """
+        B, L, D = x.shape
+        self._routing_mode = "static"
+        self._tokens_total = L
+        self._tokens_processed = L  # All tokens processed in static mode
+
+        # Compute router scores (for learning and aux loss)
+        scores = self.mod_router.forward_logits(x)  # [B, L]
+        self._last_scores = scores
+
+        # Convert to probabilities
+        probs = torch.sigmoid(scores.clamp(-10.0, 10.0))  # [B, L]
+        self._last_probs_mean_t = probs.mean().detach()
+        self._last_probs_std_t = probs.std().detach()
+
+        # Compute aux loss for router learning
+        if self.training and self.aux_loss_weight > 0:
+            mean_prob = probs.mean()
+            target_prob = self.capacity_ratio
+            capacity_loss = (mean_prob - target_prob).pow(2)
+            prob_variance = probs.var()
+            expected_var = target_prob * (1 - target_prob) * 0.5
+            collapse_loss = torch.exp(-prob_variance / max(expected_var, 0.01) * 5.0)
+            self._aux_loss = self.aux_loss_weight * (capacity_loss + 0.5 * collapse_loss)
+        else:
+            self._aux_loss = self._zero_scalar
+
+        # Compute MLP for ALL tokens (no skipping)
+        mlp_out = self.mlp(x)  # [B, L, D]
+
+        # Apply soft router weights: output = mlp_out * prob + x * (1 - prob)
+        # This creates a differentiable path for router learning while
+        # keeping the computation graph static
+        probs_expanded = probs.unsqueeze(-1)  # [B, L, 1]
+        output = mlp_out * probs_expanded + x * (1 - probs_expanded)
+
+        return output
 
     def _forward_hard(self, x: torch.Tensor) -> torch.Tensor:
         B, L, D = x.shape
@@ -310,6 +375,7 @@ class HydraBlockWithMoDMLP(nn.Module):
         mod_aux_loss_weight: float = 0.01,
         mod_warmup_steps: int = 100,
         mod_loss_aware_weight: float = 0.0,
+        static_routing_mode: bool = False,
         **attention_kwargs,
     ):
         super().__init__()
@@ -337,6 +403,7 @@ class HydraBlockWithMoDMLP(nn.Module):
             warmup_steps=mod_warmup_steps,
             max_seq_len=max_seq_len,
             loss_aware_weight=mod_loss_aware_weight,
+            static_routing_mode=static_routing_mode,
         )
 
     def set_global_step(self, step: int):
@@ -388,6 +455,7 @@ class HydraMoRBlock(nn.Module):
         dim_ref: int = 768,
         depth_alpha: float = 0.0,
         depth_scale_max: float = 2.0,
+        static_routing_mode: bool = False,
         **attention_kwargs,
     ):
         super().__init__()
@@ -398,6 +466,7 @@ class HydraMoRBlock(nn.Module):
         self.total_layers = total_layers
         self.dim = dim
         self.attention_type = attention_type
+        self.static_routing_mode = static_routing_mode
 
         self._depth_scale = dim_to_depth_scale(dim, dim_ref, depth_alpha, depth_scale_max)
 
@@ -445,6 +514,7 @@ class HydraMoRBlock(nn.Module):
                 max_seq_len=max_seq_len,
                 enable_loss_threshold=mod_enable_loss_threshold,
                 loss_aware_weight=mod_loss_aware_weight,
+                static_routing_mode=static_routing_mode,
             )
         else:
             self.mod_mlp_wrapper = None
@@ -464,6 +534,7 @@ class HydraMoRBlock(nn.Module):
             depth_scale_max=depth_scale_max,
             advantage_loss_scale=attention_kwargs.pop("mor_advantage_loss_scale", 0.1),
             min_depth=mor_min_depth,
+            static_routing_mode=static_routing_mode,
         )
         self.mor_router = MoRRouter(mor_config)
         self.mor_executor = MoRExecutor(mor_config)

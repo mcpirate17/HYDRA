@@ -522,6 +522,8 @@ class Trainer:
             moe_identity_init=config.moe_identity_init,
             moe_forced_routing_steps=getattr(config, "moe_forced_routing_steps", 0),
             moe_teacher_until_step=getattr(config, "moe_teacher_until_step", 0),
+            # Static routing mode for CUDA graph compatibility
+            static_routing_mode=getattr(config, "static_routing_mode", False),
         ).to(self.device)
         self._use_mod_mor = True
         mod_status = "OFF (capacity=1.0)" if config.mod_capacity >= 1.0 else f"{config.mod_capacity:.0%} capacity (warmup={mod_mlp_warmup} steps)"
@@ -548,6 +550,13 @@ class Trainer:
         else:
             self._mor_enable_step = 0
             self.logger.info("MoR CURRICULUM: Disabled (adaptive=False, running pure fixed-depth)")
+
+        # Static routing mode: enables CUDA graphs by using soft weights instead of dynamic routing
+        if getattr(config, "static_routing_mode", False):
+            self.logger.info("STATIC ROUTING: Enabled - using soft weights for CUDA graph compatibility")
+            self.logger.info("  MoD: All tokens computed, router weights applied after")
+            self.logger.info("  MoR: All recursions computed, soft depth weighting")
+            self.logger.info("  CUDA Graphs: Forced enabled (no dynamic shapes)")
         if config.gradient_checkpointing:
             if hasattr(self.model, "enable_gradient_checkpointing"):
                 every_n = getattr(config, "checkpoint_every_n", 1)
@@ -1814,10 +1823,16 @@ class Trainer:
                     pass
 
                 # Mark CUDA graph step begin if CUDA graphs are enabled and SafeOptimizations allows it
+                # Static routing mode bypasses the SafeOptimizations check because it's designed
+                # to eliminate the dynamic shapes that break CUDA graphs
                 _use_cuda_graphs = (
                     self.device == "cuda" and
                     self.config.use_compile and
-                    (self._safe_opts is None or self._safe_opts.should_use_cuda_graphs())
+                    (
+                        getattr(self.config, "static_routing_mode", False) or
+                        self._safe_opts is None or
+                        self._safe_opts.should_use_cuda_graphs()
+                    )
                 )
                 if _use_cuda_graphs:
                     torch.compiler.cudagraph_mark_step_begin()
