@@ -1080,7 +1080,7 @@ def plot_scaling_analysis(
 # =============================================================================
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Scaling Analysis for CCGQA + MoD + MoR Models"
     )

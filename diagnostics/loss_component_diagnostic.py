@@ -56,7 +56,7 @@ def patch_trainer_for_diagnostics(trainer):
     return trainer, loss_log
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Diagnose loss component breakdown")
     parser.add_argument("--resume", type=str, default="hydra_500m_step_20000.pt", help="Checkpoint to resume from")
     parser.add_argument("--max_steps", type=int, default=50, help="Number of steps to run")

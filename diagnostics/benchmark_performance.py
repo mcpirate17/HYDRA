@@ -445,7 +445,7 @@ def compare_results(baseline: Dict, optimized: Dict) -> Dict:
     return comparison
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="HYDRA Performance Benchmark")
     parser.add_argument("--warmup", type=int, default=5, help="Number of warmup steps")
     parser.add_argument("--steps", type=int, default=20, help="Number of benchmark steps")

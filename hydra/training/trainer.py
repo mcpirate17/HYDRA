@@ -42,6 +42,7 @@ from .halt import HaltController
 from .policy import SeqLenPolicy
 from .curriculum import CurriculumController
 from . import step_diagnostics as _step_diag
+from . import db as _db
 
 _RUNTIME_STATUS = configure_runtime()
 
@@ -498,8 +499,6 @@ class Trainer:
                 self.logger.warning("WARNING: Model doesn't support gradient checkpointing")
         if config.use_compile and self.device == "cuda":
             mode = config.compile_mode
-            # if mode == "max-autotune":
-            #     mode = "max-autotune-no-cudagraphs"
             self.logger.info(f"Compiling model with mode='{mode}'...")
             self.model = torch.compile(self.model, mode=mode, fullgraph=False, dynamic=False)
             self.logger.info("Model compiled successfully!")
@@ -520,12 +519,19 @@ class Trainer:
         # exploding while new routers learn too slowly.
         # =====================================================================
         
-        expert_lr_scale = float(getattr(config, "moe_expert_lr_scale", 1.0) or 1.0)
-        router_lr_scale = float(getattr(config, "moe_router_lr_scale", 1.0) or 1.0)
-        expert_wd_scale = float(getattr(config, "moe_expert_weight_decay_scale", 1.0) or 1.0)
+        # Force sensible defaults for MoE - old checkpoints may have 1.0 which is wrong
+        # If config has 1.0 (old default), override with new defaults
+        _expert_lr = getattr(config, "moe_expert_lr_scale", None)
+        _router_lr = getattr(config, "moe_router_lr_scale", None)
+        _expert_wd = getattr(config, "moe_expert_weight_decay_scale", None)
+        
+        expert_lr_scale = 0.5 if (_expert_lr is None or _expert_lr == 1.0) else float(_expert_lr)
+        router_lr_scale = 3.0 if (_router_lr is None or _router_lr == 1.0) else float(_router_lr)
+        expert_wd_scale = 3.0 if (_expert_wd is None or _expert_wd == 1.0) else float(_expert_wd)
         embed_lr_scale = 0.1  # Always slower for embeddings
         
-        use_per_component_lr = config.moe_enabled and (expert_lr_scale != 1.0 or router_lr_scale != 1.0 or expert_wd_scale != 1.0)
+        # ALWAYS use per-component LR when MoE is enabled (experts need different treatment)
+        use_per_component_lr = config.moe_enabled
         
         # Parameter categorization
         expert_decay_params = []      # Group A: expert/mlp with decay
@@ -1279,10 +1285,10 @@ class Trainer:
         loss_scale = 1.0 / grad_accum
 
         # Dynamic gradient clipping state
-        _use_dynamic_clip = bool(getattr(config, "grad_clip_dynamic", False))
+        _use_dynamic_clip = bool(getattr(config, "grad_clip_dynamic", True))
         _clip_k = float(getattr(config, "grad_clip_k", 2.0))
-        _clip_min = float(getattr(config, "grad_clip_min", 5.0))
-        _clip_max = float(getattr(config, "grad_clip_max", 500.0))
+        _clip_min = float(getattr(config, "grad_clip_min", 50.0))
+        _clip_max = float(getattr(config, "grad_clip_max", 3000.0))
         _clip_ema_alpha = float(getattr(config, "grad_clip_ema_alpha", 0.05))
         # Initialize EMA from checkpoint or static grad_clip (R2/R5 mitigation)
         _grad_norm_ema = float(getattr(self, "_grad_norm_ema", 0.0) or 0.0)
@@ -1767,12 +1773,13 @@ class Trainer:
                 _step_diag.collect_phase2_preclip_grads(_step_diag_ctx, model, self.logger)
 
             # Dynamic gradient clipping: compute adaptive threshold
+            # Always track an EMA-based dynamic clip; if static clipping is active,
+            # use the larger of static and dynamic to avoid per-step saturation.
+            dynamic_clip = min(_clip_max, max(_clip_min, _clip_k * _grad_norm_ema))
             if _use_dynamic_clip:
-                # Compute dynamic clip: clamp between min and max (R1 mitigation)
-                dynamic_clip = min(_clip_max, max(_clip_min, _clip_k * _grad_norm_ema))
                 effective_clip = dynamic_clip
             else:
-                effective_clip = grad_clip
+                effective_clip = max(grad_clip, dynamic_clip)
 
             base = model._orig_mod if hasattr(model, "_orig_mod") else model
             pre_clip_norm_t = torch.nn.utils.clip_grad_norm_(base.parameters(), effective_clip)
@@ -2292,6 +2299,7 @@ class Trainer:
         self._save_checkpoint(step, final=True)
         self._generate_report()
         self._save_diagnostics()
+        self._update_training_db()
 
         if tb_writer is not None:
             try:
@@ -2442,6 +2450,22 @@ class Trainer:
             )
         self._diagnostics_data.append(record)
 
+        # MoE health recording: divergence, entropy, utilization (averaged across MoE layers)
+        try:
+            moe_result = self._compute_moe_divergence()
+            if isinstance(moe_result, tuple) and len(moe_result) == 3:
+                moe_div, moe_ent, moe_util = moe_result
+                util_pct = [round(u * 100.0, 1) for u in moe_util] if isinstance(moe_util, list) else []
+                # Append a compact MoE summary to diagnostics data
+                self._diagnostics_data[-1]["moe"] = {
+                    "divergence": float(moe_div) if moe_div is not None else None,
+                    "entropy": float(moe_ent) if moe_ent is not None else None,
+                    "utilization_pct": util_pct,
+                }
+        except Exception:
+            # Keep diagnostics robust; MoE metrics are optional.
+            pass
+
         # =========================
         # MoR auto-nudge controller
         # =========================
@@ -2591,6 +2615,76 @@ class Trainer:
             logger=self.logger,
             run_id=self.config.run_id,
         )
+
+    def _update_training_db(self) -> None:
+        """Load diagnostics JSON into training database for cross-run analysis."""
+        try:
+            # Extract model_id from run_id (e.g., "500m_20260109_144733" -> "500m")
+            run_id = self.config.run_id
+            model_id = run_id.split("_")[0] if "_" in run_id else run_id
+            
+            # Find the diagnostics file for this run
+            diag_path = Path(self.config.checkpoint_dir) / f"diagnostics_{run_id}.json"
+            if not diag_path.exists():
+                self.logger.info(f"   No diagnostics file to load into DB: {diag_path}")
+                return
+            
+            db = _db.TrainingDB()
+            count = db.load_diagnostics_json(diag_path, model_id=model_id, run_id=run_id)
+            
+            # Also load the training report if it exists
+            report_path = Path(self.config.log_dir) / f"training_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            # Reports are saved after this method, so try to find the latest one
+            reports_dir = Path(self.config.log_dir).parent / "reports"
+            if reports_dir.exists():
+                report_files = sorted(reports_dir.glob("training_report_*.json"))
+                if report_files:
+                    db.load_training_report(report_files[-1], model_id=model_id)
+            
+            self.logger.info(f"   📊 Training DB updated: {count} steps loaded for {model_id}")
+            
+            # Generate plots and report
+            self._generate_training_analysis(model_id)
+        except Exception as e:
+            self.logger.warning(f"   ⚠️  Failed to update training DB: {e}")
+
+    def _generate_training_analysis(self, model_id: str) -> None:
+        """Generate training plots and comprehensive report."""
+        try:
+            # Import here to avoid circular imports and keep it optional
+            import subprocess
+            import sys
+            
+            script_path = Path(__file__).resolve().parents[2] / "scripts" / "plot_training_trends.py"
+            if not script_path.exists():
+                self.logger.warning(f"   Training analysis script not found: {script_path}")
+                return
+            
+            self.logger.info(f"   📈 Generating training analysis for {model_id}...")
+            
+            # Run the analysis script
+            result = subprocess.run(
+                [sys.executable, str(script_path), "--model", model_id],
+                capture_output=True,
+                text=True,
+                timeout=120,  # 2 minute timeout for plots
+                cwd=str(Path(__file__).resolve().parents[2]),  # Run from repo root
+            )
+            
+            if result.returncode == 0:
+                self.logger.info(f"   ✅ Training analysis complete: reports/training_status_{model_id}.md")
+            else:
+                self.logger.warning(f"   ⚠️  Training analysis failed (exit {result.returncode})")
+                if result.stderr:
+                    # Show first meaningful error line
+                    for line in result.stderr.split('\n'):
+                        if 'Error' in line or 'Exception' in line or 'Traceback' in line:
+                            self.logger.warning(f"      {line[:100]}")
+                            break
+        except subprocess.TimeoutExpired:
+            self.logger.warning("   ⚠️  Training analysis timed out (>2min)")
+        except Exception as e:
+            self.logger.warning(f"   ⚠️  Training analysis error: {e}")
 
     def _save_checkpoint(self, step: int, final: bool = False, best: bool = False) -> None:
         _checkpointing.save_checkpoint(

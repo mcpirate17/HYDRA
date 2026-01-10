@@ -61,7 +61,7 @@ from .loss_tracker import (
 )
 
 # Shared operations (advanced usage)
-from ._ops import (
+from .ops import (
     soft_clamp_logits,
     ste_round,
     compute_exit_masks,

@@ -424,7 +424,7 @@ def compare_checkpoints_weights_only(paths: List[str]) -> str:
 # MAIN
 # =============================================================================
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate MoE expert specialization")
     parser.add_argument("checkpoints", nargs="+", help="Checkpoint path(s)")
     parser.add_argument("--compare", action="store_true", 

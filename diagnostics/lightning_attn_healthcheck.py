@@ -323,7 +323,7 @@ def test_numerical_stability_across_scales():
     return all_passed
 
 
-def main():
+def main() -> None:
     """Run all diagnostic tests."""
     print("\n" + "=" * 70)
     print("LIGHTNING-ATTENTION DIAGNOSTIC SUITE")

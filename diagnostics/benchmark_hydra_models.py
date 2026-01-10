@@ -20,7 +20,7 @@ from hydra.attention import CCGQAAttention
 from hydra.model.framework import HydraBaseModel, HydraModel, create_base_model, create_hydra_model
 
 
-def benchmark_ccgqa_attention():
+def benchmark_ccgqa_attention() -> None:
     """Quick benchmark of CCGQA attention (for model context).
     
     For comprehensive attention benchmarks, run:
@@ -75,7 +75,7 @@ def benchmark_ccgqa_attention():
     print()
 
 
-def benchmark_base_model():
+def benchmark_base_model() -> None:
     """Benchmark HydraBaseModel (CCGQA transformer without MoD/MoR)."""
     print("=" * 80)
     print("Benchmarking HydraBaseModel (CCGQA Transformer)")
@@ -121,7 +121,7 @@ def benchmark_base_model():
     print()
 
 
-def benchmark_hydra_model():
+def benchmark_hydra_model() -> None:
     """Benchmark full HydraModel (CCGQA + MoD + MoR)."""
     print("=" * 80)
     print("Benchmarking HydraModel (CCGQA + MoD + MoR)")
@@ -179,7 +179,7 @@ def benchmark_hydra_model():
     print()
 
 
-def benchmark_memory_usage():
+def benchmark_memory_usage() -> None:
     """Benchmark memory usage with different configurations."""
     if not torch.cuda.is_available():
         print("CUDA not available, skipping memory benchmark")
@@ -243,7 +243,7 @@ def benchmark_memory_usage():
     print()
 
 
-def main():
+def main() -> None:
     """Run all model benchmarks."""
     print("\n")
     print("=" * 80)

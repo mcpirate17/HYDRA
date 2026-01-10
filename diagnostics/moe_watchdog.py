@@ -380,7 +380,7 @@ def run_watchdog(
             time.sleep(interval)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="MoE Training Watchdog")
     parser.add_argument("--interval", type=int, default=60, 
                         help="Poll interval in seconds (default: 60)")

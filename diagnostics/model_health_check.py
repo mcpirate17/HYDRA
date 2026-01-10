@@ -394,7 +394,7 @@ def check_tied_weights(model):
     return True
 
 
-def main():
+def main() -> None:
     print("=" * 70)
     print("HYDRA MODEL HEALTH CHECK (CPU)")
     print("=" * 70)
