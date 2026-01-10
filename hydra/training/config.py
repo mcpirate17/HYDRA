@@ -1,5 +1,11 @@
+"""HYDRA Training Configuration.
+
+Contains TrainingConfig dataclass, model size presets, and config-building
+utilities for constructing configs from CLI arguments.
+"""
 from __future__ import annotations
 
+import argparse
 import logging
 import math
 from dataclasses import dataclass, field
@@ -132,10 +138,11 @@ class TrainingConfig:
 
     # Per-component LR scaling for MoE gradient stabilization
     # Use when upcycled experts explode while routers learn too slowly.
-    moe_expert_lr_scale: float = 1.0  # LR multiplier for expert/MLP params (e.g. 0.1 to freeze)
+    # These defaults ALWAYS activate when MoE is enabled.
+    moe_expert_lr_scale: float = 0.5  # LR multiplier for expert/MLP params (slower to prevent explosion)
     moe_router_lr_scale: float = 3.0  # LR multiplier for router/gate params (routers need faster learning)
     moe_lr_rewarmup_steps: int = 0    # Steps to re-warmup LR after mid-run optimizer reset (0=disabled)
-    moe_expert_weight_decay_scale: float = 2.0  # WD multiplier for experts (prevents weight explosion)
+    moe_expert_weight_decay_scale: float = 3.0  # WD multiplier for experts (prevents weight explosion)
 
     # Model config
     dim: int = 768
@@ -196,7 +203,7 @@ class TrainingConfig:
     # of the run has completed (prevents early collapse to min_lr during the
     # volatile curriculum ramp phase).
     adaptive_min_trigger_pct: float = 0.50
-    adaptive_cooldown_factor: float = 0.15
+    adaptive_cooldown_factor: float = 0.5
     adaptive_lr_reduction: float = 0.5
 
     # Resume LR behavior
@@ -553,3 +560,294 @@ MODEL_SIZE_CONFIGS: Dict[str, Dict[str, Any]] = {
         "aux_scale": 0.0685,
     },
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config Building from CLI Args
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Estimated parameter counts for μP scaling
+_PARAM_ESTIMATES: Dict[str, int] = {
+    "debug": 15,
+    "50M": 50,
+    "DIAG": 50,
+    "100M": 220,
+    "debug_tall_skinny": 100,
+    "250M": 250,
+    "300M": 300,
+    "500M": 692,
+    "750M": 750,
+    "1B": 1000,
+    "1.5B": 1500,
+}
+
+
+def build_config_from_args(
+    args: argparse.Namespace,
+    size_config: Dict[str, Any],
+) -> TrainingConfig:
+    """Construct TrainingConfig from parsed CLI arguments.
+
+    Creates the base config with all settings from args and size_config.
+    Does not apply LR/schedule overrides - use apply_lr_config() and
+    apply_schedule_overrides() for those.
+
+    Args:
+        args: Parsed argparse namespace from build_argument_parser()
+        size_config: Model size configuration dict from MODEL_SIZE_CONFIGS
+
+    Returns:
+        Base TrainingConfig (before LR/schedule/batch overrides)
+    """
+    return TrainingConfig(
+        architecture=args.arch,
+        attention_backend=args.attention,
+        mode=args.mode,
+        resume_from=args.resume,
+        resume_ignore_ckpt_lr=args.resume_ignore_ckpt_lr,
+        resume_lr_override=args.resume_lr_override,
+        # MoR configuration
+        mor_enable_pct=args.mor_enable_pct,
+        mor_enable_min_steps=args.mor_enable_min_steps,
+        mor_enable_loss_threshold=args.mor_enable_loss_threshold,
+        mor_already_enabled=args.mor_already_enabled,
+        mor_adaptive=(args.mor_adaptive.lower() == "true"),
+        mor_advantage_loss_scale=args.mor_advantage_loss_scale,
+        mor_min_depth=args.mor_min_depth,
+        ponder_scale=args.ponder_scale,
+        # MoD configuration
+        mod_capacity=args.mod_capacity,
+        mod_mlp_warmup_steps=args.mod_mlp_warmup_steps,
+        mod_enable_mor_early_exit_threshold=args.mod_enable_mor_early_exit_threshold,
+        mod_enable_loss_threshold=args.mod_enable_loss_threshold,
+        mod_loss_aware_weight=args.mod_loss_aware_weight,
+        aux_scale=0.0 if getattr(args, "mod_off", False) else size_config.get("aux_scale", args.aux_scale),
+        # Model architecture from size_config
+        model_size=args.model_size,
+        mod_mor_dim=size_config["mod_mor_dim"],
+        n_mor_blocks=size_config["n_mor_blocks"],
+        mor_recursions=size_config["mor_recursions"],
+        mod_mor_n_heads=size_config["mod_mor_n_heads"],
+        mod_mor_n_kv_heads=size_config["mod_mor_n_kv_heads"],
+        # Fixed architecture params
+        dim=768,
+        n_macro_blocks=3,
+        n_heads=12,
+        n_kv_heads=3,
+        # Adaptive LR
+        adaptive_lr=args.adaptive_lr,
+        adaptive_metric=args.adaptive_metric,
+        adaptive_min_trigger_pct=args.adaptive_min_trigger_pct,
+        # SWA
+        use_swa=args.use_swa,
+        swa_start_pct=args.swa_start_pct,
+        # Batch filtering
+        batch_filter=args.batch_filter,
+        batch_filter_threshold=args.batch_filter_threshold,
+        # Optimization
+        use_triton_kernels=args.triton_kernels,
+        use_chunked_ce=args.chunked_ce,
+        chunked_ce_size=args.chunked_ce_size,
+        use_compile=args.compile,
+        dtype="bfloat16",
+        gradient_checkpointing=args.gradient_checkpointing,
+        checkpoint_every_n=args.checkpoint_every_n,
+        use_8bit_adam=args.use_8bit_adam,
+        use_adafactor=args.use_adafactor,
+        # Dataset
+        dataset_name=args.dataset,
+        # Gradient clipping
+        grad_clip=(
+            float(args.grad_clip)
+            if (args.grad_clip is not None and args.grad_clip > 0)
+            else size_config.get("grad_clip", 5.0)
+        ),
+        grad_clip_dynamic=getattr(args, "grad_clip_dynamic", False),
+        grad_clip_k=getattr(args, "grad_clip_k", 2.0),
+        grad_clip_min=getattr(args, "grad_clip_min", 5.0),
+        grad_clip_max=getattr(args, "grad_clip_max", 500.0),
+        # Logging & observability
+        log_interval=25,
+        save_interval=args.save_interval,
+        seed=args.seed,
+        use_wandb=args.wandb,
+        wandb_project=(args.wandb_project or "hydra-llm"),
+        wandb_entity=args.wandb_entity,
+        run_name=args.run_name,
+        use_tensorboard=args.tensorboard,
+        tensorboard_dir=(args.tensorboard_dir or "runs"),
+        use_profiler=args.profiler,
+        profiler_dir=(args.profiler_dir or "profiler_traces"),
+        # Debug flags
+        halt_on_spike=args.halt_on_spike,
+        ema_debug=getattr(args, "ema_debug", False),
+        eval_debug=getattr(args, "eval_debug", False),
+        # MoE configuration
+        moe_enabled=getattr(args, "moe_enabled", False),
+        moe_num_experts=getattr(args, "moe_num_experts", 0),
+        moe_num_layers=getattr(args, "moe_num_layers", 0),
+        moe_top_k=getattr(args, "moe_top_k", 1),
+        moe_aux_weight=getattr(args, "moe_aux_weight", 0.0001),
+        moe_router_jitter=getattr(args, "moe_router_jitter", 0.15),
+        moe_expert_diversity_noise=getattr(args, "moe_expert_diversity_noise", 0.05),
+        moe_warmup_steps=getattr(args, "moe_warmup_steps", 1000),
+        moe_identity_init=not getattr(args, "moe_no_identity_init", False),
+        moe_track_divergence=getattr(args, "moe_track_divergence", False),
+        moe_divergence_interval=getattr(args, "moe_divergence_interval", 100),
+        moe_forced_routing_steps=getattr(args, "moe_forced_routing_steps", 0),
+        moe_domain_expert_map=getattr(args, "moe_domain_expert_map", ""),
+        moe_teacher_weight=getattr(args, "moe_teacher_weight", 0.0),
+        moe_teacher_until_step=getattr(args, "moe_teacher_until_step", 0),
+        # MoE gradient stabilization
+        moe_expert_lr_scale=getattr(args, "moe_expert_lr_scale", 1.0),
+        moe_router_lr_scale=getattr(args, "moe_router_lr_scale", 1.0),
+        moe_lr_rewarmup_steps=getattr(args, "moe_lr_rewarmup_steps", 0),
+        moe_expert_weight_decay_scale=getattr(args, "moe_expert_weight_decay_scale", 1.0),
+    )
+
+
+def apply_lr_config(
+    config: TrainingConfig,
+    args: argparse.Namespace,
+    size_config: Dict[str, Any],
+) -> None:
+    """Apply learning rate configuration with μP scaling.
+
+    Mutates config in-place. Handles:
+    - Auto-computed LR based on model size (μP scaling)
+    - CLI --max_lr, --min_lr overrides
+    - Size preset overrides
+
+    Priority: CLI override > size_config > auto_lr
+
+    Args:
+        config: TrainingConfig to mutate
+        args: Parsed argparse namespace
+        size_config: Model size configuration dict
+    """
+    est_params = _PARAM_ESTIMATES.get(args.model_size, 220)
+    auto_lr = compute_auto_lr(est_params)
+
+    # Apply max_lr: CLI override > size_config > auto_lr
+    if args.max_lr is not None and args.max_lr > 0:
+        config.max_lr = float(args.max_lr)
+        print(f"\n⚠️  OVERRIDE: max_lr={config.max_lr}")
+    elif "max_lr" in size_config:
+        config.max_lr = size_config["max_lr"]
+        print(f"\n🔧 MODEL SIZE: max_lr={config.max_lr} (from {args.model_size} preset)")
+    else:
+        config.max_lr = auto_lr
+        print(f"\n🔧 AUTO LR: max_lr={config.max_lr:.2e} (μP scaling for ~{est_params}M params)")
+
+    # Apply min_lr: CLI override > 30% of max_lr
+    if args.min_lr is not None and args.min_lr > 0:
+        config.min_lr = float(args.min_lr)
+        print(f"⚠️  OVERRIDE: min_lr={config.min_lr}")
+    else:
+        config.min_lr = config.max_lr * 0.3
+        print(f"   min_lr={config.min_lr:.2e} (30% of max_lr)")
+
+
+def apply_schedule_overrides(
+    config: TrainingConfig,
+    args: argparse.Namespace,
+) -> None:
+    """Apply --max_steps and short-run heuristics.
+
+    Mutates config in-place. Handles:
+    - Proportional schedule rescaling for custom max_steps
+    - Save interval adjustment for short runs
+    - Short-run (≤10K steps) MoR warmup adjustments
+
+    Args:
+        config: TrainingConfig to mutate
+        args: Parsed argparse namespace
+    """
+    if args.max_steps is not None:
+        config.max_steps = args.max_steps
+
+        # Rescale step-based schedule to match mode proportions
+        if config.mode == "testing":
+            warmup_pct = 150 / 5000
+            decay_start_pct = 3500 / 5000
+        elif config.mode == "production":
+            warmup_pct = 1000 / 100000
+            decay_start_pct = 85000 / 100000
+        elif config.mode == "chinchilla_third":
+            warmup_pct = 500 / 90000
+            decay_start_pct = 76500 / 90000
+        else:
+            warmup_pct = 0.01
+            decay_start_pct = 0.85
+
+        config.warmup_steps = max(1, int(round(config.max_steps * warmup_pct)))
+        config.decay_start_step = max(0, int(round(config.max_steps * decay_start_pct)))
+        config.decay_start_step = min(config.decay_start_step, max(0, config.max_steps - 1))
+        config.decay_steps = max(1, config.max_steps - config.decay_start_step)
+
+        # Adjust save_interval unless user explicitly set it
+        user_set_save_interval = args.save_interval != 500
+        if not user_set_save_interval:
+            if config.max_steps >= 2000:
+                config.save_interval = 500
+            else:
+                config.save_interval = min(config.save_interval, max(100, config.max_steps // 5))
+
+        print(f"\n⚠️  OVERRIDE: max_steps={config.max_steps:,}, save_interval={config.save_interval:,}")
+
+    # Short-run heuristics for ≤10K step runs
+    if (
+        config.max_steps is not None
+        and config.max_steps <= 10_000
+        and not args.no_short_run_override
+    ):
+        # Adjust MoR rampup for short runs
+        if (
+            args.mor_enable_pct == 0.10
+            and not args.mor_already_enabled
+            and args.mor_adaptive.lower() == "true"
+        ):
+            config.mor_rampup_steps = max(100, int(round(config.max_steps * 0.10)))
+            print(
+                f"⚙️  SHORT RUN: setting mor_rampup_steps={config.mor_rampup_steps}. "
+                "MoD will trigger when MoR early_exit > 38%. Use --no_short_run_override to disable."
+            )
+
+    # Deprecation notice
+    if args.recalc_lr:
+        print("\n📈 NOTE: --recalc_lr is deprecated. LR schedule is now ALWAYS recalculated automatically on resume.")
+
+
+def apply_batch_overrides(
+    config: TrainingConfig,
+    args: argparse.Namespace,
+    size_config: Dict[str, Any],
+) -> None:
+    """Apply batch size, grad accum, and sequence length overrides.
+
+    Mutates config in-place.
+
+    Args:
+        config: TrainingConfig to mutate
+        args: Parsed argparse namespace
+        size_config: Model size configuration dict
+    """
+    # Batch size
+    if args.batch_size is None:
+        config.batch_size = size_config.get("default_batch_size", 8)
+    else:
+        config.batch_size = args.batch_size
+        print(f"\n⚠️  OVERRIDE: batch_size={config.batch_size}")
+
+    # Gradient accumulation
+    if args.grad_accum is None:
+        config.grad_accum_steps = size_config.get("default_grad_accum", 2)
+    else:
+        config.grad_accum_steps = args.grad_accum
+        print(f"\n⚠️  OVERRIDE: grad_accum_steps={config.grad_accum_steps}")
+
+    # Sequence length
+    if args.seq_len is not None:
+        config.max_seq_len = args.seq_len
+        config.seq_steps = ()
+        print(f"\n⚠️  OVERRIDE: max_seq_len={config.max_seq_len} (fixed, no stepping)")
