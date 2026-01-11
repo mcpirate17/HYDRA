@@ -2,9 +2,9 @@
 
 ## Current Status
 
-Completed inline profiling of HYDRA 100M training. Key bottlenecks and optimization opportunities identified.
+Inline profiling of HYDRA 100M training complete. Copy overhead (`aten::copy_`) investigated and found to be well-handled by existing code.
 
-## Profiling Results (100M Model, batch=4, seq=1024)
+## Key Profiling Results (100M Model)
 
 ### Time Breakdown
 - **Forward pass**: ~35% of step time (18ms)
@@ -18,38 +18,36 @@ Completed inline profiling of HYDRA 100M training. Key bottlenecks and optimizat
 - Per-layer activations: ~640-650MB each (8 layers)
 - Loss computation: +1.2GB (logits materialized)
 - Peak during backward: ~5.4GB
-- Final after optimizer: ~1.2GB
 
-### Top GPU Bottlenecks (by time)
+### Top GPU Bottlenecks
 1. **Matrix multiply (aten::mm)**: 36% - cuBLAS optimized, no action needed
-2. **aten::copy_**: 19% - Memory copies, possible layout inefficiency
-3. **aten::add_/fill_**: 13% each - Elementwise ops, fusion candidates
-4. **FusedSwiGLU**: 2.7% forward, 2.7% backward - Already fused
-5. **LigerCrossEntropy**: 0.7% forward - Efficient chunked CE working
+2. **Dynamic routing** saves 21% compute vs static routing
+3. **SDPA/Flash Attention** handles GQA efficiently
 
-### Key Findings
-1. **Dynamic routing saves 21% compute** - MoD+MoR gives significant speedup over static routing
-2. **Layer 0 attention dominates** (25% of forward) - First block runs 40x longer than others (warm-up effect)
-3. **Memory copies (12K+ calls)** - Excessive `aten::copy_` and `aten::to` operations
-4. **Log softmax backward** is 27% of backward pass - From cross-entropy
+### Copy Overhead Investigation (RESOLVED)
+The 19% `aten::copy_` time was investigated:
+- **Non-contiguous Q/K slices**: Handled efficiently by `OptimizedConvSequence` (5.6% overhead for explicit pre-contiguous, so leaving as-is is faster)
+- **Value shift operations**: Only 0.02ms per attention call (negligible)
+- **Main sources**: Optimizer state updates and necessary backward pass copies
 
-### Optimization Opportunities
-1. **Memory**: Gradient checkpointing already enabled (every 2 layers)
-2. **Memory**: Chunked CE already active - working correctly
-3. **Speed**: CUDA graphs fail due to dynamic routing - need `--static_routing_mode`
-4. **Speed**: torch.compile active with `max-autotune-no-cudagraphs`
-5. **Investigate**: High copy_ overhead - check for unnecessary tensor copies
+**Conclusion**: Copy overhead is well-optimized; no changes needed.
 
-## Profiling Scripts Added
+## Optimization Opportunities Already Implemented
+- Gradient checkpointing (every 2 layers)
+- Chunked cross-entropy (Liger fused CE)
+- Fused QKV projection
+- torch.compile with `max-autotune-no-cudagraphs`
+- Flash Attention via SDPA
+
+## Profiling Scripts
 - `diagnostics/profile_100m_training.py` - Basic profiling
-- `diagnostics/profile_100m_detailed.py` - Module-level breakdown with hooks
-- `diagnostics/profile_100m_trace.json` - Chrome trace (load in chrome://tracing)
-- `diagnostics/profile_100m_real_training.json` - Actual training trace
-
-## Known Issue
-Coverage reporting (`--cov`) causes torch reimport error. Tests run fine without coverage flags.
+- `diagnostics/profile_100m_detailed.py` - Module-level breakdown
+- `diagnostics/profile_copy_operations.py` - Copy hotspot investigation
+- `diagnostics/benchmark_contiguity.py` - Contiguity impact
+- `diagnostics/profile_value_shift.py` - Value shift alternatives
+- `diagnostics/profile_100m_trace.json` - Chrome trace
 
 ## Next Steps
-1. Investigate `aten::copy_` hotspot - may indicate tensor layout issues
-2. Consider attention mechanism optimizations (layer 0 is slowest)
-3. Profile at 500M/1B to see if patterns scale
+1. **Profile at larger scales** (500M/1B) to see if patterns hold
+2. **Static routing mode** could enable CUDA graphs for further speedup
+3. **Attention layer 0** runs 40x longer than others on first call (JIT warmup) - not a real bottleneck
