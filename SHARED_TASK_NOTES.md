@@ -2,17 +2,10 @@
 
 ## Current Status
 
-`tests/test_gradients.py` created with 23 passing tests covering all 4 functions in `hydra/training/gradients.py`:
+Task complete. `tests/test_gradients.py` has 23 passing tests covering all functions in `hydra/training/gradients.py`.
 
-- `skip_update_for_nonfinite_gradients` - 3 tests
-- `reset_optimizer_moments_for_gradient_spike` - 6 tests
-- `maybe_prepare_halt_on_spike` - 4 tests
-- `log_gradient_pathology_diagnostic` - 10 tests
+Verified on 2026-01-11: `pytest tests/test_gradients.py -v` passes all 23 tests.
 
 ## Known Issue
 
 Coverage reporting (`--cov`) causes torch reimport error with conftest.py. This is a pytest-cov plugin issue, not a test issue. Tests run fine without coverage flags.
-
-## Next Steps
-
-None - gradients.py testing is complete.
