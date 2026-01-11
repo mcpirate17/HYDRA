@@ -102,6 +102,8 @@ recover_venv_complete.sh
 
 # Diagnostics output (keep scripts in diagnostics/, ignore output)
 diagnostics/output/
+diagnostics/profile_*.json
+diagnostics/*_trace.json
 
 # Nested benchmark results (keep canonical benchmark_results.json only)
 # Already partially covered, but be explicit:
