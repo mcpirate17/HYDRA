@@ -667,6 +667,11 @@ def _add_moe_args(parser: argparse.ArgumentParser) -> None:
         default=1.0,
         help="Weight decay multiplier for MoE experts",
     )
+    parser.add_argument(
+        "--moe_reset_optimizer_state",
+        action="store_true",
+        help="Reset optimizer moments for MoE parameters on resume (fixes gradient scale mismatch)",
+    )
 
 
 def _add_experimental_args(parser: argparse.ArgumentParser) -> None:

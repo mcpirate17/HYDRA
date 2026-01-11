@@ -528,35 +528,33 @@ class MoEDispatcher(nn.Module):
         device = x.device
         dtype = x.dtype
         
-        # For compile compatibility, we use a loop over experts
-        # but with tensor masking (no Python-level token loops)
+        # Flatten for efficient gather/scatter
+        x_flat = x.view(B * L, D)  # [N, D]
+        expert_indices_flat = expert_indices.view(B * L, self.top_k)  # [N, top_k]
+        expert_weights_flat = expert_weights.view(B * L, self.top_k)  # [N, top_k]
         
         # Initialize output
-        output = torch.zeros(B, L, D, device=device, dtype=dtype)
+        output_flat = torch.zeros(B * L, D, device=device, dtype=dtype)
         
         # Track total tokens processed
         self._tokens_total = torch.tensor(B * L * self.top_k, device=device)
         self._tokens_dropped = torch.tensor(0, device=device)
         
-        # Process each expert
+        # Process each expert - only selected tokens go through each expert
         for expert_idx in range(self.num_experts):
             expert = experts[expert_idx]
             
             # Find tokens assigned to this expert (across all top-k slots)
-            # expert_indices: [B, L, top_k]
-            # mask: [B, L, top_k] - True where this expert is selected
-            mask = expert_indices == expert_idx  # [B, L, top_k]
+            # expert_indices_flat: [N, top_k]
+            # mask: [N, top_k] - True where this expert is selected
+            mask = expert_indices_flat == expert_idx  # [N, top_k]
             
-            if not mask.any():
-                continue
-            
-            # Sum of weights for this expert across all slots where it's selected
-            # This handles the case where same expert is selected in multiple slots
-            weights_for_expert = expert_weights * mask.float()  # [B, L, top_k]
-            token_weights = weights_for_expert.sum(dim=-1)  # [B, L]
+            # Get weights for this expert
+            weights_for_expert = expert_weights_flat * mask.float()  # [N, top_k]
+            token_weights = weights_for_expert.sum(dim=-1)  # [N]
             
             # Mask of tokens that have non-zero weight for this expert
-            token_mask = token_weights > 0  # [B, L]
+            token_mask = token_weights > 0  # [N]
             
             if not token_mask.any():
                 continue
@@ -568,22 +566,34 @@ class MoEDispatcher(nn.Module):
                 n_selected = token_mask.sum().item()
                 if n_selected > capacity:
                     # Drop excess tokens (keep first `capacity` in flat order)
-                    flat_mask = token_mask.view(-1)
-                    selected_positions = flat_mask.nonzero(as_tuple=True)[0]
+                    selected_positions = token_mask.nonzero(as_tuple=True)[0]
                     drop_positions = selected_positions[capacity:]
-                    flat_mask[drop_positions] = False
-                    token_mask = flat_mask.view(B, L)
+                    token_mask = token_mask.clone()
+                    token_mask[drop_positions] = False
+                    token_weights = token_weights * token_mask.float()
                     self._tokens_dropped = self._tokens_dropped + (n_selected - capacity)
             
-            # Gather tokens for this expert
-            # We process all tokens but mask the output
-            expert_input = x  # [B, L, D]
-            expert_output = expert(expert_input)  # [B, L, D]
+            # CRITICAL FIX: Only process selected tokens through expert
+            # This prevents gradient explosion from computing all tokens through all experts
+            selected_indices = token_mask.nonzero(as_tuple=True)[0]  # [M]
             
-            # Weighted addition to output (only for selected tokens)
-            output = output + expert_output * token_weights.unsqueeze(-1)
+            if selected_indices.numel() == 0:
+                continue
+            
+            # Gather selected tokens
+            expert_input = x_flat[selected_indices]  # [M, D]
+            
+            # Process through expert (only selected tokens)
+            expert_output = expert(expert_input)  # [M, D]
+            
+            # Scale by routing weights
+            selected_weights = token_weights[selected_indices].unsqueeze(-1)  # [M, 1]
+            scaled_output = expert_output * selected_weights  # [M, D]
+            
+            # Scatter back to output
+            output_flat.index_add_(0, selected_indices, scaled_output)
         
-        return output
+        return output_flat.view(B, L, D)
     
     @torch.compiler.disable  
     def get_dispatch_stats(self) -> Dict[str, Any]:

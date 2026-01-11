@@ -160,6 +160,7 @@ class TrainingConfig:
     moe_router_lr_scale: float = 3.0  # LR multiplier for router/gate params (routers need faster learning)
     moe_lr_rewarmup_steps: int = 0    # Steps to re-warmup LR after mid-run optimizer reset (0=disabled)
     moe_expert_weight_decay_scale: float = 3.0  # WD multiplier for experts (prevents weight explosion)
+    moe_reset_optimizer_state: bool = False  # Reset optimizer moments for MoE params on resume
 
     # Model config
     dim: int = 768
@@ -721,6 +722,7 @@ def build_config_from_args(
         moe_router_lr_scale=getattr(args, "moe_router_lr_scale", 1.0),
         moe_lr_rewarmup_steps=getattr(args, "moe_lr_rewarmup_steps", 0),
         moe_expert_weight_decay_scale=getattr(args, "moe_expert_weight_decay_scale", 1.0),
+        moe_reset_optimizer_state=getattr(args, "moe_reset_optimizer_state", False),
     )
 
 
