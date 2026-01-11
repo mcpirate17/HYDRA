@@ -141,13 +141,15 @@ Inside `forward()` or compiled regions:
 
 ## Model Sizes
 
-| Variant | Params | Dim | Blocks × Rec | Peak VRAM |
-|---------|--------|-----|--------------|-----------|
+| Variant | Params | Dim | Blocks × Rec | Peak VRAM* |
+|---------|--------|-----|--------------|------------|
 | debug | ~33M | 512 | 2 × 2 | ~4GB |
-| 100M | ~104M | 768 | 8 × 4 | ~14GB |
-| 250M | ~198M | 1024 | 10 × 4 | ~18GB |
-| 500M | ~426M | 1280 | 16 × 4 | ~22GB |
-| 1B | ~973M | 1792 | 20 × 4 | ~29GB |
+| 100M | ~220M | 768 | 8 × 4 | ~8GB |
+| 250M | ~250M | 1024 | 10 × 4 | ~9GB |
+| 500M | ~490M | 1792 | 14 × 4 | ~11GB |
+| 1B | ~1000M | 1792 | 20 × 4 | ~16GB |
+
+*Peak VRAM with all optimizations: gradient checkpointing (every 2 layers), 8-bit Adam, chunked CE, bfloat16. Without optimizations, expect ~30-50% higher.
 
 For 750M+ models: `--8bit_adam --checkpoint_every 1` are essential.
 
