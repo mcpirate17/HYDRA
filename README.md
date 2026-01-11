@@ -652,9 +652,112 @@ HYDRA/
 │   └── variants.yaml        # Model variant definitions
 ├── reports/                 # Generated analysis reports
 ├── checkpoints/             # Training checkpoints (hydra_{model_size}_*.pt)
+│   └── training.db          # SQLite metrics database
 ├── README.md                # This file
 ├── pytest.ini               # Test configuration
 └── requirements.txt         # Dependencies
+```
+
+---
+
+## 📊 Training Metrics Database
+
+HYDRA maintains a SQLite database (`checkpoints/training.db`) for tracking training metrics across runs. This enables cross-run analysis, trend visualization, and training continuity.
+
+### Database Architecture
+
+The database uses a two-phase workflow optimized for batch training:
+
+1. **During training**: Metrics are logged to JSON files (fast, append-only)
+2. **After training**: JSON is loaded into SQLite (queryable, cross-run analysis)
+
+### Database Schema
+
+| Table | Description | Key Fields |
+|-------|-------------|------------|
+| `models` | Model metadata | `model_id`, `params_millions`, `architecture_json` |
+| `runs` | Training run summaries | `run_id`, `model_id`, `start_step`, `end_step`, `best_loss`, `config_json` |
+| `steps` | Per-step metrics | `step`, `loss_total`, `loss_ce`, `loss_aux`, `lr`, `grad_norm`, `ema_short/medium/long` |
+| `routing_mod` | MoD stats per layer | `layer`, `selected_frac`, `compute_savings_pct`, `probs_mean/std` |
+| `routing_mor` | MoR stats per layer | `layer`, `avg_depth`, `expected_depth`, `depth_histogram` |
+| `routing_moe` | MoE routing metrics | `entropy`, `divergence`, `util_expert_0/1/2/3` |
+| `adaptive_lr` | LR scheduler state | `loss_ema_short/long`, `patience_counter`, `cooldown_triggered` |
+
+### Data Flow
+
+```
+Training Loop
+     │
+     ├─[every 100 steps]─► _log_layer_diagnostics() ─► _diagnostics_data (list)
+     │                                                        │
+     ├─[periodically]────► _save_diagnostics() ─────► diagnostics_{run_id}.json
+     │                                                        │
+     └─[training end]────► _update_training_db() ───► training.db (SQLite)
+                                                              │
+                           TrainingDB.load_diagnostics_json()─┘
+```
+
+### Multi-Scale EMA Tracking
+
+The database tracks loss with three EMA windows for different analysis timescales:
+
+| EMA Type | Alpha | Window | Use Case |
+|----------|-------|--------|----------|
+| `ema_short` | 0.99 | ~100 steps | Recent trend, spike detection |
+| `ema_medium` | 0.999 | ~1K steps | Session-level progress |
+| `ema_long` | 0.9999 | ~10K steps | Cross-run trend analysis |
+
+### Query Scripts
+
+```bash
+# Query model stats
+python scripts/query_training_db.py --model 500m --stats
+
+# View loss milestones (every 10K steps)
+python scripts/query_training_db.py --model 500m --milestones
+
+# View multi-scale EMA series
+python scripts/query_training_db.py --model 500m --ema --start 100000
+
+# View run history
+python scripts/query_training_db.py --model 500m --runs
+```
+
+### Backfill from JSON
+
+To rebuild the database from existing diagnostics files:
+
+```bash
+# Build for default model (500m)
+python scripts/build_training_db.py
+
+# Build for specific model
+python scripts/build_training_db.py --model-id 1b
+
+# Custom database location
+python scripts/build_training_db.py --db-path /path/to/training.db
+```
+
+### Programmatic Access
+
+```python
+from hydra.training.db import TrainingDB
+
+db = TrainingDB()  # Uses default: checkpoints/training.db
+
+# Get model stats
+stats = db.get_model_stats("500m")
+print(f"Steps: {stats['step_count']:,}, Best loss: {stats['best_loss']:.4f}")
+
+# Get loss milestones
+milestones = db.get_loss_milestones("500m", milestone_interval=10000)
+
+# Get multi-scale EMA series for plotting
+ema = db.get_ema_series("500m", start_step=100000)
+
+# Resume with latest EMA state
+latest_step = db.get_latest_step("500m")
+ema_short, ema_medium, ema_long = db.get_latest_ema("500m")
 ```
 
 ---

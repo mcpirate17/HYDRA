@@ -89,7 +89,8 @@ source /home/tim/venvs/llm/bin/activate && python diagnostics/moe_specialization
 - `trainer.py` - Training entrypoint (CLI)
 - `tests/` - Test suite
 - `diagnostics/` - Diagnostic and benchmark scripts (not discovered by pytest)
-- `checkpoints/` - Training checkpoints (`hydra_{model_size}_*.pt`)
+- `scripts/` - Utility scripts (query_training_db.py, build_training_db.py, etc.)
+- `checkpoints/` - Training checkpoints (`hydra_{model_size}_*.pt`) and `training.db`
 
 ### Key Components
 
@@ -182,3 +183,52 @@ Use `HYDRA_DISABLE_*` variants to force-disable specific kernels for debugging.
 | `--moe_num_experts N` | Number of expert FFNs (default: 4) |
 | `--8bit_adam` | Use 8-bit Adam optimizer (essential for 750M+) |
 | `--experimental_cuda_graphs` | Enable CUDA graphs (requires static routing) |
+
+## Training Metrics Database
+
+Training metrics are stored in SQLite (`checkpoints/training.db`) for cross-run analysis.
+
+### Data Flow
+1. **During training**: Metrics collected every 100 steps → `_diagnostics_data` list
+2. **Periodically**: Saved to JSON (`checkpoints/diagnostics_{run_id}.json`)
+3. **Training end**: `_update_training_db()` loads JSON into SQLite via `TrainingDB.load_diagnostics_json()`
+
+### Database Tables
+| Table | Purpose |
+|-------|---------|
+| `models` | Model metadata (id, params, architecture) |
+| `runs` | Run summaries (start/end step, best loss, config) |
+| `steps` | Per-step metrics with multi-scale EMA |
+| `routing_mod` | MoD stats per layer (selected_frac, compute_savings) |
+| `routing_mor` | MoR stats per layer (avg_depth, expected_depth) |
+| `routing_moe` | MoE metrics (entropy, divergence, utilization) |
+| `adaptive_lr` | LR scheduler state |
+
+### Key Files
+- `hydra/training/db.py` - `TrainingDB` class with schema and query methods
+- `hydra/training/trainer.py:_log_layer_diagnostics()` - Collects routing stats every 100 steps
+- `hydra/training/trainer.py:_update_training_db()` - Loads JSON to DB at training end
+- `scripts/build_training_db.py` - Backfill DB from existing JSON files
+- `scripts/query_training_db.py` - Query DB for analysis
+
+### Query Commands
+```bash
+# Model stats
+source /home/tim/venvs/llm/bin/activate && python scripts/query_training_db.py --model 500m --stats
+
+# Loss milestones
+source /home/tim/venvs/llm/bin/activate && python scripts/query_training_db.py --model 500m --milestones
+
+# Multi-scale EMA
+source /home/tim/venvs/llm/bin/activate && python scripts/query_training_db.py --model 500m --ema --start 100000
+
+# Rebuild DB from JSON
+source /home/tim/venvs/llm/bin/activate && python scripts/build_training_db.py --model-id 500m
+```
+
+### Multi-Scale EMA
+| EMA | Alpha | Window | Use |
+|-----|-------|--------|-----|
+| `ema_short` | 0.99 | ~100 steps | Spike detection |
+| `ema_medium` | 0.999 | ~1K steps | Session progress |
+| `ema_long` | 0.9999 | ~10K steps | Cross-run trends |
