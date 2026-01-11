@@ -286,6 +286,19 @@ class Trainer:
                 config.mod_mor_n_heads = self._checkpoint_config["mod_mor_n_heads"]
             if "mod_mor_n_kv_heads" in self._checkpoint_config:
                 config.mod_mor_n_kv_heads = self._checkpoint_config["mod_mor_n_kv_heads"]
+            # MoE configuration MUST be restored from checkpoint to ensure model architecture matches
+            # Without this, resuming a MoE checkpoint without --moe flag builds a non-MoE model
+            if "moe_enabled" in self._checkpoint_config and self._checkpoint_config["moe_enabled"]:
+                config.moe_enabled = True
+                config.moe_num_experts = self._checkpoint_config.get("moe_num_experts", config.moe_num_experts)
+                config.moe_num_layers = self._checkpoint_config.get("moe_num_layers", config.moe_num_layers)
+                config.moe_top_k = self._checkpoint_config.get("moe_top_k", config.moe_top_k)
+                self.logger.info(f"MoE config restored from checkpoint: {config.moe_num_experts} experts, {config.moe_num_layers} layers")
+            # Optimizer type MUST be restored from checkpoint to load state correctly
+            if "use_8bit_adam" in self._checkpoint_config:
+                config.use_8bit_adam = self._checkpoint_config["use_8bit_adam"]
+                if config.use_8bit_adam:
+                    self.logger.info("Optimizer restored from checkpoint: 8-bit Adam")
             # NOTE: attention_backend is NOT restored from checkpoint - use config/CLI value
             # This allows switching backends on resume (e.g., la3 -> ccgqa)
             # Preserve run_id from checkpoint for continuity of diagnostics/logs
@@ -395,6 +408,14 @@ class Trainer:
             "mod_capacity",
             "vocab_size",
             "mor_adaptive",
+            # MoE architecture keys - critical for resume
+            "moe_enabled",
+            "moe_num_experts",
+            "moe_num_layers",
+            "moe_top_k",
+            # Optimizer type - critical for state loading
+            "use_8bit_adam",
+            "use_adafactor",
         ]
         for key in arch_keys:
             if key in ckpt_config:
@@ -819,6 +840,68 @@ class Trainer:
         self.logger.info(f"Tokens per step: {self._tokens_per_step:,}")
         self.logger.info("Dataset ready!")
 
+    def _reset_moe_optimizer_state(self) -> None:
+        """Reset optimizer moments (exp_avg, exp_avg_sq) for MoE parameters.
+        
+        This fixes gradient scale mismatch after code changes (e.g., MoE dispatcher fix).
+        The Adam/AdamW momentum and variance estimates learned under the old gradient
+        flow and need to re-adapt to the corrected gradients.
+        """
+        # Check moe_layers on unwrapped model (for detection)
+        base_model = self.model
+        if hasattr(base_model, "_orig_mod"):
+            base_model = base_model._orig_mod
+        
+        if not hasattr(base_model, "moe_layers") or len(base_model.moe_layers) == 0:
+            self.logger.info("  No MoE layers found, skipping optimizer state reset")
+            return
+        
+        # But use self.model for parameter iteration (optimizer was built with these)
+        # Collect MoE parameter names (not ids) since ids differ between wrapped/unwrapped
+        moe_param_names = set()
+        for moe_layer in base_model.moe_layers:
+            for name, _ in moe_layer.named_parameters():
+                moe_param_names.add(name)
+        
+        # Match by name pattern in model's parameters 
+        moe_params = []
+        for name, param in self.model.named_parameters():
+            # Check if this param is from an MoE layer (moe_layers.X.*)
+            if "moe_layers" in name:
+                moe_params.append(param)
+        
+        # Reset optimizer state for MoE parameters
+        reset_count = 0
+        for p in moe_params:
+            state = self.optimizer.state.get(p)
+            if state is None:
+                continue
+            # Reset Adam moments
+            reset_this = False
+            if "exp_avg" in state and torch.is_tensor(state["exp_avg"]):
+                state["exp_avg"].zero_()
+                reset_this = True
+            if "exp_avg_sq" in state and torch.is_tensor(state["exp_avg_sq"]):
+                state["exp_avg_sq"].zero_()
+            # Also reset AMSGrad max variance if present
+            if "max_exp_avg_sq" in state and torch.is_tensor(state["max_exp_avg_sq"]):
+                state["max_exp_avg_sq"].zero_()
+            # For 8-bit Adam, reset quantized state
+            if "state1" in state and torch.is_tensor(state["state1"]):
+                state["state1"].zero_()
+                reset_this = True
+            if "state2" in state and torch.is_tensor(state["state2"]):
+                state["state2"].zero_()
+            if reset_this:
+                reset_count += 1
+        
+        self.logger.info("=" * 60)
+        self.logger.info("🔧 MoE OPTIMIZER STATE RESET")
+        self.logger.info("=" * 60)
+        self.logger.info(f"  Reset Adam moments for {reset_count} MoE parameters")
+        self.logger.info("  Gradient scale will re-adapt over ~100-500 steps")
+        self.logger.info("=" * 60)
+
     def _load_checkpoint(self, checkpoint_path: str) -> None:
         self.logger.info(f"\n{'='*70}")
         self.logger.info(f"RESUMING FROM CHECKPOINT: {checkpoint_path}")
@@ -1100,6 +1183,11 @@ class Trainer:
                 self.logger.info(f"  Expert LR scale: {self._expert_lr_scale}x (stabilize upcycled experts)")
                 self.logger.info(f"  Router LR scale: {self._router_lr_scale}x (accelerate router learning)")
             self.logger.info("=" * 60)
+        
+        # MoE optimizer state reset (fixes gradient scale mismatch after code changes)
+        # This clears Adam moments for MoE parameters so they re-adapt to correct gradient flow
+        if getattr(self.config, "moe_reset_optimizer_state", False):
+            self._reset_moe_optimizer_state()
         
         # Apply MoE expert diversity noise post-load to break symmetry on resumed checkpoints
         # This is critical for identity-init MoE that hasn't specialized yet
@@ -2489,7 +2577,17 @@ class Trainer:
                         wandb_payload["moe_aux_loss"] = moe_val
                     wandb_mod.log(wandb_payload)
                 if use_mod_mor and step % 100 == 0:
-                    self._log_layer_diagnostics(step, accum_loss, lr, grad_norm, ce_step=accum_ce_f)
+                    # Compute VRAM for dashboard
+                    _vram_gb = 0.0
+                    if _track_peak_vram:
+                        try:
+                            _vram_gb = float(torch.cuda.max_memory_allocated(device=_cuda_device_idx)) / (1024.0 ** 3)
+                        except Exception:
+                            pass
+                    self._log_layer_diagnostics(
+                        step, accum_loss, lr, grad_norm, ce_step=accum_ce_f,
+                        tokens_per_sec=float(tps), vram_gb=_vram_gb
+                    )
             
             # MoE divergence tracking (optional, adds CPU overhead)
             if (self.config.moe_enabled and 
@@ -2586,7 +2684,8 @@ class Trainer:
         return metrics
 
     def _log_layer_diagnostics(
-        self, step: int, loss: float, lr: float, grad_norm: float, *, ce_step: float
+        self, step: int, loss: float, lr: float, grad_norm: float, *, ce_step: float,
+        tokens_per_sec: float = 0.0, vram_gb: float = 0.0
     ) -> None:
         model = self.model
         if hasattr(model, "_orig_mod"):
@@ -2611,6 +2710,11 @@ class Trainer:
             "lr": lr,
             "grad_norm": grad_norm,
             "grad_norm_pre_clip": getattr(self, "_last_pre_clip_norm", grad_norm),  # Raw norm before clipping
+            # Performance metrics for dashboard
+            "tokens_per_sec": tokens_per_sec,
+            "vram_gb": vram_gb,
+            "batch_size": self.config.batch_size,
+            "seq_len": self._current_seq_len,
             "mod_layers": [],
             "mor_layers": [],
         }

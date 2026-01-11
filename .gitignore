@@ -115,3 +115,4 @@ hydra/attention/backends/*/docs/profile_results.json
 
 # Full benchmark logs
 hydra/attention/backends/*/full_benchmark.log
+dashboard/frontend/node_modules/

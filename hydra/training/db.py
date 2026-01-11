@@ -41,6 +41,11 @@ class StepRecord:
     ema_short: float = 0.0
     ema_medium: float = 0.0
     ema_long: float = 0.0
+    # Performance metrics (for dashboard)
+    tokens_per_sec: float = 0.0
+    vram_gb: float = 0.0
+    batch_size: int = 0
+    seq_len: int = 0
 
 
 class TrainingDB:
@@ -125,6 +130,10 @@ class TrainingDB:
                     ema_short REAL,
                     ema_medium REAL,
                     ema_long REAL,
+                    tokens_per_sec REAL,
+                    vram_gb REAL,
+                    batch_size INTEGER,
+                    seq_len INTEGER,
                     PRIMARY KEY (model_id, step),
                     FOREIGN KEY (run_id) REFERENCES runs(run_id)
                 );
@@ -187,7 +196,25 @@ class TrainingDB:
                 CREATE INDEX IF NOT EXISTS idx_steps_run ON steps(run_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_model ON runs(model_id);
             """)
-    
+        # Run migrations for existing databases
+        self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        """Add new columns to existing tables (safe for fresh DBs)."""
+        new_columns = [
+            ("steps", "tokens_per_sec", "REAL DEFAULT 0"),
+            ("steps", "vram_gb", "REAL DEFAULT 0"),
+            ("steps", "batch_size", "INTEGER DEFAULT 0"),
+            ("steps", "seq_len", "INTEGER DEFAULT 0"),
+        ]
+        with self._conn() as conn:
+            for table, column, col_type in new_columns:
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+                except sqlite3.OperationalError:
+                    # Column already exists, ignore
+                    pass
+
     def ensure_model(self, model_id: str, name: str = None, params_millions: float = None) -> None:
         """Ensure a model exists in the database."""
         with self._conn() as conn:
@@ -230,14 +257,17 @@ class TrainingDB:
                 INSERT OR REPLACE INTO steps
                 (step, run_id, model_id, timestamp, loss_total, loss_ce, loss_aux,
                  loss_ponder, loss_advantage, lr, grad_norm, grad_norm_pre_clip,
-                 ema_short, ema_medium, ema_long)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ema_short, ema_medium, ema_long, tokens_per_sec, vram_gb,
+                 batch_size, seq_len)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.step, record.run_id, record.model_id, record.timestamp,
                 record.loss_total, record.loss_ce, record.loss_aux,
                 record.loss_ponder, record.loss_advantage,
                 record.lr, record.grad_norm, record.grad_norm_pre_clip,
-                record.ema_short, record.ema_medium, record.ema_long
+                record.ema_short, record.ema_medium, record.ema_long,
+                record.tokens_per_sec, record.vram_gb,
+                record.batch_size, record.seq_len
             ))
     
     def insert_steps_batch(self, records: List[StepRecord]) -> None:
@@ -249,14 +279,17 @@ class TrainingDB:
                 INSERT OR REPLACE INTO steps
                 (step, run_id, model_id, timestamp, loss_total, loss_ce, loss_aux,
                  loss_ponder, loss_advantage, lr, grad_norm, grad_norm_pre_clip,
-                 ema_short, ema_medium, ema_long)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ema_short, ema_medium, ema_long, tokens_per_sec, vram_gb,
+                 batch_size, seq_len)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, [
                 (r.step, r.run_id, r.model_id, r.timestamp,
                  r.loss_total, r.loss_ce, r.loss_aux,
                  r.loss_ponder, r.loss_advantage,
                  r.lr, r.grad_norm, r.grad_norm_pre_clip,
-                 r.ema_short, r.ema_medium, r.ema_long)
+                 r.ema_short, r.ema_medium, r.ema_long,
+                 r.tokens_per_sec, r.vram_gb,
+                 r.batch_size, r.seq_len)
                 for r in records
             ])
     
@@ -516,6 +549,10 @@ class TrainingDB:
                 ema_short=ema_short,
                 ema_medium=ema_medium,
                 ema_long=ema_long,
+                tokens_per_sec=record.get("tokens_per_sec", 0.0),
+                vram_gb=record.get("vram_gb", 0.0),
+                batch_size=record.get("batch_size", 0),
+                seq_len=record.get("seq_len", 0),
             ))
             
             # MoD routing
