@@ -39,11 +39,11 @@ tensorboard/
 outputs/
 reports/
 
-# Data directories
-data/
-datasets/
-filtered_data/
-raw_data/
+# Data directories (root level only, not hydra/data/)
+/data/
+/datasets/
+/filtered_data/
+/raw_data/
 
 # Virtual environments
 .venv/
