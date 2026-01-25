@@ -300,9 +300,9 @@ class TestInitialization:
         norms = sphere_module.basis.norm(dim=-1)
         assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
 
-    def test_alpha_initialized_to_zero(self, sphere_module):
-        """Test that residual_alpha starts at 0."""
-        assert sphere_module.residual_alpha.item() == 0.0
+    def test_alpha_initialized_to_small_value(self, sphere_module):
+        """Test that residual_alpha starts at a small value (0.01)."""
+        assert sphere_module.residual_alpha.item() == pytest.approx(0.01, abs=1e-5)
 
     def test_invalid_manifold_type_raises(self):
         """Test that invalid manifold type raises error."""
