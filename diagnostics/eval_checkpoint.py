@@ -117,9 +117,10 @@ def generate_text(
     temperature: float = 0.8,
     top_k: int = 50,
     top_p: float = 0.9,
+    repetition_penalty: float = 1.2,
     device: str = "cuda",
 ) -> str:
-    """Generate text from a prompt."""
+    """Generate text from a prompt with repetition penalty."""
     model.eval()
     
     # Tokenize prompt
@@ -134,6 +135,16 @@ def generate_text(
             
             # Get next token logits
             next_logits = logits[:, -1, :] / temperature
+            
+            # Apply repetition penalty
+            if repetition_penalty != 1.0:
+                for token_id in set(generated[0].tolist()):
+                    # If score < 0 then repetition penalty has to be multiplied
+                    # to reduce probability; if score > 0 it has to be divided
+                    if next_logits[0, token_id] < 0:
+                        next_logits[0, token_id] *= repetition_penalty
+                    else:
+                        next_logits[0, token_id] /= repetition_penalty
             
             # Top-k filtering
             if top_k > 0:
@@ -202,6 +213,7 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
     parser.add_argument("--top-k", type=int, default=50, help="Top-k sampling")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p (nucleus) sampling")
+    parser.add_argument("--repetition-penalty", type=float, default=1.2, help="Repetition penalty (1.0 = no penalty)")
     parser.add_argument("--eval-loss", action="store_true", help="Compute eval loss on sample texts")
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
     args = parser.parse_args()
@@ -226,6 +238,8 @@ def main():
         "The scientist discovered that",
         "Once upon a time, there was",
         "The future of artificial intelligence",
+        "Write a Python function to calculate fibonacci numbers:",
+        "Solve this math problem: If x + 5 = 12, then x =",
     ]
     
     prompts = [args.prompt] if args.prompt else default_prompts[:args.samples]
@@ -249,6 +263,7 @@ def main():
                 temperature=args.temperature,
                 top_k=args.top_k,
                 top_p=args.top_p,
+                repetition_penalty=args.repetition_penalty,
                 device=args.device,
             )
             print(output)

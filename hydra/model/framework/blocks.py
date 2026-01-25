@@ -132,6 +132,11 @@ class MoDMLPWrapper(nn.Module):
         self._tokens_processed: int = 0
         self._tokens_total: int = 0
         self._last_scores: Optional[torch.Tensor] = None
+        
+        # Aggregate tracking for MoR collapse detection
+        # Tracks which tokens were selected across ALL MoR recursions
+        self._aggregate_tracking: bool = False
+        self._aggregate_selected_mask: Optional[torch.Tensor] = None
 
     def set_global_step(self, step: int):
         self._global_step.fill_(step)
@@ -254,6 +259,9 @@ class MoDMLPWrapper(nn.Module):
         self._last_probs_mean_t = probs.mean().detach()
         self._last_probs_std_t = probs.std().detach()
         self._tokens_processed = k
+        
+        # Update aggregate tracking for MoR collapse detection
+        self._update_aggregate_mask(indices, B, L, x.device)
 
         if self.aux_loss_weight > 0:
             self._aux_loss = self.mod_router.get_aux_loss()
@@ -281,6 +289,9 @@ class MoDMLPWrapper(nn.Module):
         self._last_probs_mean_t = probs.mean().detach()
         self._last_probs_std_t = probs.std().detach()
         self._tokens_processed = k
+        
+        # Update aggregate tracking for MoR collapse detection
+        self._update_aggregate_mask(indices, B, L, x.device)
 
         indices, _ = torch.sort(indices, dim=1)
         indices_exp = indices.unsqueeze(-1).expand(-1, -1, D)
@@ -301,6 +312,40 @@ class MoDMLPWrapper(nn.Module):
 
     def get_aux_loss(self) -> torch.Tensor:
         return self._aux_loss
+
+    def start_aggregate_tracking(self) -> None:
+        """Start tracking which tokens are selected across multiple calls.
+        
+        Used by MoR to track tokens selected across all recursion depths
+        for accurate collapse detection (only count tokens MoD processed).
+        """
+        self._aggregate_tracking = True
+        self._aggregate_selected_mask = None
+
+    def end_aggregate_tracking(self) -> Optional[torch.Tensor]:
+        """End aggregate tracking and return the combined mask.
+        
+        Returns:
+            Boolean mask [B, L] where True = token was selected in at least
+            one MoD call during tracking period. None if MoD was disabled.
+        """
+        self._aggregate_tracking = False
+        mask = self._aggregate_selected_mask
+        self._aggregate_selected_mask = None
+        return mask
+
+    def _update_aggregate_mask(self, indices: torch.Tensor, B: int, L: int, device: torch.device) -> None:
+        """Update aggregate mask with newly selected indices."""
+        if not self._aggregate_tracking:
+            return
+        # Create mask for this call
+        current_mask = torch.zeros(B, L, dtype=torch.bool, device=device)
+        current_mask.scatter_(1, indices, True)
+        # OR with existing aggregate
+        if self._aggregate_selected_mask is None:
+            self._aggregate_selected_mask = current_mask
+        else:
+            self._aggregate_selected_mask = self._aggregate_selected_mask | current_mask
 
     def compute_loss_aware_loss(self, token_losses: torch.Tensor) -> torch.Tensor:
         if self.loss_aware_weight <= 0:
@@ -614,12 +659,23 @@ class HydraMoRBlock(nn.Module):
 
         self._last_target_depths = depths.detach().float()
         self._last_router_probs_tensor = probs.detach()
-        self._last_router_logits = logits
-        self._last_depths = depths
-        self._last_probs = probs
+        self._last_router_logits = logits.detach()  # Detach to prevent graph accumulation
+        self._last_depths = depths.detach()         # Detach to prevent graph accumulation
+        self._last_probs = probs  # Keep gradients for compute_advantage_loss
 
         mlp = self.mod_mlp_wrapper if self.mod_mlp_wrapper is not None else self.mlp
+        
+        # Start MoD aggregate tracking if MoD is active
+        if self.mod_mlp_wrapper is not None:
+            self.mod_mlp_wrapper.start_aggregate_tracking()
+        
         output = self.mor_executor(h, depths, probs, mlp, self.norm2)
+        
+        # End tracking and store mask for collapse detection
+        if self.mod_mlp_wrapper is not None:
+            self._last_mod_selected_mask = self.mod_mlp_wrapper.end_aggregate_tracking()
+        else:
+            self._last_mod_selected_mask = None
 
         ponder_loss = self.mor_router.compute_ponder_loss(depths, probs, logits, token_losses=None, baseline=None)
 
@@ -638,9 +694,24 @@ class HydraMoRBlock(nn.Module):
         probs = self._last_probs
         n_rec = self.max_recursions
         depth_continuous = probs * (n_rec - 1)
+        
+        # Handle sequence length mismatch (can happen during reasoning steps)
+        # depth_continuous: [B, T1], token_losses: [B, T2]
+        if depth_continuous.shape[1] != token_losses.shape[1]:
+            # Use the minimum length to align
+            min_len = min(depth_continuous.shape[1], token_losses.shape[1])
+            depth_continuous = depth_continuous[:, :min_len]
+            token_losses = token_losses[:, :min_len]
+        
         advantage = baseline.compute_advantage(token_losses)
         scale = self._mor_config.advantage_loss_scale
-        return -(advantage * depth_continuous).mean() * scale
+        loss = -(advantage * depth_continuous).mean() * scale
+        
+        # Clear _last_probs after use to prevent memory leak across steps
+        # The gradient graph is kept alive until backward() completes
+        self._last_probs = None
+        
+        return loss
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.adaptive:
@@ -714,6 +785,27 @@ class HydraMoRBlock(nn.Module):
             stats["depth_std"] = depths.std().item()
             hist = torch.histc(depths, bins=self.max_recursions, min=0, max=self.max_recursions - 1)
             stats["depth_histogram"] = hist.tolist()
+            
+            # If MoD is active, compute filtered histogram for collapse detection
+            # Only count tokens that MoD actually processed
+            mod_mask = getattr(self, "_last_mod_selected_mask", None)
+            if mod_mask is not None:
+                # Filter depths to only MoD-selected tokens
+                depths_filtered = self._last_target_depths[mod_mask].flatten().float()
+                if depths_filtered.numel() > 0:
+                    hist_filtered = torch.histc(
+                        depths_filtered, bins=self.max_recursions, min=0, max=self.max_recursions - 1
+                    )
+                    stats["depth_histogram_mod_filtered"] = hist_filtered.tolist()
+                    stats["avg_depth_mod_filtered"] = depths_filtered.mean().item()
+                    stats["mod_selected_count"] = depths_filtered.numel()
+                    stats["mod_selected_ratio"] = depths_filtered.numel() / max(1, depths.numel())
+                else:
+                    # MoD skipped all tokens (edge case)
+                    stats["depth_histogram_mod_filtered"] = [0] * self.max_recursions
+                    stats["avg_depth_mod_filtered"] = 0.0
+                    stats["mod_selected_count"] = 0
+                    stats["mod_selected_ratio"] = 0.0
 
         if hasattr(self, "_recursion_tokens_processed"):
             tokens_per_recursion = self._recursion_tokens_processed

@@ -55,7 +55,11 @@ def configure_runtime() -> dict:
         LIGER_AVAILABLE,
         patch_hydra_with_liger,
     )
-    from hydra.layers import FLASH_ATTN_AVAILABLE, set_attention_backend
+    from hydra.layers import (
+        FLASH_ATTN_AVAILABLE,
+        SAGE_ATTN_AVAILABLE,
+        set_attention_backend,
+    )
 
     if LIGER_AVAILABLE:
         patch_hydra_with_liger()
@@ -63,10 +67,18 @@ def configure_runtime() -> dict:
     else:
         status["liger"] = "unavailable"
 
-    if FLASH_ATTN_AVAILABLE:
+    # Attention backend priority: Sage > Flash > SDPA
+    # Sage is 2-5x faster than Flash via INT8/FP8 quantization
+    if SAGE_ATTN_AVAILABLE:
+        set_attention_backend("sage")
+        status["sage_attn"] = "enabled"
+        status["flash_attn"] = "available (not used, sage preferred)"
+    elif FLASH_ATTN_AVAILABLE:
         set_attention_backend("flash")
+        status["sage_attn"] = "unavailable"
         status["flash_attn"] = "enabled"
     else:
+        status["sage_attn"] = "unavailable"
         status["flash_attn"] = "unavailable"
 
     return status

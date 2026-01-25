@@ -536,9 +536,9 @@ class MoEDispatcher(nn.Module):
         # Initialize output
         output_flat = torch.zeros(B * L, D, device=device, dtype=dtype)
 
-        # Track total tokens processed
-        self._tokens_total = torch.tensor(B * L * self.top_k, device=device)
-        self._tokens_dropped = torch.tensor(0, device=device)
+        # Track total tokens processed (use in-place fill_ for CUDA graph compatibility)
+        self._tokens_total.fill_(B * L * self.top_k)
+        self._tokens_dropped.fill_(0)
 
         # Process each expert - only selected tokens go through each expert
         for expert_idx in range(self.num_experts):
@@ -556,29 +556,35 @@ class MoEDispatcher(nn.Module):
             # Mask of tokens that have non-zero weight for this expert
             token_mask = token_weights > 0  # [N]
 
-            if not token_mask.any():
-                continue
-
-            # Capacity checking (if not infinite)
-            if self.capacity_factor < float("inf"):
-                expected_tokens = (B * L * self.top_k) / self.num_experts
-                capacity = int(self.capacity_factor * expected_tokens)
-                n_selected = token_mask.sum().item()
-                if n_selected > capacity:
-                    # Drop excess tokens (keep first `capacity` in flat order)
-                    selected_positions = token_mask.nonzero(as_tuple=True)[0]
-                    drop_positions = selected_positions[capacity:]
-                    token_mask = token_mask.clone()
-                    token_mask[drop_positions] = False
-                    token_weights = token_weights * token_mask.float()
-                    self._tokens_dropped = self._tokens_dropped + (n_selected - capacity)
-
             # SPARSE DISPATCH: Only process selected tokens through expert
             # This prevents massive memory usage from computing all tokens through all experts
             selected_indices = token_mask.nonzero(as_tuple=True)[0]  # [M]
-
+            
+            # Skip if no tokens for this expert (use .numel() which is compile-safe)
             if selected_indices.numel() == 0:
                 continue
+
+            # Capacity checking (if not infinite)
+            # NOTE: Must avoid .item() and .any() for CUDA graph compatibility
+            if self.capacity_factor < float("inf"):
+                expected_tokens = (B * L * self.top_k) / self.num_experts
+                capacity = int(self.capacity_factor * expected_tokens)
+                n_selected = selected_indices.numel()  # Compile-safe size query
+                
+                # Only apply dropping if over capacity
+                if n_selected > capacity:
+                    # Keep first `capacity` tokens in flat order
+                    drop_indices = selected_indices[capacity:]
+                    token_mask = token_mask.clone()
+                    token_mask[drop_indices] = False
+                    token_weights = token_weights * token_mask.float()
+                    # Track dropped tokens (in-place add for CUDA graph compatibility)
+                    self._tokens_dropped.add_(n_selected - capacity)
+                    # Re-select indices after dropping
+                    selected_indices = token_mask.nonzero(as_tuple=True)[0]
+                    
+                    if selected_indices.numel() == 0:
+                        continue
 
             # Gather selected tokens
             expert_input = x_flat[selected_indices]  # [M, D]

@@ -14,60 +14,12 @@ HYDRA uses a **SafeOptimizations** wrapper that automatically:
 
 | Optimization | CLI Flag | Default | Speedup | Status |
 |-------------|----------|---------|---------|--------|
-| Flash Attention 3 | `--experimental_fa3` | on | 15-25% | Requires FA3 package |
 | CUDA Graphs | `--experimental_cuda_graphs` | on | 5-15% | Incompatible with MoD/MoR |
 | Static Routing Mode | `--static_routing_mode` | off | Enables CUDA graphs | Stable |
 | Blackwell Tuning | `--experimental_blackwell_tuning` | on | 10-15% | RTX 50xx only |
 | Prefetch Threads | `--experimental_prefetch_threads` | 4 | 5-10% | Stable |
 | FP8 Compute | `--experimental_fp8` | off | 20-40% | Experimental |
 | Fused Backward Kernels | `--triton_kernels` | on | 10-20% | Stable |
-
----
-
-## Flash Attention 3 (FA3)
-
-### What It Does
-
-Flash Attention 3 is the next-generation fused attention kernel optimized for Hopper (H100) and Blackwell (RTX 50xx) architectures. It provides:
-- Reduced memory bandwidth through kernel fusion
-- Better SM utilization with warp specialization
-- Native FP8 support on Blackwell
-
-### Expected Speedup
-
-| GPU Architecture | Speedup vs FA2 | Notes |
-|-----------------|----------------|-------|
-| Blackwell (SM 12.0) | 20-25% | Best performance |
-| Hopper (SM 9.0) | 15-20% | Well optimized |
-| Ada (SM 8.9) | 5-10% | Limited benefit |
-| Ampere (SM 8.0) | N/A | Not supported |
-
-### CLI Flags
-
-```bash
---experimental_fa3          # Enable FA3 (default: on)
---no-experimental_fa3       # Disable FA3
-```
-
-### Known Failure Modes
-
-1. **Package Not Installed**: FA3 requires `flash-attn>=3.0`. Install with:
-   ```bash
-   pip install flash-attn --no-build-isolation
-   ```
-
-2. **Incompatible GPU**: FA3 requires Hopper+ architecture. Falls back to FA2 on older GPUs.
-
-3. **Sequence Length Limits**: Very long sequences (>32K) may hit shared memory limits.
-
-### Validation Status
-
-| Model Size | 100M | 250M | 500M | 1B |
-|-----------|------|------|------|-----|
-| Blackwell | N/A* | N/A* | N/A* | N/A* |
-| Hopper | N/A* | N/A* | N/A* | N/A* |
-
-*FA3 package not installed in current environment. Install to enable.
 
 ---
 
@@ -441,7 +393,6 @@ hook.print_summary()
 ```bash
 python trainer.py \
     --model_size 500M \
-    --experimental_fa3 \              # Enable if FA3 installed
     --no-experimental_cuda_graphs \   # Disable (incompatible with dynamic MoD/MoR)
     --experimental_blackwell_tuning \ # Enable Blackwell optimizations
     --experimental_prefetch_threads 4 \
@@ -466,7 +417,6 @@ python trainer.py \
 ```bash
 python trainer.py \
     --model_size 1B \
-    --experimental_fa3 \              # Enable if FA3 installed
     --no-experimental_cuda_graphs \   # Disable (incompatible with MoD/MoR)
     --no-experimental_blackwell_tuning \ # Not Blackwell
     --experimental_prefetch_threads 4 \
@@ -478,7 +428,6 @@ python trainer.py \
 ```bash
 python trainer.py \
     --model_size 500M \
-    --no-experimental_fa3 \           # FA3 not beneficial on Ada
     --no-experimental_cuda_graphs \   # Disable (incompatible with MoD/MoR)
     --no-experimental_blackwell_tuning \
     --experimental_prefetch_threads 4 \
@@ -518,7 +467,7 @@ python trainer.py \
 1. Check which optimizations are active:
    ```python
    # In training logs, look for:
-   # SafeOptimizations status: {'fa3': 'DISABLED', 'blackwell_tuning': 'ENABLED', ...}
+   # SafeOptimizations status: {'blackwell_tuning': 'ENABLED', 'cuda_graphs': 'DISABLED', ...}
    ```
 
 2. Verify GPU utilization:
@@ -546,6 +495,6 @@ python trainer.py \
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0.0 | 2026-01-10 | Initial SafeOptimizations system |
-| | | - FA3, CUDA Graphs, Blackwell Tuning, Prefetch, FP8 |
+| | | - CUDA Graphs, Blackwell Tuning, Prefetch, FP8 |
 | | | - PretestHook with JSON logging |
 | | | - W&B and TensorBoard integration |

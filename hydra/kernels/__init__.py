@@ -6,7 +6,7 @@ Fused GPU kernels for maximum performance on attention operations.
 Performance Hierarchy (best to worst):
 1. Transformer Engine FP8 (Hopper+ only) - Maximum TFLOPS
 2. Liger Kernels - Best memory savings, great speed
-3. Flash Attention 3 - Best for long sequences
+3. Flash Attention 2 - Best for long sequences
 4. HYDRA Triton Kernels - Good baseline with custom ops
 """
 

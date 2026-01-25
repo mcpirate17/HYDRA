@@ -463,5 +463,74 @@ class TestMoECompile:
         assert torch.isfinite(logits).all()
 
 
+# =============================================================================
+# CUDA Graph Capture Tests  
+# =============================================================================
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestMoECUDAGraphCapture:
+    """Tests for CUDA graph compatibility with MoE.
+    
+    Note: MoE is fundamentally incompatible with CUDA graphs because it uses
+    dynamic indexing (nonzero) for sparse token dispatch. The nonzero operation
+    produces variable-size outputs that cannot be captured in a static graph.
+    
+    The SafeOptimizations system correctly disables CUDA graphs when MoE is
+    enabled. See CUDA_GRAPH_ERROR_ANALYSIS.md for details.
+    """
+    
+    def test_moe_incompatible_with_cuda_graphs(self, sample_batch_cuda):
+        """Verify that SafeOptimizations correctly disables CUDA graphs for MoE.
+        
+        MoE uses nonzero() for sparse token dispatch which produces variable-size
+        outputs incompatible with CUDA graph capture.
+        """
+        from hydra.training.safe_optimizations import SafeOptimizations, OptimizationConfig
+        
+        if sample_batch_cuda is None:
+            pytest.skip("CUDA not available")
+        
+        # Config with MoE enabled
+        opt_config = OptimizationConfig(
+            enable_cuda_graphs=True,  # Request CUDA graphs
+            moe_enabled=True,
+        )
+        
+        safe_opts = SafeOptimizations(opt_config, device="cuda")
+        status = safe_opts.get_status_summary()
+        
+        # CUDA graphs should be disabled due to MoE incompatibility
+        assert status["cuda_graphs"] == "DISABLED", (
+            f"Expected CUDA graphs to be DISABLED for MoE, "
+            f"got {status['cuda_graphs']}"
+        )
+        
+        # Verify the disable reason mentions MoE or sparse dispatch
+        state = safe_opts._states["cuda_graphs"]
+        assert "MoE" in state.disable_reason or "sparse" in state.disable_reason.lower()
+    
+    def test_non_moe_allows_cuda_graphs(self, sample_batch_cuda):
+        """Verify CUDA graphs are allowed when MoE is disabled."""
+        from hydra.training.safe_optimizations import SafeOptimizations, OptimizationConfig
+        
+        if sample_batch_cuda is None:
+            pytest.skip("CUDA not available")
+        
+        # Config without MoE
+        opt_config = OptimizationConfig(
+            enable_cuda_graphs=True,
+            moe_enabled=False,
+        )
+        
+        safe_opts = SafeOptimizations(opt_config, device="cuda")
+        status = safe_opts.get_status_summary()
+        
+        # CUDA graphs should be enabled (or pretesting) without MoE
+        assert status["cuda_graphs"] in ("PRETESTING", "ENABLED"), (
+            f"Expected CUDA graphs to be PRETESTING or ENABLED without MoE, "
+            f"got {status['cuda_graphs']}"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

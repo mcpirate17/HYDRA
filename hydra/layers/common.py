@@ -31,14 +31,11 @@ try:
     from flash_attn import flash_attn_func
     import flash_attn
     FLASH_ATTN_AVAILABLE = True
-    # Parse version for FA3 features
+    # Parse version for feature detection
     _fa_ver = getattr(flash_attn, "__version__", "0.0.0")
     FLASH_ATTN_VERSION = tuple(int(x) for x in _fa_ver.split(".")[:3])
 except ImportError:
     flash_attn_func = None
-
-# Flash Attention 3 has additional optimizations (FP8 support, better perf)
-FLASH_ATTN_3_AVAILABLE = FLASH_ATTN_AVAILABLE and FLASH_ATTN_VERSION >= (3, 0, 0)
 
 XFORMERS_AVAILABLE = False
 try:
@@ -46,6 +43,22 @@ try:
     XFORMERS_AVAILABLE = True
 except ImportError:
     xops = None
+
+# Sage Attention: 2-5x faster than FlashAttention via INT8/FP8 quantization
+SAGE_ATTN_AVAILABLE = False
+SAGE_ATTN_VERSION = (0, 0, 0)
+_sage_attn_disabled = os.environ.get("HYDRA_DISABLE_SAGE", "").strip().lower() in {"1", "true", "yes"}
+if not _sage_attn_disabled:
+    try:
+        from sageattention import sageattn
+        import sageattention
+        SAGE_ATTN_AVAILABLE = True
+        _sage_ver = getattr(sageattention, "__version__", "0.0.0")
+        SAGE_ATTN_VERSION = tuple(int(x) for x in _sage_ver.split(".")[:3])
+    except ImportError:
+        sageattn = None
+else:
+    sageattn = None
 
 
 # =============================================================================
@@ -269,21 +282,34 @@ class RotaryEmbedding(nn.Module):
 
     def _init_cache(self, seq_len: int):
         """Initialize or extend the cos/sin cache."""
+        import os
         head_dim = self.head_dim
-        
+
         # Compute frequencies
         inv_freq = 1.0 / (self.base ** (torch.arange(0, head_dim, 2).float() / head_dim))
         if self.scaling_factor != 1.0:
             inv_freq = inv_freq / self.scaling_factor
-        
+
         # Compute position encodings
         t = torch.arange(seq_len, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)
-        
+
+        # MEMORY FIX: Default to bfloat16 for RoPE cache to save ~50% memory.
+        # Most training uses bf16 anyway, and precision loss is negligible for positional info.
+        rope_cache_dtype = os.environ.get("HYDRA_ROPE_CACHE_DTYPE", "bf16").strip().lower()
+        if rope_cache_dtype in {"bf16", "bfloat16"}:
+            cache_dtype = torch.bfloat16
+        elif rope_cache_dtype in {"fp16", "float16", "half"}:
+            cache_dtype = torch.float16
+        elif rope_cache_dtype in {"fp32", "float32", "float"}:
+            cache_dtype = torch.float32
+        else:
+            cache_dtype = torch.bfloat16  # Default to bf16
+
         # Cache as buffers (will move to correct device automatically)
         # Shape: [1, 1, seq_len, head_dim//2]
-        self.register_buffer("cos_cached", freqs.cos().unsqueeze(0).unsqueeze(0), persistent=False)
-        self.register_buffer("sin_cached", freqs.sin().unsqueeze(0).unsqueeze(0), persistent=False)
+        self.register_buffer("cos_cached", freqs.cos().to(cache_dtype).unsqueeze(0).unsqueeze(0), persistent=False)
+        self.register_buffer("sin_cached", freqs.sin().to(cache_dtype).unsqueeze(0).unsqueeze(0), persistent=False)
         self.max_seq_len = seq_len
 
     def extend_cache(self, seq_len: int):
@@ -342,16 +368,16 @@ class RotaryEmbedding(nn.Module):
 # FLEXIBLE ATTENTION: Backend selection for scaled dot-product attention
 # =============================================================================
 
-_ATTENTION_BACKEND = "auto"  # "auto", "flash", "xformers", "sdpa", "naive"
+_ATTENTION_BACKEND = "auto"  # "auto", "sage", "flash", "xformers", "sdpa", "naive"
 
 def set_attention_backend(backend: str):
     """Set the attention backend to use.
-    
+
     Args:
-        backend: One of "auto", "flash", "xformers", "sdpa", "naive"
+        backend: One of "auto", "sage", "flash", "xformers", "sdpa", "naive"
     """
     global _ATTENTION_BACKEND
-    valid = {"auto", "flash", "xformers", "sdpa", "naive"}
+    valid = {"auto", "sage", "flash", "xformers", "sdpa", "naive"}
     if backend not in valid:
         raise ValueError(f"Invalid backend: {backend}. Valid: {valid}")
     _ATTENTION_BACKEND = backend
@@ -369,9 +395,9 @@ def flexible_attention(
     dropout_p: float = 0.0,
 ) -> torch.Tensor:
     """Flexible attention with automatic backend selection.
-    
-    Tries backends in order: Flash Attention 2 > xFormers > PyTorch SDPA > naive
-    
+
+    Tries backends in order: Sage > Flash Attention 2 > xFormers > PyTorch SDPA > naive
+
     Args:
         q: Query tensor [B, n_heads, seq_len, head_dim]
         k: Key tensor [B, n_kv_heads, seq_len, head_dim]
@@ -379,23 +405,30 @@ def flexible_attention(
         is_causal: Whether to use causal masking
         scale: Optional attention scale (defaults to 1/sqrt(head_dim))
         dropout_p: Dropout probability (only used in training)
-    
+
     Returns:
         Output tensor [B, n_heads, seq_len, head_dim]
     """
     backend = _ATTENTION_BACKEND
     B, n_heads, seq_len, head_dim = q.shape
     n_kv_heads = k.shape[1]
-    
+
     # GQA expansion if needed
     if n_kv_heads != n_heads:
         n_groups = n_heads // n_kv_heads
         k = k.unsqueeze(2).expand(-1, -1, n_groups, -1, -1).reshape(B, n_heads, seq_len, head_dim)
         v = v.unsqueeze(2).expand(-1, -1, n_groups, -1, -1).reshape(B, n_heads, seq_len, head_dim)
-    
+
     if scale is None:
         scale = head_dim ** -0.5
-    
+
+    # Try Sage Attention (fastest, 2-5x over Flash via INT8/FP8 quantization)
+    if backend in ("auto", "sage") and SAGE_ATTN_AVAILABLE and sageattn is not None:
+        # Sage expects [B, n_heads, seq_len, head_dim] with tensor_layout="HND"
+        # Note: Sage handles scale internally, no need to pass it
+        out = sageattn(q, k, v, tensor_layout="HND", is_causal=is_causal)
+        return out
+
     # Try Flash Attention 2
     if backend in ("auto", "flash") and FLASH_ATTN_AVAILABLE and flash_attn_func is not None:
         # Flash attention expects [B, seq_len, n_heads, head_dim]
@@ -645,5 +678,9 @@ __all__ = [
     # Feature flags
     "FUSED_KERNELS_AVAILABLE",
     "FLASH_ATTN_AVAILABLE",
+    "FLASH_ATTN_VERSION",
     "XFORMERS_AVAILABLE",
+    "SAGE_ATTN_AVAILABLE",
+    "SAGE_ATTN_VERSION",
+    "sageattn",
 ]

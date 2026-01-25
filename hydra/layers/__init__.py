@@ -17,6 +17,11 @@ from .common import (
     SwiGLUMLPFused,
     RotaryEmbedding,
     get_activation,
+)
+from .manifold_connections import ManifoldConstrainedHyperConnection
+
+# Re-export common imports
+from .common import (
     # Attention
     flexible_attention,
     set_attention_backend,
@@ -33,7 +38,11 @@ from .common import (
     # Feature flags
     FUSED_KERNELS_AVAILABLE,
     FLASH_ATTN_AVAILABLE,
+    FLASH_ATTN_VERSION,
     XFORMERS_AVAILABLE,
+    SAGE_ATTN_AVAILABLE,
+    SAGE_ATTN_VERSION,
+    sageattn,
 )
 
 __all__ = [
@@ -44,6 +53,8 @@ __all__ = [
     "SwiGLUMLPFused",
     "RotaryEmbedding",
     "get_activation",
+    # Manifold connections
+    "ManifoldConstrainedHyperConnection",
     # Attention
     "flexible_attention",
     "set_attention_backend",
@@ -60,5 +71,9 @@ __all__ = [
     # Feature flags
     "FUSED_KERNELS_AVAILABLE",
     "FLASH_ATTN_AVAILABLE",
+    "FLASH_ATTN_VERSION",
     "XFORMERS_AVAILABLE",
+    "SAGE_ATTN_AVAILABLE",
+    "SAGE_ATTN_VERSION",
+    "sageattn",
 ]

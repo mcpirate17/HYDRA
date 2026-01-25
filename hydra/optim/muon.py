@@ -1,199 +1,136 @@
-from __future__ import annotations
-
-import math
-from typing import Callable, Optional
-
+"""
+Muon: Momentum Orthogonalized Optimizer.
+References: 
+- https://github.com/KellerJordan/Muon
+- https://arxiv.org/abs/2410.09331
+"""
 import torch
+import torch.distributed as dist
 
-
-def _newton_schulz_orthogonalize(
-    grad_matrix: torch.Tensor,
-    *,
-    steps: int = 5,
-    eps: float = 1e-7,
-) -> torch.Tensor:
-    """Approximate $G (G^T G)^{-1/2}$ via a Newton–Schulz quintic iteration.
-
-    This is an algorithmic implementation (no code copied) matching the common
-    Muon-style orthogonalization step described in public references.
-
-    Returns a tensor with the same shape/dtype as `grad_matrix`.
+@torch.compile
+def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 10, eps: float = 1e-7) -> torch.Tensor:
     """
-    if grad_matrix.ndim != 2:
-        raise ValueError(f"Expected 2D tensor, got shape={tuple(grad_matrix.shape)}")
-
-    original_dtype = grad_matrix.dtype
-
-    # Prefer bf16 on CUDA where supported; otherwise float32.
-    if grad_matrix.is_cuda and torch.cuda.is_bf16_supported():
-        work = grad_matrix.to(torch.bfloat16)
-    else:
-        work = grad_matrix.to(torch.float32)
-
-    # Normalize spectral norm-ish to keep iteration stable.
-    work = work / (work.norm() + eps)
-
-    transposed = False
-    if work.shape[0] > work.shape[1]:
-        work = work.mT
-        transposed = True
-
-    # Quintic iteration coefficients (commonly cited for Muon-like NS updates).
-    a, b, c = 3.4445, -4.7750, 2.0315
-
-    for _ in range(int(steps)):
-        a_mat = work @ work.mT
-        ax = a_mat @ work
-        work = a * work + b * ax + c * (a_mat @ ax)
-
-    if transposed:
-        work = work.mT
-
-    return work.to(original_dtype)
-
-
-class Muon2D(torch.optim.Optimizer):
-    """Muon-style optimizer for 2D parameters only.
-
-    Update rule (high level): momentum on gradients, then orthogonalize the
-    momentum buffer via Newton–Schulz, scale it, and apply weight decay + update.
-
-    Notes:
-    - Only parameters with `p.ndim == 2` are updated.
-    - Weight decay here is applied as an L2 term in the update (Muon-style).
+    Newton-Schulz iteration to compute the zeroth power of the matrix G.
+    Approximates UV^T where G = USV^T.
     """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    
+    # Ensure spectral norm < sqrt(4/3)
+    X /= (X.norm() + eps) 
+    
+    if G.size(0) > G.size(1):
+        X = X.T
+        
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+        
+    if G.size(0) > G.size(1):
+        X = X.T
+        
+    return X
 
-    def __init__(
-        self,
-        params,
-        *,
-        lr: float = 1e-3,
-        momentum: float = 0.95,
-        weight_decay: float = 0.0,
-        ns_steps: int = 5,
-        eps: float = 1e-7,
-        rms_scale: float = 0.2,
-    ):
-        if lr <= 0:
-            raise ValueError("lr must be positive")
-        if not (0.0 <= momentum <= 1.0):
-            raise ValueError("momentum must be in [0, 1]")
-        if weight_decay < 0:
-            raise ValueError("weight_decay must be >= 0")
-        if ns_steps <= 0:
-            raise ValueError("ns_steps must be > 0")
-        if eps <= 0:
-            raise ValueError("eps must be > 0")
-        if rms_scale <= 0:
-            raise ValueError("rms_scale must be > 0")
-
-        defaults = dict(
-            lr=lr,
-            momentum=momentum,
-            weight_decay=weight_decay,
-            ns_steps=ns_steps,
-            eps=eps,
-            rms_scale=rms_scale,
-        )
-        super().__init__(params, defaults)
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - Momentum Orthogonalized Optimizer.
+    
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-processing step.
+    This effectively whitens the updates.
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, adamw_params=None, adamw_lr=3e-4, adamw_betas=(0.9, 0.95), adamw_eps=1e-8, adamw_wd=0.01):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
+                        adamw_lr_ratio=adamw_lr/lr, 
+                        adamw_betas=adamw_betas, 
+                        adamw_eps=adamw_eps, 
+                        adamw_wd=adamw_wd)
+        
+        # Segregate params into 2D (Muon) and other (AdamW)
+        params = list(params)
+        muon_params = [p for p in params if p.ndim == 2 and p.numel() > 1024] # Heuristic: only 2D and >1k params
+        adamw_params = [p for p in params if p.ndim != 2 or p.numel() <= 1024]
+        
+        super().__init__(muon_params + adamw_params, defaults)
+        
+        # Store param groups for easy access
+        self.muon_params = set(muon_params)
+        self.adamw_params = set(adamw_params)
 
     @torch.no_grad()
-    def step(self, closure: Optional[Callable] = None):
+    def step(self, closure=None):
         loss = None
         if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+            loss = closure()
 
         for group in self.param_groups:
-            lr: float = group["lr"]
-            momentum: float = group["momentum"]
-            weight_decay: float = group["weight_decay"]
-            ns_steps: int = group["ns_steps"]
-            eps: float = group["eps"]
-            rms_scale: float = group["rms_scale"]
+            lr = group['lr']
+            momentum = group['momentum']
+            nesterov = group['nesterov']
+            ns_steps = group['ns_steps']
+            
+            # AdamW sub-parameters
+            adamw_lr = lr * group['adamw_lr_ratio']
+            beta1, beta2 = group['adamw_betas']
+            eps = group['adamw_eps']
+            wd = group['adamw_wd']
 
-            for p in group["params"]:
+            for p in group['params']:
                 if p.grad is None:
                     continue
-                if p.ndim != 2:
-                    continue
-
+                
                 grad = p.grad
                 state = self.state[p]
-                if "momentum" not in state:
-                    state["momentum"] = torch.zeros_like(p)
 
-                buf = state["momentum"]
-                buf.mul_(momentum).add_(grad)
-
-                ortho = _newton_schulz_orthogonalize(buf, steps=ns_steps, eps=eps)
-
-                # RMS matching factor
-                n, m = p.shape
-                ortho = ortho * math.sqrt(max(n, m) * rms_scale)
-
-                # Muon-style update with L2 term
-                p.add_(ortho + weight_decay * p, alpha=-lr)
+                if 'step' not in state:
+                    state['step'] = 0
+                
+                state['step'] += 1
+                
+                if p in self.adamw_params:
+                    # Standard AdamW
+                    if 'exp_avg' not in state:
+                        state['exp_avg'] = torch.zeros_like(p)
+                        state['exp_avg_sq'] = torch.zeros_like(p)
+                        
+                    exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                    
+                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                    
+                    denom = exp_avg_sq.sqrt().add_(eps)
+                    
+                    # Weight decay
+                    p.mul_(1 - adamw_lr * wd)
+                    
+                    # Update
+                    step_size = adamw_lr
+                    if state['step'] < 1000: # Simple warmup
+                         step_size *= state['step'] / 1000
+                         
+                    p.addcdiv_(exp_avg, denom, value=-step_size)
+                    
+                elif p in self.muon_params:
+                    # Muon
+                    if 'momentum_buffer' not in state:
+                        state['momentum_buffer'] = torch.zeros_like(p)
+                    
+                    buf = state['momentum_buffer']
+                    buf.mul_(momentum).add_(grad)
+                    
+                    if nesterov:
+                        g = grad + momentum * buf
+                    else:
+                        g = buf
+                    
+                    # Orthogonalize
+                    update = zeropower_via_newtonschulz5(g, steps=ns_steps)
+                    
+                    # Scale
+                    update.mul_(max(1, update.size(0)/update.size(1))**0.5)
+                    
+                    # Apply
+                    p.add_(update, alpha=-lr)
 
         return loss
-
-
-class MuonAdamWHybrid:
-    """Hybrid optimizer: Muon2D for 2D params + AdamW/AdamW8bit for the rest.
-
-    This is designed to mirror the *behavior* described in the referenced blog:
-    - 2D params (e.g., Linear weights) -> Muon-style
-    - non-2D params (e.g., norms/biases) -> AdamW (optionally 8-bit via bitsandbytes)
-
-    For checkpoint compatibility with this repo, this wrapper exposes:
-    - `param_groups` (concatenated, as references)
-    - `state_dict()` / `load_state_dict()`
-    - `step()` / `zero_grad()`
-
-    It is intentionally lightweight and intended for testing.
-    """
-
-    def __init__(
-        self,
-        *,
-        muon: torch.optim.Optimizer,
-        adamw: torch.optim.Optimizer,
-    ):
-        self._muon = muon
-        self._adamw = adamw
-
-        # Expose param groups as references so LR schedulers that mutate dicts
-        # will affect the inner optimizers.
-        self.param_groups = list(self._muon.param_groups) + list(self._adamw.param_groups)
-
-        # Expose a "state" mapping for compatibility with spike-handling logic.
-        # (AdamW side is the only one with exp_avg/exp_avg_sq.)
-        self.state = getattr(self._adamw, "state", {})
-
-    @torch.no_grad()
-    def step(self, closure: Optional[Callable] = None):
-        loss = closure() if closure is not None else None
-        self._adamw.step()
-        self._muon.step()
-        return loss
-
-    def zero_grad(self, set_to_none: bool = True):
-        self._adamw.zero_grad(set_to_none=set_to_none)
-        self._muon.zero_grad(set_to_none=set_to_none)
-
-    def state_dict(self):
-        return {
-            "muon": self._muon.state_dict(),
-            "adamw": self._adamw.state_dict(),
-        }
-
-    def load_state_dict(self, state_dict):
-        self._muon.load_state_dict(state_dict["muon"])
-        self._adamw.load_state_dict(state_dict["adamw"])
-
-        # Refresh references (some optimizers rebuild param_groups on load)
-        self.param_groups = list(self._muon.param_groups) + list(self._adamw.param_groups)
-        self.state = getattr(self._adamw, "state", {})
-
-    def add_param_group(self, param_group):
-        raise NotImplementedError("Add param groups to the inner optimizers directly.")

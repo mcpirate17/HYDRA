@@ -8,7 +8,6 @@ Usage:
     from hydra.training.safe_optimizations import SafeOptimizations, OptimizationConfig
 
     opt_config = OptimizationConfig(
-        enable_fa3=True,
         enable_cuda_graphs=True,
         enable_blackwell_tuning=True,
     )
@@ -54,10 +53,6 @@ class OptimizationConfig:
     All optimizations default to True (enabled) but will auto-disable
     if they cause anomalies during the safety window.
     """
-    # Flash Attention 3 (Blackwell/Hopper optimized)
-    enable_fa3: bool = True
-    fa3_fallback_to_fa2: bool = True  # Fall back to FA2 if FA3 fails
-
     # CUDA Graphs for reduced launch overhead
     enable_cuda_graphs: bool = True
     cuda_graphs_warmup_steps: int = 50  # Steps before graph capture
@@ -86,6 +81,10 @@ class OptimizationConfig:
     # Pretest settings
     pretest_steps: int = 10  # Steps to run for pretest
     pretest_batch_size: int = 2  # Small batch for quick pretest
+    
+    # MoE settings - affects CUDA graph compatibility
+    moe_enabled: bool = False
+    moe_capacity_factor: float = float("inf")  # inf = no dropping, compatible with graphs
 
 
 @dataclass
@@ -134,7 +133,6 @@ class SafeOptimizations:
 
         # Initialize optimization states
         self._states: Dict[str, OptimizationState] = {
-            "fa3": OptimizationState("fa3"),
             "cuda_graphs": OptimizationState("cuda_graphs"),
             "blackwell_tuning": OptimizationState("blackwell_tuning"),
             "prefetch_threads": OptimizationState("prefetch_threads"),
@@ -155,7 +153,6 @@ class SafeOptimizations:
 
         # Hardware detection
         self._gpu_arch = self._detect_gpu_arch()
-        self._has_fa3 = self._check_fa3_available()
         self._has_cuda_graphs = self._check_cuda_graphs_available()
 
         # Initialize based on config and hardware
@@ -179,50 +176,6 @@ class SafeOptimizations:
             return "ampere"  # SM80-86
         return "older"
 
-    def _check_fa3_available(self) -> bool:
-        """Check if Flash Attention 3 is available.
-
-        FA3 requires:
-        1. Hopper (SM90) or Blackwell (SM100+) GPU architecture
-        2. flash-attn >= 2.6.0 with cute/hopper modules
-        3. CUTLASS Python DSL (cutlass module with cute submodule)
-        """
-        try:
-            # FA3 requires Hopper+ GPU
-            if self._gpu_arch not in ("blackwell", "hopper"):
-                self.logger.debug("FA3: GPU arch not Hopper/Blackwell")
-                return False
-
-            # Check flash_attn version >= 2.6
-            try:
-                import flash_attn
-                version = getattr(flash_attn, "__version__", "0.0.0")
-                parts = version.split(".")
-                major, minor = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
-                if major < 2 or (major == 2 and minor < 6):
-                    self.logger.debug(f"FA3: flash_attn {version} < 2.6.0")
-                    return False
-            except ImportError:
-                self.logger.debug("FA3: flash_attn not installed")
-                return False
-
-            # Check for CUTLASS Python DSL (required for FA3 kernels)
-            try:
-                import cutlass
-                import cutlass.cute  # FA3 uses CUTLASS cute DSL
-                self.logger.debug("FA3: cutlass with cute DSL available")
-                return True
-            except ImportError:
-                self.logger.debug(
-                    "FA3: cutlass Python DSL not available. "
-                    "Install from CUTLASS source: "
-                    "https://github.com/NVIDIA/cutlass (python/ directory)"
-                )
-                return False
-        except Exception as e:
-            self.logger.debug(f"FA3: check failed with {e}")
-            return False
-
     def _check_cuda_graphs_available(self) -> bool:
         """Check if CUDA graphs are supported."""
         if not torch.cuda.is_available():
@@ -234,25 +187,24 @@ class SafeOptimizations:
         """Initialize optimization states based on config and hardware."""
         cfg = self.config
 
-        # FA3: Only on Hopper+ with CUTLASS Python DSL
-        if cfg.enable_fa3 and self._has_fa3:
-            self._states["fa3"].status = OptimizationStatus.PRETESTING
-            self.logger.info(f"FA3: Enabled for pretest (GPU arch: {self._gpu_arch})")
-        else:
-            if not cfg.enable_fa3:
-                reason = "disabled by config"
-            elif self._gpu_arch not in ("blackwell", "hopper"):
-                reason = f"requires Hopper/Blackwell GPU (have {self._gpu_arch})"
-            else:
-                reason = "cutlass DSL not installed (build from CUTLASS source)"
-            self._states["fa3"].status = OptimizationStatus.DISABLED
-            self._states["fa3"].disable_reason = reason
-            self.logger.info(f"FA3: Disabled ({reason})")
-
-        # CUDA Graphs
+        # CUDA Graphs - check MoE compatibility
+        # MoE uses dynamic indexing (nonzero) for sparse token dispatch which is
+        # incompatible with CUDA graph capture. The nonzero operation produces
+        # variable-size outputs that can't be captured in a static graph.
+        
         if cfg.enable_cuda_graphs and self._has_cuda_graphs:
-            self._states["cuda_graphs"].status = OptimizationStatus.PRETESTING
-            self.logger.info("CUDA Graphs: Enabled for pretest")
+            if cfg.moe_enabled:
+                self._states["cuda_graphs"].status = OptimizationStatus.DISABLED
+                self._states["cuda_graphs"].disable_reason = (
+                    "MoE uses dynamic indexing (nonzero) for sparse token dispatch "
+                    "which is incompatible with CUDA graph capture"
+                )
+                self.logger.info(
+                    "CUDA Graphs: Disabled (MoE sparse dispatch is incompatible)"
+                )
+            else:
+                self._states["cuda_graphs"].status = OptimizationStatus.PRETESTING
+                self.logger.info("CUDA Graphs: Enabled for pretest")
         else:
             self._states["cuda_graphs"].status = OptimizationStatus.DISABLED
 
@@ -330,9 +282,7 @@ class SafeOptimizations:
         """Run pretest for a single optimization."""
         cfg = self.config
 
-        if name == "fa3":
-            return self._pretest_fa3(model, sample_batch)
-        elif name == "cuda_graphs":
+        if name == "cuda_graphs":
             return self._pretest_cuda_graphs(model, sample_batch)
         elif name == "blackwell_tuning":
             return self._pretest_blackwell_tuning(model, sample_batch)
@@ -340,26 +290,6 @@ class SafeOptimizations:
             return self._pretest_fp8(model, sample_batch)
 
         return True  # Default pass for unknown optimizations
-
-    def _pretest_fa3(
-        self,
-        model: torch.nn.Module,
-        sample_batch: torch.Tensor,
-    ) -> bool:
-        """Pretest Flash Attention 3."""
-        try:
-            # Run a few forward passes and check for NaN/Inf
-            model.eval()
-            with torch.no_grad():
-                for _ in range(self.config.pretest_steps):
-                    output = model(sample_batch)
-                    if torch.isnan(output).any() or torch.isinf(output).any():
-                        return False
-            model.train()
-            return True
-        except Exception as e:
-            self.logger.warning(f"FA3 pretest exception: {e}")
-            return False
 
     def _pretest_cuda_graphs(
         self,
@@ -573,17 +503,9 @@ class SafeOptimizations:
             f"DISABLING {name}: {reason} (was enabled at step {state.enabled_at_step})"
         )
 
-        # Apply fallback logic
-        if name == "fa3" and self.config.fa3_fallback_to_fa2:
-            self.logger.info("  -> Falling back to Flash Attention 2")
-
     # ─────────────────────────────────────────────────────────────────────────
     # Query Methods for Training Code
     # ─────────────────────────────────────────────────────────────────────────
-
-    def should_use_fa3(self) -> bool:
-        """Check if FA3 should be used."""
-        return self._states["fa3"].is_active()
 
     def should_use_cuda_graphs(self) -> bool:
         """Check if CUDA graphs should be used."""
@@ -680,7 +602,6 @@ def create_safe_optimizations_from_args(args) -> SafeOptimizations:
         Configured SafeOptimizations instance
     """
     config = OptimizationConfig(
-        enable_fa3=getattr(args, "experimental_fa3", True),
         enable_cuda_graphs=getattr(args, "experimental_cuda_graphs", True),
         enable_blackwell_tuning=getattr(args, "experimental_blackwell_tuning", True),
         enable_prefetch_threads=getattr(args, "experimental_prefetch_threads", 4),

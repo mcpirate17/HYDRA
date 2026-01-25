@@ -31,10 +31,18 @@ _OOB_TOKEN_WARNED = False
 
 @torch.compiler.disable
 def _log_oob_warning(x: torch.Tensor, vocab_size: int) -> None:
-	"""Log OOB token warning (outside compiled region)."""
+	"""Log OOB token warning (outside compiled region).
+	
+	Skips entirely during CUDA graph capture to avoid stream invalidation.
+	"""
 	global _OOB_TOKEN_WARNED
 	if _OOB_TOKEN_WARNED:
 		return
+	
+	# Check if we're inside CUDA graph capture - skip host sync operations
+	if torch.cuda.is_current_stream_capturing():
+		return
+	
 	oob_mask = (x < 0) | (x >= vocab_size)
 	if oob_mask.any():
 		n_oob = int(oob_mask.sum().item())
@@ -213,6 +221,13 @@ class HydraModel(nn.Module):
 		moe_identity_init: bool = True,
 		moe_forced_routing_steps: int = 0,  # Steps to force position-based routing
 		moe_teacher_until_step: int = 0,
+		# Manifold connections configuration
+		manifold_enabled: bool = False,
+		manifold_type: str = "sphere",
+		manifold_n_components: int = 8,
+		manifold_warmup_steps: int = 1000,
+		manifold_placement_interval: int = 2,
+		manifold_curvature: float = 1.0,
 		**kwargs,
 	):
 		super().__init__()
@@ -252,6 +267,14 @@ class HydraModel(nn.Module):
 		self.moe_teacher_until_step = moe_teacher_until_step
 		self.mor_min_depth = mor_min_depth
 		self.static_routing_mode = static_routing_mode
+
+		# Manifold connections configuration
+		self.manifold_enabled = manifold_enabled
+		self.manifold_type = manifold_type
+		self.manifold_n_components = manifold_n_components
+		self.manifold_warmup_steps = manifold_warmup_steps
+		self.manifold_placement_interval = manifold_placement_interval
+		self.manifold_curvature = manifold_curvature
 
 		if aux_loss_weight is None:
 			depth_scale = max(1.0, self.effective_layers / 32)
@@ -338,6 +361,28 @@ class HydraModel(nn.Module):
 					teacher_until_step=self.moe_teacher_until_step,
 				)
 				self.moe_layers.append(moe_block)
+
+		# Manifold connections (optional, for gradient stabilization)
+		self.manifold_connections = nn.ModuleList()
+		self._manifold_placement = ()
+		if self.manifold_enabled:
+			from hydra.layers import ManifoldConstrainedHyperConnection
+
+			# Compute placement: every N blocks
+			interval = max(1, self.manifold_placement_interval)
+			self._manifold_placement = tuple(range(0, n_mor_blocks, interval))
+
+			_log.info(f"Manifold: {len(self._manifold_placement)} connections at positions {self._manifold_placement}")
+
+			for _ in self._manifold_placement:
+				mc = ManifoldConstrainedHyperConnection(
+					dim=dim,
+					n_components=self.manifold_n_components,
+					manifold_type=self.manifold_type,
+					warmup_steps=self.manifold_warmup_steps,
+					curvature=self.manifold_curvature,
+				)
+				self.manifold_connections.append(mc)
 
 		self.norm = RMSNorm(dim)
 		self.output = nn.Linear(dim, vocab_size, bias=False)
@@ -432,6 +477,12 @@ class HydraModel(nn.Module):
 			for moe_idx, block_idx in enumerate(self._moe_placement):
 				moe_after_block[block_idx] = moe_idx
 
+		# Build manifold placement lookup
+		manifold_after_block = {}
+		if self.manifold_connections:
+			for mc_idx, block_idx in enumerate(self._manifold_placement):
+				manifold_after_block[block_idx] = mc_idx
+
 		if return_losses:
 			if self._gradient_checkpointing and self.training:
 				layer_results = []
@@ -452,19 +503,33 @@ class HydraModel(nn.Module):
 						else:
 							h, moe_losses = moe_block.forward_with_losses(h)
 						moe_results.append(moe_losses)
+
+					# Apply manifold connection after this block if scheduled
+					if i in manifold_after_block:
+						mc_idx = manifold_after_block[i]
+						mc = self.manifold_connections[mc_idx]
+						if i % self._checkpoint_every_n == 0:
+							h = gradient_checkpoint(mc, h, use_reentrant=False)
+						else:
+							h = mc(h)
 			else:
 				layer_results = []
 				moe_results = []
 				for i, layer in enumerate(self.layers):
 					h, layer_losses = layer.forward_with_losses(h)
 					layer_results.append(layer_losses)
-					
+
 					# Apply MoE after this block if scheduled
 					if i in moe_after_block:
 						moe_idx = moe_after_block[i]
 						moe_block = self.moe_layers[moe_idx]
 						h, moe_losses = moe_block.forward_with_losses(h)
 						moe_results.append(moe_losses)
+
+					# Apply manifold connection after this block if scheduled
+					if i in manifold_after_block:
+						mc_idx = manifold_after_block[i]
+						h = self.manifold_connections[mc_idx](h)
 
 			aux_losses = [losses["aux_loss"] for losses in layer_results if "aux_loss" in losses]
 			ponder_losses = [losses["ponder_loss"] for losses in layer_results if "ponder_loss" in losses]
@@ -494,6 +559,14 @@ class HydraModel(nn.Module):
 						h = gradient_checkpoint(moe_block, h, use_reentrant=False)
 					else:
 						h = moe_block(h)
+				# Apply manifold connection after this block if scheduled
+				if i in manifold_after_block:
+					mc_idx = manifold_after_block[i]
+					mc = self.manifold_connections[mc_idx]
+					if i % self._checkpoint_every_n == 0:
+						h = gradient_checkpoint(mc, h, use_reentrant=False)
+					else:
+						h = mc(h)
 		else:
 			for i, layer in enumerate(self.layers):
 				h = layer(h)
@@ -501,6 +574,10 @@ class HydraModel(nn.Module):
 				if i in moe_after_block:
 					moe_idx = moe_after_block[i]
 					h = self.moe_layers[moe_idx](h)
+				# Apply manifold connection after this block if scheduled
+				if i in manifold_after_block:
+					mc_idx = manifold_after_block[i]
+					h = self.manifold_connections[mc_idx](h)
 
 		h = self.norm(h)
 		return self.output(h)
@@ -528,6 +605,12 @@ class HydraModel(nn.Module):
 			for moe_idx, block_idx in enumerate(self._moe_placement):
 				moe_after_block[block_idx] = moe_idx
 
+		# Build manifold placement lookup
+		manifold_after_block = {}
+		if self.manifold_connections:
+			for mc_idx, block_idx in enumerate(self._manifold_placement):
+				manifold_after_block[block_idx] = mc_idx
+
 		if self._gradient_checkpointing and self.training:
 			for i, layer in enumerate(self.layers):
 				if i % self._checkpoint_every_n == 0:
@@ -542,11 +625,21 @@ class HydraModel(nn.Module):
 						h = gradient_checkpoint(moe_block, h, use_reentrant=False)
 					else:
 						h = moe_block(h)
+				# Apply manifold connection after this block if scheduled
+				if i in manifold_after_block:
+					mc_idx = manifold_after_block[i]
+					mc = self.manifold_connections[mc_idx]
+					if i % self._checkpoint_every_n == 0:
+						h = gradient_checkpoint(mc, h, use_reentrant=False)
+					else:
+						h = mc(h)
 		else:
 			for i, layer in enumerate(self.layers):
 				h = layer(h)
 				if i in moe_after_block:
 					h = self.moe_layers[moe_after_block[i]](h)
+				if i in manifold_after_block:
+					h = self.manifold_connections[manifold_after_block[i]](h)
 
 		return self.norm(h)
 
@@ -575,6 +668,12 @@ class HydraModel(nn.Module):
 			for moe_idx, block_idx in enumerate(self._moe_placement):
 				moe_after_block[block_idx] = moe_idx
 
+		# Build manifold placement lookup
+		manifold_after_block = {}
+		if self.manifold_connections:
+			for mc_idx, block_idx in enumerate(self._manifold_placement):
+				manifold_after_block[block_idx] = mc_idx
+
 		if self._gradient_checkpointing and self.training:
 			layer_results = []
 			moe_results = []
@@ -593,6 +692,14 @@ class HydraModel(nn.Module):
 					else:
 						h, moe_losses = moe_block.forward_with_losses(h)
 					moe_results.append(moe_losses)
+				# Apply manifold connection after this block if scheduled
+				if i in manifold_after_block:
+					mc_idx = manifold_after_block[i]
+					mc = self.manifold_connections[mc_idx]
+					if i % self._checkpoint_every_n == 0:
+						h = gradient_checkpoint(mc, h, use_reentrant=False)
+					else:
+						h = mc(h)
 		else:
 			layer_results = []
 			moe_results = []
@@ -603,6 +710,8 @@ class HydraModel(nn.Module):
 					moe_idx = moe_after_block[i]
 					h, moe_losses = self.moe_layers[moe_idx].forward_with_losses(h)
 					moe_results.append(moe_losses)
+				if i in manifold_after_block:
+					h = self.manifold_connections[manifold_after_block[i]](h)
 
 		aux_losses = [losses["aux_loss"] for losses in layer_results if "aux_loss" in losses]
 		ponder_losses = [losses["ponder_loss"] for losses in layer_results if "ponder_loss" in losses]
@@ -703,6 +812,38 @@ class HydraModel(nn.Module):
 		for moe_layer in self.moe_layers:
 			if hasattr(moe_layer, "set_global_step"):
 				moe_layer.set_global_step(step)
+		# Update manifold connections
+		for mc in self.manifold_connections:
+			mc.set_global_step(step)
+	
+	def freeze_manifold_grads(self) -> None:
+		"""Freeze all manifold connection gradients.
+		
+		Call this when resuming a checkpoint that doesn't have manifold params,
+		to prevent catastrophic forgetting while the model adapts.
+		"""
+		for mc in self.manifold_connections:
+			mc.freeze_grads()
+	
+	def unfreeze_manifold_grads(self) -> None:
+		"""Unfreeze manifold connection gradients to resume learning."""
+		for mc in self.manifold_connections:
+			mc.unfreeze_grads()
+	
+	def manifold_grads_frozen(self) -> bool:
+		"""Return True if manifold gradients are frozen."""
+		if not self.manifold_connections:
+			return False
+		return self.manifold_connections[0].grads_frozen
+	
+	def set_manifold_warmup_start(self, step: int) -> None:
+		"""Set the warmup start step for all manifold connections.
+		
+		Call this when adding manifold to a trained checkpoint to ensure
+		warmup is relative to when manifold was added.
+		"""
+		for mc in self.manifold_connections:
+			mc.set_warmup_start_step(step)
 
 	@torch.compiler.disable
 	def update_mod_loss_ema(self, loss_ema: float) -> None:
@@ -806,7 +947,20 @@ class HydraModel(nn.Module):
 		else:
 			summary["moe_enabled"] = False
 
-		return {"mod_layers": mod_stats, "mor_layers": mor_stats, "moe_layers": moe_stats, "summary": summary}
+		# Manifold connection stats
+		manifold_stats = []
+		for i, mc in enumerate(self.manifold_connections):
+			block_idx = self._manifold_placement[i] if i < len(self._manifold_placement) else -1
+			manifold_stats.append({"mc_idx": i, "after_block": block_idx, **mc.get_stats()})
+		if manifold_stats:
+			alphas = [s.get("residual_alpha", 0) for s in manifold_stats]
+			summary["manifold_enabled"] = True
+			summary["manifold_num_connections"] = len(manifold_stats)
+			summary["manifold_avg_alpha"] = sum(alphas) / len(alphas) if alphas else 0
+		else:
+			summary["manifold_enabled"] = False
+
+		return {"mod_layers": mod_stats, "mor_layers": mor_stats, "moe_layers": moe_stats, "manifold_connections": manifold_stats, "summary": summary}
 
 
 # Backward compatibility alias

@@ -240,6 +240,11 @@ class MoDMLPWrapper(nn.Module):
         self._tokens_processed: int = 0
         self._tokens_total: int = 0
         self._last_scores: Optional[torch.Tensor] = None
+        
+        # Aggregate tracking for MoR collapse detection
+        # Tracks which tokens were selected across ALL MoR recursions
+        self._aggregate_tracking: bool = False
+        self._aggregate_selected_mask: Optional[torch.Tensor] = None
 
     def set_global_step(self, step: int):
         """Set global training step for curriculum scheduling."""
@@ -332,13 +337,17 @@ class MoDMLPWrapper(nn.Module):
         self._last_probs_mean_t = probs.mean().detach()
         self._last_probs_std_t = probs.std().detach()
         self._tokens_processed = k
+        
+        # Update aggregate tracking for MoR collapse detection
+        self._update_aggregate_mask(indices, B, L, x.device)
 
         if self.aux_loss_weight > 0:
             self._aux_loss = self.mod_router.get_aux_loss()
         
-        # Sort indices ascending to maintain position monotonicity
+        # Sort indices by position (ascending) for better memory coalescing in gather.
+        # Note: topk uses sorted=False to skip value-sorting we don't need.
         indices, _ = torch.sort(indices, dim=1)
-        
+
         # GATHER: Extract only top-k tokens
         indices_exp = indices.unsqueeze(-1).expand(-1, -1, D)  # [B, k, D]
         x_selected = torch.gather(x, 1, indices_exp)  # [B, k, D]
@@ -374,9 +383,13 @@ class MoDMLPWrapper(nn.Module):
         self._last_probs_std_t = probs.std().detach()
         self._tokens_processed = k
         
-        # Sort indices ascending to maintain position monotonicity
-        indices, sort_order = torch.sort(indices, dim=1)
+        # Update aggregate tracking for MoR collapse detection
+        self._update_aggregate_mask(indices, B, L, x.device)
         
+        # Sort indices by position (ascending) for better memory coalescing in gather.
+        # Note: topk uses sorted=False to skip value-sorting we don't need.
+        indices, sort_order = torch.sort(indices, dim=1)
+
         # GATHER
         indices_exp = indices.unsqueeze(-1).expand(-1, -1, D)
         x_selected = torch.gather(x, 1, indices_exp)  # [B, k, D]
@@ -438,6 +451,40 @@ class MoDMLPWrapper(nn.Module):
         the model's `compute_advantage_loss()` path.
         """
         return self._aux_loss
+
+    def start_aggregate_tracking(self) -> None:
+        """Start tracking which tokens are selected across multiple calls.
+        
+        Used by MoR to track tokens selected across all recursion depths
+        for accurate collapse detection (only count tokens MoD processed).
+        """
+        self._aggregate_tracking = True
+        self._aggregate_selected_mask = None
+
+    def end_aggregate_tracking(self) -> Optional[torch.Tensor]:
+        """End aggregate tracking and return the combined mask.
+        
+        Returns:
+            Boolean mask [B, L] where True = token was selected in at least
+            one MoD call during tracking period. None if MoD was disabled.
+        """
+        self._aggregate_tracking = False
+        mask = self._aggregate_selected_mask
+        self._aggregate_selected_mask = None
+        return mask
+
+    def _update_aggregate_mask(self, indices: torch.Tensor, B: int, L: int, device: torch.device) -> None:
+        """Update aggregate mask with newly selected indices."""
+        if not self._aggregate_tracking:
+            return
+        # Create mask for this call
+        current_mask = torch.zeros(B, L, dtype=torch.bool, device=device)
+        current_mask.scatter_(1, indices, True)
+        # OR with existing aggregate
+        if self._aggregate_selected_mask is None:
+            self._aggregate_selected_mask = current_mask
+        else:
+            self._aggregate_selected_mask = self._aggregate_selected_mask | current_mask
 
     def compute_loss_aware_loss(self, token_losses: torch.Tensor) -> torch.Tensor:
         """Supervise router scores to prioritize hard tokens.
@@ -945,11 +992,13 @@ class CCGQAMoRBlock(nn.Module):
         depths, probs, logits = self.mor_router(h)
         
         # Store for diagnostics and later advantage computation
+        # MEMORY FIX: Detach tensors used only for diagnostics to prevent graph accumulation.
+        # Only _last_probs needs gradients for compute_advantage_loss().
         self._last_target_depths = depths.detach().float()
         self._last_router_probs_tensor = probs.detach()
-        self._last_router_logits = logits  # Keep with grad for advantage loss
-        self._last_depths = depths
-        self._last_probs = probs
+        self._last_router_logits = logits.detach()  # Diagnostics only - detach to free graph
+        self._last_depths = depths.detach()         # Diagnostics only - detach to free graph
+        self._last_probs = probs  # Keep with grad for advantage loss (cleared after backward)
         
         # =====================================================================
         # STEP 3: MoR EXECUTOR - Apply MLP recursions with depth routing

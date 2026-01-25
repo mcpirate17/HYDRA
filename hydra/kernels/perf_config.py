@@ -17,7 +17,6 @@ Environment Variables:
     HYDRA_PERF_PROFILE: "max", "balanced", "memory_saver", "debug"
     HYDRA_USE_LIGER: "1" to enable Liger kernels
     HYDRA_USE_TE: "1" to enable Transformer Engine
-    HYDRA_USE_FA3: "1" to prefer Flash Attention 3
     HYDRA_COMPILE_MODE: "max-autotune", "reduce-overhead", "default"
 """
 

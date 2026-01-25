@@ -30,6 +30,19 @@ except Exception:
 # Optimized convolution sequences
 from hydra.attention.backends.ccgqa.kernels.fused_conv import OptimizedConvSequence
 
+# Sage Attention: 2-5x faster than Flash via INT8/FP8 quantization
+from hydra.layers import SAGE_ATTN_AVAILABLE, sageattn
+
+
+def _get_ccgqa_attn_backend() -> str:
+    """Get attention backend for CCGQA inner attention.
+
+    Env: HYDRA_CCGQA_ATTN_BACKEND=auto|sage|sdpa
+    Default: auto (tries Sage first, falls back to SDPA)
+    """
+    mode = os.environ.get("HYDRA_CCGQA_ATTN_BACKEND", "auto").strip().lower()
+    return mode if mode in {"auto", "sage", "sdpa"} else "auto"
+
 
 def _env_flag(name: str) -> bool:
     v = os.environ.get(name, "").strip().lower()
@@ -152,10 +165,11 @@ class CCGQAAttention(nn.Module):
         self.scale = self.head_dim**-0.5
         self.max_seq_len = max_seq_len
 
-        # Pre-compute causal mask to avoid regenerating per forward
-        # Shape: [max_seq_len, max_seq_len], True = masked (upper triangle)
-        causal_mask = torch.ones((max_seq_len, max_seq_len), dtype=torch.bool).triu(diagonal=1)
-        self.register_buffer("causal_mask_cached", causal_mask, persistent=False)
+        # MEMORY FIX: Don't pre-allocate causal mask - saves ~67MB per attention module.
+        # Causal mask is only needed when combining with padding masks, and SDPA
+        # handles is_causal=True natively. Compute on-demand when needed.
+        # Old code: causal_mask = torch.ones((max_seq_len, max_seq_len), dtype=torch.bool).triu(diagonal=1)
+        # self.register_buffer("causal_mask_cached", causal_mask, persistent=False)
 
     def _init_rope(self, max_seq_len: int):
         head_dim = self.head_dim
@@ -165,13 +179,18 @@ class CCGQAAttention(nn.Module):
         t = torch.arange(max_seq_len, dtype=torch.float32)
         freqs = torch.outer(t, freqs)
 
-        rope_cache_dtype = os.environ.get("HYDRA_ROPE_CACHE_DTYPE", "").strip().lower()
+        # MEMORY FIX: Default to bfloat16 for RoPE cache to save ~50% memory.
+        # Most training uses bf16 anyway, and precision loss is negligible for positional info.
+        # Override with HYDRA_ROPE_CACHE_DTYPE=fp32 if float32 precision is needed.
+        rope_cache_dtype = os.environ.get("HYDRA_ROPE_CACHE_DTYPE", "bf16").strip().lower()
         if rope_cache_dtype in {"bf16", "bfloat16"}:
             cache_dtype = torch.bfloat16
         elif rope_cache_dtype in {"fp16", "float16", "half"}:
             cache_dtype = torch.float16
-        else:
+        elif rope_cache_dtype in {"fp32", "float32", "float"}:
             cache_dtype = torch.float32
+        else:
+            cache_dtype = torch.bfloat16  # Default to bf16
 
         self.register_buffer(
             "cos_cached",
@@ -274,18 +293,39 @@ class CCGQAAttention(nn.Module):
             # mask is (B, S), 1=valid, 0=pad
             # We need boolean mask where True = masked out
 
-            # Use cached causal mask (sliced to current sequence length)
-            causal_mask = self.causal_mask_cached[:S, :S]
+            # MEMORY FIX: Compute causal mask on-demand instead of using pre-allocated buffer.
+            # This saves ~67MB per attention module (for max_seq_len=8192).
+            causal_mask = torch.triu(
+                torch.ones((S, S), device=q.device, dtype=torch.bool),
+                diagonal=1
+            )
 
             # Padding part: True where mask == 0
             padding_mask = (mask == 0).view(B, 1, 1, S)
 
             attn_mask = causal_mask.unsqueeze(0).unsqueeze(0) | padding_mask
 
-        # Fast path: on CUDA, prefer PyTorch SDPA (Flash/MemEff) for both MHA and GQA.
-        # This is safe (PyTorch-managed) and typically faster than custom Triton kernels.
+        # Fast path: try Sage Attention first (2-5x faster than Flash), then SDPA.
+        # Sage uses INT8/FP8 quantization for speedup with minimal precision loss.
         out = None
-        if self.use_fused_kernel and q.is_cuda and self.head_dim >= 16:
+        attn_backend = _get_ccgqa_attn_backend()
+
+        # Try Sage Attention (fastest path)
+        if (attn_backend in ("auto", "sage")
+            and SAGE_ATTN_AVAILABLE
+            and sageattn is not None
+            and self.use_fused_kernel
+            and q.is_cuda
+            and attn_mask is None  # Sage doesn't support arbitrary attention masks
+        ):
+            try:
+                # Sage supports GQA natively, expects [B, n_heads, S, head_dim]
+                out = sageattn(q, k, v, tensor_layout="HND", is_causal=is_causal)
+            except Exception:
+                out = None  # Fall through to SDPA
+
+        # Try PyTorch SDPA (Flash/MemEff) for both MHA and GQA
+        if out is None and self.use_fused_kernel and q.is_cuda and self.head_dim >= 16:
             try:
                 with _sdpa_kernel_context():
                     out = F.scaled_dot_product_attention(

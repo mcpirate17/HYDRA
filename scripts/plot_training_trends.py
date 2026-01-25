@@ -396,6 +396,284 @@ def plot_training_dashboard(db: TrainingDB, model_id: str):
     print(f"Saved {out}")
 
 
+def plot_throughput_vram(db: TrainingDB, model_id: str):
+    """Tokens/sec and VRAM usage over time."""
+    steps = get_step_data(db, model_id)
+    if len(steps) < 2:
+        print("Skipping throughput/VRAM plot (insufficient data)")
+        return
+
+    x = [s["step"] for s in steps]
+    tps = [s.get("tokens_per_sec", 0.0) or 0.0 for s in steps]
+    vram = [s.get("vram_gb", 0.0) or 0.0 for s in steps]
+
+    if not any(tps) and not any(vram):
+        print("Skipping throughput/VRAM plot (no data)")
+        return
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+
+    axes[0].plot(x, tps, linewidth=1.2, color="teal")
+    axes[0].set_ylabel("Tokens/sec")
+    axes[0].set_title(f"{model_id.upper()} Throughput")
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(x, vram, linewidth=1.2, color="purple")
+    axes[1].set_ylabel("VRAM (GB)")
+    axes[1].set_xlabel("Step")
+    axes[1].set_title(f"{model_id.upper()} VRAM Usage")
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    out = PLOTS_DIR / f"throughput_vram_{model_id}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved {out}")
+
+
+def plot_moe_routing_health(db: TrainingDB, model_id: str):
+    """MoE routing entropy, divergence, and expert utilization."""
+    with db._conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT step, entropy, divergence,
+                   util_expert_0, util_expert_1, util_expert_2, util_expert_3
+            FROM routing_moe
+            WHERE model_id = ?
+            ORDER BY step
+            """,
+            (model_id,),
+        ).fetchall()
+
+    if len(rows) < 2:
+        print("Skipping MoE routing plot (insufficient data)")
+        return
+
+    x = [r["step"] for r in rows]
+    entropy = [r["entropy"] for r in rows]
+    divergence = [r["divergence"] for r in rows]
+    util0 = [r["util_expert_0"] for r in rows]
+    util1 = [r["util_expert_1"] for r in rows]
+    util2 = [r["util_expert_2"] for r in rows]
+    util3 = [r["util_expert_3"] for r in rows]
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+
+    axes[0].plot(x, entropy, label="Entropy", linewidth=1.2)
+    axes[0].plot(x, divergence, label="Divergence", linewidth=1.2)
+    axes[0].set_ylabel("Score")
+    axes[0].set_title(f"{model_id.upper()} MoE Routing Health")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(x, util0, label="Expert 0")
+    axes[1].plot(x, util1, label="Expert 1")
+    axes[1].plot(x, util2, label="Expert 2")
+    axes[1].plot(x, util3, label="Expert 3")
+    axes[1].set_ylabel("Utilization (%)")
+    axes[1].set_xlabel("Step")
+    axes[1].legend(ncol=4, fontsize=9)
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    out = PLOTS_DIR / f"moe_routing_{model_id}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved {out}")
+
+
+def plot_mor_depth_health(db: TrainingDB, model_id: str):
+    """MoR average vs expected depth over time (avg across layers)."""
+    with db._conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT step,
+                   AVG(avg_depth) AS avg_depth,
+                   AVG(expected_depth) AS expected_depth
+            FROM routing_mor
+            WHERE model_id = ?
+            GROUP BY step
+            ORDER BY step
+            """,
+            (model_id,),
+        ).fetchall()
+
+    if len(rows) < 2:
+        print("Skipping MoR depth plot (insufficient data)")
+        return
+
+    x = [r["step"] for r in rows]
+    avg_depth = [r["avg_depth"] for r in rows]
+    exp_depth = [r["expected_depth"] for r in rows]
+
+    plt.figure(figsize=(14, 5))
+    plt.plot(x, avg_depth, label="Avg Depth", linewidth=1.5)
+    plt.plot(x, exp_depth, label="Expected Depth", linewidth=1.5)
+    plt.xlabel("Step")
+    plt.ylabel("Depth")
+    plt.title(f"{model_id.upper()} MoR Depth Health")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    out = PLOTS_DIR / f"mor_depth_{model_id}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved {out}")
+
+
+def plot_mod_utilization(db: TrainingDB, model_id: str):
+    """MoD utilization and compute savings (avg across layers)."""
+    with db._conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT step,
+                   AVG(selected_frac) AS selected_frac,
+                   AVG(compute_savings_pct) AS compute_savings_pct
+            FROM routing_mod
+            WHERE model_id = ?
+            GROUP BY step
+            ORDER BY step
+            """,
+            (model_id,),
+        ).fetchall()
+
+    if len(rows) < 2:
+        print("Skipping MoD utilization plot (insufficient data)")
+        return
+
+    x = [r["step"] for r in rows]
+    selected_frac = [r["selected_frac"] for r in rows]
+    savings = [r["compute_savings_pct"] for r in rows]
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+
+    axes[0].plot(x, selected_frac, linewidth=1.2, color="blue")
+    axes[0].set_ylabel("Selected Fraction")
+    axes[0].set_title(f"{model_id.upper()} MoD Utilization")
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(x, savings, linewidth=1.2, color="green")
+    axes[1].set_ylabel("Compute Savings (%)")
+    axes[1].set_xlabel("Step")
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    out = PLOTS_DIR / f"mod_utilization_{model_id}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved {out}")
+
+
+def plot_adaptive_lr_state(db: TrainingDB, model_id: str):
+    """Adaptive LR state (EMA trends, patience, cooldown)."""
+    with db._conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT step, loss_ema_short, loss_ema_long,
+                   patience_counter, cooldown_triggered
+            FROM adaptive_lr
+            WHERE model_id = ?
+            ORDER BY step
+            """,
+            (model_id,),
+        ).fetchall()
+
+    if len(rows) < 2:
+        print("Skipping adaptive LR plot (insufficient data)")
+        return
+
+    x = [r["step"] for r in rows]
+    ema_short = [r["loss_ema_short"] for r in rows]
+    ema_long = [r["loss_ema_long"] for r in rows]
+    patience = [r["patience_counter"] for r in rows]
+    cooldown = [r["cooldown_triggered"] for r in rows]
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+
+    axes[0].plot(x, ema_short, label="EMA Short", linewidth=1.2)
+    axes[0].plot(x, ema_long, label="EMA Long", linewidth=1.2)
+    axes[0].set_ylabel("Loss EMA")
+    axes[0].set_title(f"{model_id.upper()} Adaptive LR State")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(x, patience, label="Patience", linewidth=1.2)
+    axes[1].plot(x, cooldown, label="Cooldown Triggered", linewidth=1.2)
+    axes[1].set_xlabel("Step")
+    axes[1].set_ylabel("State")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    out = PLOTS_DIR / f"adaptive_lr_{model_id}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved {out}")
+
+
+def plot_grad_clip_pressure(db: TrainingDB, model_id: str):
+    """Grad clip pressure: post/pre ratio over time."""
+    steps = get_step_data(db, model_id)
+    if len(steps) < 2:
+        print("Skipping grad clip pressure plot (insufficient data)")
+        return
+
+    x = [s["step"] for s in steps]
+    pre = [s["grad_norm_pre_clip"] for s in steps]
+    post = [s["grad_norm"] for s in steps]
+
+    eps = 1e-9
+    ratio = [p / max(pp, eps) for p, pp in zip(post, pre)]
+
+    plt.figure(figsize=(14, 4))
+    plt.plot(x, ratio, linewidth=1.2, color="orange")
+    plt.axhline(y=1.0, color="gray", linestyle="--", linewidth=1.0, alpha=0.7)
+    plt.xlabel("Step")
+    plt.ylabel("Post/Pre")
+    plt.title(f"{model_id.upper()} Grad Clip Pressure (ratio)")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    out = PLOTS_DIR / f"grad_clip_pressure_{model_id}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved {out}")
+
+
+def plot_run_health(db: TrainingDB, model_id: str):
+    """Run lengths and best loss per run (cross-run health)."""
+    runs = get_run_data(db, model_id)
+    if not runs:
+        print("Skipping run health plot (insufficient data)")
+        return
+
+    run_labels = list(range(len(runs)))
+    run_lengths = [(r.get("end_step", 0) or 0) - (r.get("start_step", 0) or 0) for r in runs]
+    best_losses = [r.get("best_loss", 0.0) or 0.0 for r in runs]
+
+    fig, ax1 = plt.subplots(figsize=(14, 5))
+    ax1.bar(run_labels, run_lengths, color="steelblue", alpha=0.7, label="Run Length (steps)")
+    ax1.set_xlabel("Run Index")
+    ax1.set_ylabel("Steps")
+    ax1.grid(True, alpha=0.3, axis="y")
+
+    ax2 = ax1.twinx()
+    ax2.plot(run_labels, best_losses, color="darkred", linewidth=1.5, label="Best Loss")
+    ax2.set_ylabel("Best Loss")
+
+    ax1.set_title(f"{model_id.upper()} Run Health Summary")
+    lines, labels = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines + lines2, labels + labels2, loc="upper right")
+
+    plt.tight_layout()
+    out = PLOTS_DIR / f"run_health_{model_id}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved {out}")
+
+
 # =============================================================================
 # COMPREHENSIVE TRAINING REPORT
 # =============================================================================
@@ -570,6 +848,13 @@ See `reports/plots/` for detailed visualizations:
 - `loss_components_{model_id}.png` - CE vs auxiliary losses
 - `grad_norms_{model_id}.png` - Gradient health
 - `learning_rate_{model_id}.png` - LR schedule
+- `throughput_vram_{model_id}.png` - Throughput & VRAM over time
+- `moe_routing_{model_id}.png` - MoE routing entropy/utilization
+- `mor_depth_{model_id}.png` - MoR depth health
+- `mod_utilization_{model_id}.png` - MoD utilization & savings
+- `adaptive_lr_{model_id}.png` - Adaptive LR state
+- `grad_clip_pressure_{model_id}.png` - Grad clip pressure ratio
+- `run_health_{model_id}.png` - Run length & best loss summary
 
 ---
 
@@ -621,6 +906,13 @@ def analyze_training(model_id: str = "500m"):
     plot_gradient_norms(db, model_id)
     plot_learning_rate(db, model_id)
     plot_training_dashboard(db, model_id)
+    plot_throughput_vram(db, model_id)
+    plot_moe_routing_health(db, model_id)
+    plot_mor_depth_health(db, model_id)
+    plot_mod_utilization(db, model_id)
+    plot_adaptive_lr_state(db, model_id)
+    plot_grad_clip_pressure(db, model_id)
+    plot_run_health(db, model_id)
     
     # Generate report
     print("\n📝 Generating training report...")

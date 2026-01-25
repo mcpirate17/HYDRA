@@ -103,6 +103,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     _add_training_args(parser)
     _add_observability_args(parser)
     _add_moe_args(parser)
+    _add_manifold_args(parser)
     _add_experimental_args(parser)
     return parser
 
@@ -210,7 +211,7 @@ def _add_routing_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--mor_min_depth",
         type=int,
-        default=1,
+        default=0,
         help="Minimum MoR recursion depth. 0=allow immediate exit, 1+=force iterations.",
     )
 
@@ -256,7 +257,7 @@ def _add_routing_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--ponder_scale",
         type=float,
-        default=0.01,
+        default=0.015,
         help="MoR ponder loss scale",
     )
 
@@ -555,6 +556,7 @@ def _add_moe_args(parser: argparse.ArgumentParser) -> None:
         "--moe",
         action="store_true",
         dest="moe_enabled",
+        default=True,
         help="Enable Mixture of Experts (sparse FFN routing)",
     )
     parser.add_argument(
@@ -607,12 +609,13 @@ def _add_moe_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--moe_track_divergence",
         action="store_true",
+        default=True,
         help="Track expert weight divergence during training",
     )
     parser.add_argument(
         "--moe_divergence_interval",
         type=int,
-        default=100,
+        default=500,
         help="Steps between divergence checks",
     )
     parser.add_argument(
@@ -667,6 +670,52 @@ def _add_moe_args(parser: argparse.ArgumentParser) -> None:
         default=1.0,
         help="Weight decay multiplier for MoE experts",
     )
+    parser.add_argument(
+        "--moe_reset_optimizer_state",
+        action="store_true",
+        help="Reset optimizer moments for MoE parameters on resume (fixes gradient scale mismatch)",
+    )
+
+
+def _add_manifold_args(parser: argparse.ArgumentParser) -> None:
+    """Add manifold-constrained hyper connection arguments."""
+    parser.add_argument(
+        "--manifold",
+        action="store_true",
+        dest="manifold_enabled",
+        help="Enable manifold-constrained hyper connections for gradient stabilization",
+    )
+    parser.add_argument(
+        "--manifold_type",
+        type=str,
+        default="sphere",
+        choices=["sphere", "hyperbolic"],
+        help="Manifold type: sphere (L2 norm) or hyperbolic (Poincare ball)",
+    )
+    parser.add_argument(
+        "--manifold_n_components",
+        type=int,
+        default=8,
+        help="Number of learnable basis vectors in manifold connection",
+    )
+    parser.add_argument(
+        "--manifold_warmup_steps",
+        type=int,
+        default=1000,
+        help="Steps before manifold connections reach full contribution",
+    )
+    parser.add_argument(
+        "--manifold_placement_interval",
+        type=int,
+        default=2,
+        help="Place manifold connection after every N blocks (0=all blocks)",
+    )
+    parser.add_argument(
+        "--manifold_curvature",
+        type=float,
+        default=1.0,
+        help="Poincare ball curvature (hyperbolic manifold only)",
+    )
 
 
 def _add_experimental_args(parser: argparse.ArgumentParser) -> None:
@@ -675,14 +724,6 @@ def _add_experimental_args(parser: argparse.ArgumentParser) -> None:
     These optimizations use SafeOptimizations wrapper with auto-fallback
     if anomalies (loss spikes, NaN grads, throughput drops) are detected.
     """
-    # Flash Attention 3
-    parser.add_argument(
-        "--experimental_fa3",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable Flash Attention 3 (Hopper/Blackwell). Auto-falls back to FA2 on failure.",
-    )
-
     # CUDA Graphs
     parser.add_argument(
         "--experimental_cuda_graphs",

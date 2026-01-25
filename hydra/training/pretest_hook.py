@@ -252,7 +252,6 @@ class PretestHook:
         hash_input.append(f"heads={getattr(config, 'mod_mor_n_heads', 0)}")
 
         # Experimental flags
-        hash_input.append(f"fa3={getattr(config, 'experimental_fa3', True)}")
         hash_input.append(f"cuda_graphs={getattr(config, 'experimental_cuda_graphs', True)}")
         hash_input.append(f"blackwell={getattr(config, 'experimental_blackwell_tuning', True)}")
         hash_input.append(f"fp8={getattr(config, 'experimental_fp8', False)}")
@@ -353,12 +352,14 @@ class PretestHook:
 
         # Create SafeOptimizations
         opt_config = OptimizationConfig(
-            enable_fa3=bool(getattr(config, "experimental_fa3", True)),
             enable_cuda_graphs=bool(getattr(config, "experimental_cuda_graphs", True)),
             enable_blackwell_tuning=bool(getattr(config, "experimental_blackwell_tuning", True)),
             enable_prefetch_threads=int(getattr(config, "experimental_prefetch_threads", 4)),
             enable_fp8=bool(getattr(config, "experimental_fp8", False)),
             pretest_steps=int(getattr(config, "experimental_pretest_steps", 5)),
+            # MoE settings - affects CUDA graph compatibility
+            moe_enabled=bool(getattr(config, "moe_enabled", False)),
+            moe_capacity_factor=float(getattr(config, "moe_capacity_factor", float("inf"))),
         )
 
         safe_opts = SafeOptimizations(

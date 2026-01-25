@@ -422,9 +422,11 @@ def format_spike_detail(ctx: SpikeContext) -> str:
             ff = stats.get("finite_frac")
             nan = stats.get("nan_count") or 0
             inf = stats.get("inf_count") or 0
+            rms_str = f"{rms:.2e}" if rms is not None else "n/a"
+            ff_str = f"{ff:.6f}" if ff is not None else "n/a"
             lines.append(
-                f"  Layer {li}: rms={rms if rms else 'n/a':.2e}, "
-                f"finite_frac={ff if ff else 'n/a':.6f}, nan={nan}, inf={inf}"
+                f"  Layer {li}: rms={rms_str}, "
+                f"finite_frac={ff_str}, nan={nan}, inf={inf}"
             )
 
     lines.extend(["", "PROBABLE CAUSES:"])

@@ -81,7 +81,7 @@ class ProgressAwareLRManager:
         print(f"   Current step:  {current_step:,}")
         print(f"   Target steps:  {max_steps:,}")
         print(f"   Remaining:     {max_steps - current_step:,} steps")
-        print(f"   ---")
+        print("   ---")
         if not self.is_resume:
             print(f"   Warmup:        steps 0 - {self.warmup_end_step:,} (LR 0 → {self.max_lr})")
         print(f"   Stable:        steps {self.warmup_end_step:,} - {self.decay_start_step:,} (LR = {self.max_lr})")
@@ -300,7 +300,7 @@ class AdaptiveLRManager:
         remaining_steps = self.config.max_steps - step
         self.cooldown_steps = int(remaining_steps * self.config.adaptive_cooldown_factor)
         self.current_max_lr = self.base_max_lr * self.config.adaptive_lr_reduction
-        print(f"\n" + "=" * 60)
+        print("\n" + "=" * 60)
         print(f"⚡ ADAPTIVE LR: Cooldown triggered at step {step}")
         print(f"   Loss trend: {sum(self.loss_history[-15:-5])/10:.4f} -> {sum(self.loss_history[-5:])/5:.4f}")
         print(f"   New decay phase: {self.cooldown_steps} steps")

@@ -237,17 +237,14 @@ Benchmarked on RTX 5090 32GB with 8-bit Adam + gradient checkpointing (every lay
 | **Fused AdamW** (default) | 100% (2× params) | Fast | Stable | _(default)_ | PyTorch native, battle-tested |
 | **8-bit Adam** | **25%** (0.5× params) | Fast | Stable | `--8bit_adam` | Essential for 1B+. Requires bitsandbytes |
 | **Adafactor** | **<25%** (adaptive) | Medium | Good | `--adafactor` | No momentum state. Internal 1/√t schedule |
-| **Lion** | **50%** (1× params) | Fastest | Good | _(not wired)_ | 3-10x lower LR than AdamW. Needs higher WD |
-| **C-Lion** | **50%** (1× params) | Fastest | Better | _(not wired)_ | Cautious variant, only updates when signs agree |
 | **Muon** | 100% (2× params) | Slow | Research | _(not wired)_ | Newton-Schulz orthogonalization. 2D params only |
-| **Sophia-G** | 100% (2× params) | Slow | Research | _(not wired)_ | Hessian-based. Expensive Hessian estimation |
 
 > \* **Optimizer state only** (momentum + variance buffers), not total VRAM. Total VRAM = weights + gradients + optimizer state + activations.
-> 
+>
 > Example (500M params, bfloat16):
 > - Weights: 1GB, Gradients: 1GB, AdamW state: 4GB → **8-bit Adam state: 1GB** (saves 3GB total)
-> 
-> 🔬 **Research optimizers** (Lion, C-Lion, Muon, Sophia) are implemented in `hydra/optim/` but not yet CLI-accessible. To use them, you'll need to modify `hydra/training/trainer.py` `_setup_optimizer()` method.
+>
+> 🔬 **Research optimizer** (Muon) is implemented in `hydra/optim/` but not yet CLI-accessible. To use it, modify `hydra/training/trainer.py` `_setup_optimizer()` method.
 
 ### Training Commands
 
@@ -621,13 +618,14 @@ HYDRA/
 │   ├── logging.py           # Logging utilities
 │   ├── utils.py             # Common utilities
 │   ├── attention/           # Attention backends
-│   │   ├── backends/        
-│   │   │   ├── ccgqa/       # Compressed Convolutional GQA (primary)
-│   │   │   └── lightning_attn3/  # [Archived] LA3 linear attention (legacy)
+│   │   ├── backends/
+│   │   │   └── ccgqa/       # Compressed Convolutional GQA
 │   │   └── factory.py       # Attention factory
 │   ├── data/                # Data loading utilities
 │   ├── kernels/             # Triton/CUDA kernels
 │   ├── layers/              # Core layer implementations
+│   │   ├── common.py        # RMSNorm, RoPE, SwiGLU
+│   │   └── manifold_connections.py  # Manifold geometry layers
 │   ├── model/               # Model components
 │   │   ├── framework/       # Model wiring (MoD/MoR + factories)
 │   │   └── ccgqa/           # Back-compat shims
@@ -637,6 +635,7 @@ HYDRA/
 │       ├── trainer.py       # Main trainer class
 │       ├── config.py        # Configuration dataclasses
 │       ├── checkpointing.py # Checkpoint management
+│       ├── reasoning.py     # GRPO reasoning training
 │       └── metrics.py       # Training metrics
 ├── trainer.py               # Training entrypoint (CLI)
 ├── scripts/                 # Utility scripts

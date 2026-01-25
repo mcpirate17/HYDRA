@@ -49,6 +49,15 @@ def main(config: TrainingConfig) -> None:
         print(f"   Total tokens: {metrics.total_tokens:,}")
     except Exception as e:
         print(f"\n❌ Training failed: {e}")
+        # Emergency checkpoint save on error (OOM, etc.)
+        try:
+            step = getattr(trainer, "_current_step", 0) or trainer._start_step
+            if step > 0 and hasattr(trainer, "_save_checkpoint"):
+                print(f"💾 Attempting emergency checkpoint save at step {step}...")
+                trainer._save_checkpoint(step, final=False)
+                print(f"✅ Emergency checkpoint saved!")
+        except Exception as save_err:
+            print(f"⚠️  Emergency checkpoint save failed: {save_err}")
         raise
     finally:
         trainer.close()

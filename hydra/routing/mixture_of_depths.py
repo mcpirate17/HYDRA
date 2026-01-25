@@ -183,8 +183,8 @@ class MoDRouter(BaseRouter):
         # Get router scores
         scores = self.forward_logits(x)  # [B, L]
 
-        # Select top-k tokens
-        top_scores, top_indices = torch.topk(scores, k, dim=-1)  # [B, k]
+        # Select top-k tokens (sorted=False since we re-sort by position in MoD wrapper)
+        top_scores, top_indices = torch.topk(scores, k, dim=-1, sorted=False)  # [B, k]
 
         # Create binary mask
         mask = torch.zeros(B, L, device=x.device, dtype=x.dtype)
@@ -290,8 +290,12 @@ class MixtureOfDepthsBlock(nn.Module):
         out_selected = self.block(x_selected, **kwargs)  # [B, k, D]
 
         # Scatter back to full sequence (with identity for skipped)
-        # Ensure output dtype matches out_selected (for mixed precision)
-        output = x.clone().to(out_selected.dtype)  # Start with identity (residual)
+        # MEMORY FIX: Avoid unnecessary clone when dtypes match.
+        # .to() already creates a new tensor when dtype differs, so clone is redundant.
+        if x.dtype == out_selected.dtype:
+            output = x.clone()  # Clone needed to preserve identity for non-selected tokens
+        else:
+            output = x.to(out_selected.dtype)  # Creates new tensor, clone not needed
         output.scatter_(1, indices_expanded, out_selected)
 
         return output

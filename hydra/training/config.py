@@ -106,7 +106,7 @@ class TrainingConfig:
     mor_collapse_depth0_threshold: float = 0.90
     mor_advantage_nudge_mult: float = 2.0  # Boost factor for depth-0 collapse
     mor_advantage_nudge_damp: float = 0.1  # Dampen factor for min-depth collapse
-    mor_advantage_nudge_duration_steps: int = 50
+    mor_advantage_nudge_duration_steps: int = 125
     mor_advantage_nudge_cooldown_steps: int = 500
 
     # ==========================================================================
@@ -160,6 +160,22 @@ class TrainingConfig:
     moe_router_lr_scale: float = 3.0  # LR multiplier for router/gate params (routers need faster learning)
     moe_lr_rewarmup_steps: int = 0    # Steps to re-warmup LR after mid-run optimizer reset (0=disabled)
     moe_expert_weight_decay_scale: float = 3.0  # WD multiplier for experts (prevents weight explosion)
+    moe_reset_optimizer_state: bool = False  # Reset optimizer moments for MoE params on resume
+
+    # ==========================================================================
+    # Manifold-Constrained Hyper Connections
+    # ==========================================================================
+    # Projects residual stream updates onto geometric manifolds (sphere or Poincare
+    # ball) to bound gradient magnitudes and prevent gradient explosions.
+    #
+    # Key insight: Manifold projection bounds Jacobian spectral norm, preventing
+    # cascading gradient explosions through deep residual streams.
+    manifold_enabled: bool = False
+    manifold_type: str = "sphere"  # "sphere" or "hyperbolic"
+    manifold_n_components: int = 8  # Number of learnable basis vectors
+    manifold_warmup_steps: int = 1000  # Steps before full contribution
+    manifold_placement_interval: int = 2  # Place after every N blocks (0=all)
+    manifold_curvature: float = 1.0  # Poincare ball curvature (hyperbolic only)
 
     # Model config
     dim: int = 768
@@ -204,6 +220,7 @@ class TrainingConfig:
     grad_clip_min: float = 50.0  # Floor to prevent over-aggressive clipping
     grad_clip_max: float = 3000.0  # Ceiling to prevent runaway (allows MoE adaptation)
     grad_clip_ema_alpha: float = 0.05  # EMA decay (0.05 = ~20 step half-life)
+    grad_clip_ema_cap: float = 500.0  # Cap EMA input to prevent runaway feedback loop
 
     # WSD Scheduler
     lr_schedule: str = "wsd_adaptive"
@@ -281,11 +298,25 @@ class TrainingConfig:
     
     # Profiling
     use_profiler: bool = False
+
+    # Reasoning / System 2 (GRPO-based online RL)
+    reasoning_enabled: bool = False
+    reasoning_start_step: int = 10000       # Step to auto-enable reasoning (if loss threshold not met)
+    reasoning_loss_threshold: float = 2.0   # Enable when loss frequently below this (0 = disabled)
+    reasoning_interval: int = 100           # Run GRPO step every N training steps
+    reasoning_batch_size: int = 2           # Prompts per reasoning step
+    reasoning_max_tokens: int = 256         # Max completion length
+    reasoning_temperature: float = 0.7      # Sampling temperature
+    reasoning_top_p: float = 0.95           # Nucleus sampling threshold
+    reasoning_reward_function: str = "format_reward"  # 'exact_match', 'format_reward', 'length_penalty'
+    grpo_num_generations: int = 4           # G: completions per prompt
+    grpo_kl_coef: float = 0.01              # KL penalty coefficient
     profiler_dir: str = "profiler_traces"
 
     checkpoint_every_n: int = 2
     use_8bit_adam: bool = False
     use_adafactor: bool = False
+    use_muon: bool = False
 
     # Debug/stability
     halt_on_spike: bool = False
@@ -721,6 +752,14 @@ def build_config_from_args(
         moe_router_lr_scale=getattr(args, "moe_router_lr_scale", 1.0),
         moe_lr_rewarmup_steps=getattr(args, "moe_lr_rewarmup_steps", 0),
         moe_expert_weight_decay_scale=getattr(args, "moe_expert_weight_decay_scale", 1.0),
+        moe_reset_optimizer_state=getattr(args, "moe_reset_optimizer_state", False),
+        # Manifold connections
+        manifold_enabled=getattr(args, "manifold_enabled", False),
+        manifold_type=getattr(args, "manifold_type", "sphere"),
+        manifold_n_components=getattr(args, "manifold_n_components", 8),
+        manifold_warmup_steps=getattr(args, "manifold_warmup_steps", 1000),
+        manifold_placement_interval=getattr(args, "manifold_placement_interval", 2),
+        manifold_curvature=getattr(args, "manifold_curvature", 1.0),
     )
 
 
