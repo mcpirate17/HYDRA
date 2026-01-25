@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
-import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 import torch.profiler
 
@@ -24,10 +23,12 @@ from .lr import get_lr, ProgressAwareLRManager
 from .lr_step import compute_step_lr
 from .runtime import configure_runtime
 from hydra.logging import HydraLogger
+from hydra.optim.muon import Muon
 
 from . import checkpointing as _checkpointing
 from . import reporting as _reporting
 from .loop import (
+    clear_mor_caches,
     compute_microbatch_loss,
     compute_token_losses_from_hidden,
     evaluate_fixed_batches,
@@ -45,11 +46,12 @@ from . import step_diagnostics as _step_diag
 from . import db as _db
 from .safe_optimizations import SafeOptimizations, OptimizationConfig
 from .pretest_hook import PretestHook
+from .reasoning import GRPOTrainerMixin  # Added for System 2 training
 
 _RUNTIME_STATUS = configure_runtime()
 
 
-class Trainer:
+class Trainer(GRPOTrainerMixin):
     """Optimized trainer with all performance best practices."""
 
     __slots__ = (
@@ -120,6 +122,11 @@ class Trainer:
         "_grad_norm_ema",  # For dynamic gradient clipping
         "_safe_opts",  # SafeOptimizations wrapper for experimental optimizations
         "_pretest_hook",  # Hook for automatic pretest runs on config/checkpoint changes
+        # Reasoning / GRPO state
+        "_reasoning_prompts",      # Cached reasoning prompts
+        "_reasoning_prompt_idx",   # Current index into prompts
+        "_tokenizer",              # Cached tokenizer for generation
+        "_last_grpo_metrics",      # Last GRPO step metrics
     )
 
     def __init__(self, config: TrainingConfig):
@@ -268,6 +275,13 @@ class Trainer:
         self._mor_advantage_nudge_until_step: int = 0
         self._mor_advantage_nudge_cooldown_until_step: int = 0
         self._mor_advantage_nudge_active: bool = False
+        
+        # Reasoning / GRPO state (System 2)
+        self._reasoning_prompts = None
+        self._reasoning_prompt_idx = 0
+        self._tokenizer = None
+        self._last_grpo_metrics = None
+        
         if config.resume_from:
             self._checkpoint_config = self._peek_checkpoint_config(config.resume_from)
             self._checkpoint_seq_len = self._checkpoint_config.get("max_seq_len", config.max_seq_len)
@@ -337,6 +351,24 @@ class Trainer:
         self.logger.info(f"Tokens/step: {self._tokens_per_step:,} ({self._tokens_per_step/1e6:.2f}M per optimizer step)")
         self.logger.info(f"Dataset: {config.dataset_name}")
         self.logger.info(f"torch.compile: {config.use_compile} (mode={config.compile_mode})")
+        
+        # Log attention backend status
+        if _RUNTIME_STATUS:
+            sage_status = _RUNTIME_STATUS.get("sage_attn", "unavailable")
+            flash_status = _RUNTIME_STATUS.get("flash_attn", "unavailable")
+            liger_status = _RUNTIME_STATUS.get("liger", "unavailable")
+            
+            if sage_status == "enabled":
+                self.logger.info("Attention: Sage Attention (2-5x faster via INT8/FP8)")
+            elif flash_status == "enabled":
+                self.logger.info("Attention: Flash Attention 2")
+            else:
+                self.logger.info("Attention: PyTorch SDPA (default)")
+            
+            self.logger.info(f"  ├─ Sage: {sage_status}")
+            self.logger.info(f"  ├─ Flash: {flash_status}")
+            self.logger.info(f"  └─ Liger: {liger_status}")
+        
         if self._kernel_status is not None:
             ks = self._kernel_status
             triton_enabled = ks.get("use_triton_kernels", False)
@@ -436,9 +468,6 @@ class Trainer:
         handling attributes that may not exist on older configs.
         """
         opt_config = OptimizationConfig(
-            # FA3 (Flash Attention 3)
-            enable_fa3=bool(getattr(config, "experimental_fa3", True)),
-            fa3_fallback_to_fa2=True,
             # CUDA Graphs
             enable_cuda_graphs=bool(getattr(config, "experimental_cuda_graphs", True)),
             cuda_graphs_warmup_steps=int(getattr(config, "cuda_graphs_warmup", 50)),
@@ -459,6 +488,9 @@ class Trainer:
             throughput_drop_threshold=float(getattr(config, "experimental_throughput_drop_threshold", 0.5)),
             # Pretest
             pretest_steps=int(getattr(config, "experimental_pretest_steps", 10)),
+            # MoE settings - affects CUDA graph compatibility
+            moe_enabled=bool(getattr(config, "moe_enabled", False)),
+            moe_capacity_factor=float(getattr(config, "moe_capacity_factor", float("inf"))),
         )
 
         safe_opts = SafeOptimizations(
@@ -545,11 +577,20 @@ class Trainer:
             moe_teacher_until_step=getattr(config, "moe_teacher_until_step", 0),
             # Static routing mode for CUDA graph compatibility
             static_routing_mode=getattr(config, "static_routing_mode", False),
+            # Manifold-constrained hyper connections
+            manifold_enabled=getattr(config, "manifold_enabled", False),
+            manifold_type=getattr(config, "manifold_type", "sphere"),
+            manifold_n_components=getattr(config, "manifold_n_components", 8),
+            manifold_warmup_steps=getattr(config, "manifold_warmup_steps", 1000),
+            manifold_placement_interval=getattr(config, "manifold_placement_interval", 2),
+            manifold_curvature=getattr(config, "manifold_curvature", 1.0),
         ).to(self.device)
         self._use_mod_mor = True
         mod_status = "OFF (capacity=1.0)" if config.mod_capacity >= 1.0 else f"{config.mod_capacity:.0%} capacity (warmup={mod_mlp_warmup} steps)"
         mor_status = "adaptive" if config.mor_adaptive else "fixed-depth (no routing)"
         self.logger.info(f"MoD: {mod_status}")
+        if getattr(config, "manifold_enabled", False):
+            self.logger.info(f"Manifold: {config.manifold_type} ({config.manifold_n_components} components, warmup={config.manifold_warmup_steps}, interval={config.manifold_placement_interval})")
         self.logger.info(f"MoR: {mor_status}, {config.mor_recursions} recursions/block")
         
         # CurriculumController owns MoR/MoD gating state and decision logic
@@ -748,6 +789,16 @@ class Trainer:
             )
             self._skip_lr_schedule = True
             self.logger.info(f"Using PyTorch Adafactor - lr={adafactor_lr:.2e} (internal 1/√t schedule)")
+        elif config.use_muon:
+            self.optimizer = Muon(
+                self.model.parameters(), # Muon internally splits params
+                lr=config.max_lr,
+                momentum=0.95,
+                ns_steps=5,
+                adamw_lr=config.max_lr, # Base AdamW LR (scaled inside Muon if needed)
+                adamw_wd=config.weight_decay
+            )
+            self.logger.info(f"Using Muon Optimizer (Momentum Orthogonalized) + AdamW backend")
         elif config.use_8bit_adam:
             import bitsandbytes as bnb
             self.optimizer = bnb.optim.AdamW8bit(
@@ -937,6 +988,33 @@ class Trainer:
 
         # strict=False because we intentionally exclude cache buffers.
         model.load_state_dict(state_dict, strict=False)
+        
+        # Detect if manifold was added to a checkpoint that didn't have it.
+        # If so, freeze manifold gradients until warmup completes to prevent 
+        # catastrophic forgetting from the freshly-initialized manifold params.
+        if hasattr(model, "manifold_connections") and len(model.manifold_connections) > 0:
+            checkpoint_keys = set(state_dict.keys())
+            has_manifold_in_checkpoint = any(
+                k.startswith("manifold_connections.") for k in checkpoint_keys
+            )
+            if not has_manifold_in_checkpoint:
+                resume_step = checkpoint.get("step", 0)
+                self.logger.info("  📐 Manifold enabled but not in checkpoint - freezing manifold gradients during warmup")
+                model.freeze_manifold_grads()
+                # Set warmup start to current step so warmup is RELATIVE
+                model.set_manifold_warmup_start(resume_step)
+                # Store state for delayed unfreeze - warmup_steps AFTER resume
+                mc = model.manifold_connections[0]
+                warmup_steps = mc.warmup_steps if mc.warmup_steps > 0 else 500
+                self._manifold_needs_unfreeze = True
+                self._manifold_unfreeze_step = resume_step + warmup_steps
+                self.logger.info(f"  📐 Manifold warmup starts at step {resume_step}, will complete at step {self._manifold_unfreeze_step}")
+            else:
+                self._manifold_needs_unfreeze = False
+                self._manifold_unfreeze_step = 0
+        else:
+            self._manifold_needs_unfreeze = False
+            self._manifold_unfreeze_step = 0
 
         def _sanitize_bitsandbytes_state_for_step() -> bool:
             """Return True if bnb optimizer state looks usable; else clear it.
@@ -1144,7 +1222,27 @@ class Trainer:
                 if "ce_ema" in extra:
                     self._resume_ce_ema = float(extra.get("ce_ema", 0.0) or 0.0)
                 if "grad_norm_ema" in extra:
-                    self._grad_norm_ema = float(extra.get("grad_norm_ema", 0.0) or 0.0)
+                    loaded_ema = float(extra.get("grad_norm_ema", 0.0) or 0.0)
+                    # Cap the loaded EMA to prevent runaway from corrupted checkpoints.
+                    # If checkpoint has inflated EMA (e.g., from prior spike), dynamic clip
+                    # would stay at max for thousands of steps, causing gradient runaway.
+                    ema_cap = float(getattr(self.config, "grad_clip_ema_cap", 500.0) or 500.0)
+                    # Allow manual override via env var for recovery from gradient runaway
+                    env_override = os.environ.get("HYDRA_GRAD_NORM_EMA_OVERRIDE", "")
+                    if env_override:
+                        override_val = float(env_override)
+                        self.logger.warning(
+                            f"  ⚠️  HYDRA_GRAD_NORM_EMA_OVERRIDE={override_val:.1f} (was {loaded_ema:.1f})"
+                        )
+                        self._grad_norm_ema = override_val
+                    elif loaded_ema > ema_cap:
+                        self.logger.warning(
+                            f"  ⚠️  Checkpoint grad_norm_ema={loaded_ema:.1f} exceeds cap={ema_cap:.0f}; "
+                            f"resetting to cap to prevent gradient runaway"
+                        )
+                        self._grad_norm_ema = ema_cap
+                    else:
+                        self._grad_norm_ema = loaded_ema
                     self.logger.info(f"  Restored grad_norm_ema: {self._grad_norm_ema:.1f}")
         except Exception:
             self._resume_ce_ema = 0.0
@@ -1164,8 +1262,17 @@ class Trainer:
                     f"  ⚠️  Resume state incomplete (optimizer={optimizer_loaded}, scaler={scaler_loaded}, rng={rng_loaded}); "
                     f"enabling LR re-warmup for {self._resume_rewarmup_steps} steps"
                 )
+            # Skip optimizer updates entirely for first N steps to let grad norm EMA adapt
+            # This prevents catastrophic weight updates when optimizer moments are reset
+            skip_opt_steps = int(os.environ.get("HYDRA_RESUME_SKIP_OPTIMIZER_STEPS", "10") or 10)
+            self._resume_skip_optimizer_until = int(self._start_step) + skip_opt_steps
+            if skip_opt_steps > 0:
+                self.logger.warning(
+                    f"  ⚠️  Skipping optimizer updates for first {skip_opt_steps} steps to stabilize gradients"
+                )
         else:
             self._resume_rewarmup_steps = 0
+            self._resume_skip_optimizer_until = 0
         
         # MoE per-component LR re-warmup (for mid-run optimizer reset / hot-fix)
         # This is triggered when moe_lr_rewarmup_steps > 0, indicating user intentionally
@@ -1298,8 +1405,8 @@ class Trainer:
                     if counts is not None and counts.sum() > 0:
                         probs = counts / counts.sum()
                         all_utilizations.append(probs.tolist())
-                        # Compute actual entropy: -sum(p * log(p))
-                        entropy = -sum(p * math.log(p + 1e-10) for p in probs.tolist())
+                        # Compute actual entropy using torch (avoids .tolist() + Python loop)
+                        entropy = -(probs * torch.log(probs + 1e-10)).sum().item()
                         all_entropies.append(entropy)
                     
                     # Reset accumulated counts after reading
@@ -1471,13 +1578,14 @@ class Trainer:
         _clip_min = float(getattr(config, "grad_clip_min", 50.0))
         _clip_max = float(getattr(config, "grad_clip_max", 3000.0))
         _clip_ema_alpha = float(getattr(config, "grad_clip_ema_alpha", 0.05))
+        _clip_ema_cap = float(getattr(config, "grad_clip_ema_cap", 500.0))  # Cap EMA input to prevent runaway
         # Initialize EMA from checkpoint or static grad_clip (R2/R5 mitigation)
         _grad_norm_ema = float(getattr(self, "_grad_norm_ema", 0.0) or 0.0)
         if _grad_norm_ema <= 0:
             _grad_norm_ema = float(grad_clip) / _clip_k  # Start so dynamic_clip = grad_clip
         self._grad_norm_ema = _grad_norm_ema  # Initialize slot
         if _use_dynamic_clip:
-            self.logger.info(f"Dynamic gradient clipping: ENABLED (k={_clip_k}, min={_clip_min}, max={_clip_max}, ema={_grad_norm_ema:.1f})")
+            self.logger.info(f"Dynamic gradient clipping: ENABLED (k={_clip_k}, min={_clip_min}, max={_clip_max}, ema_cap={_clip_ema_cap:.0f}, ema={_grad_norm_ema:.1f})")
         start_step = self._start_step
         use_mod_mor = bool(getattr(self, "_use_mod_mor", False))
         use_scaler = bool(getattr(self, "_use_scaler", False))
@@ -1710,7 +1818,6 @@ class Trainer:
                         # SafeOptimizations status
                         "optimizations": _safe_opts_status,
                         "triton_config": _safe_opts_config,
-                        "opt_fa3": _safe_opts_status.get("fa3", "DISABLED"),
                         "opt_cuda_graphs": _safe_opts_status.get("cuda_graphs", "DISABLED"),
                         "opt_blackwell_tuning": _safe_opts_status.get("blackwell_tuning", "DISABLED"),
                         "opt_prefetch_threads": _safe_opts_status.get("prefetch_threads", "DISABLED"),
@@ -1804,6 +1911,7 @@ class Trainer:
         _diag_steps = _step_diag.get_diag_steps_from_env(start_step)
 
         step = int(start_step)
+        self._current_step = step  # Track for emergency checkpoint on error
 
         # Graceful shutdown handling for Ctrl+C
         _interrupt_requested = False
@@ -1850,6 +1958,23 @@ class Trainer:
 
         while step < max_steps:
             step_start = time.time()
+            self._current_step = step  # Track for emergency checkpoint on error
+            
+            # System 2 / Reasoning Phase: GRPO step REPLACES regular training step
+            # This runs as a complete standalone step (own optimizer cycle) to avoid
+            # graph conflicts with torch.compile. Step counter advances after completion.
+            reasoning_interval = int(getattr(self.config, "reasoning_interval", 100))
+            if getattr(self.config, "reasoning_enabled", False) and step % reasoning_interval == 0:
+                self.logger.info(f"🧠 System 2 Reasoning Active (Step {step})")
+                grpo_metrics = self._run_reasoning_step(step)
+                if grpo_metrics:
+                    self._last_grpo_metrics = grpo_metrics
+                # Advance step and continue (skip regular training this step)
+                step += 1
+                if hasattr(self.train_loader, "set_step"):
+                    self.train_loader.set_step(step)
+                continue
+            
             optimizer.zero_grad(set_to_none=True)
             accum_loss = torch.zeros((), device=self.device)
             accum_ce = torch.zeros((), device=self.device)
@@ -1867,6 +1992,16 @@ class Trainer:
                 base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
                 if hasattr(base_model, "set_global_step"):
                     base_model.set_global_step(step)
+                
+                # Check if manifold warmup is complete and gradients should be unfrozen
+                if getattr(self, "_manifold_needs_unfreeze", False):
+                    if hasattr(base_model, "manifold_connections") and len(base_model.manifold_connections) > 0:
+                        # Unfreeze when we reach the scheduled step
+                        unfreeze_step = getattr(self, "_manifold_unfreeze_step", 0)
+                        if step >= unfreeze_step:
+                            base_model.unfreeze_manifold_grads()
+                            self._manifold_needs_unfreeze = False
+                            self.logger.info(f"  📐 Manifold warmup complete - unfreezing gradients at step {step}")
 
             for micro_step in range(grad_accum):
                 x, y, mask = self._get_batch()
@@ -2056,9 +2191,39 @@ class Trainer:
                     # Fallback: treat total loss as CE if ce_loss isn't available.
                     accum_ce += loss.detach() * loss_scale
 
+            # MEMORY FIX: Clear MoR router caches after backward to release gradient graphs.
+            # This prevents graph accumulation across training steps.
+            if use_mod_mor:
+                clear_mor_caches(model)
+
             # Resolve accumulated losses (sync points)
             accum_loss = accum_loss.item()
             accum_ce_f = float(accum_ce.item())
+
+            # Automatic System 2 / Reasoning Phase Transition
+            # (Must run after accum_loss is resolved)
+            if not getattr(self.config, "reasoning_enabled", False):
+                reasoning_start = getattr(self.config, "reasoning_start_step", 1_000_000)
+                reasoning_thr = getattr(self.config, "reasoning_loss_threshold", 0.0)
+                
+                # Update Stability Window (last 100 steps of Total Loss)
+                if not hasattr(self, "_loss_history"):
+                    self._loss_history = deque(maxlen=100)
+                self._loss_history.append(accum_loss)
+
+                # Check 1: Forced Step
+                if step >= reasoning_start:
+                    self.config.reasoning_enabled = True
+                    self.logger.info(f"🚀 REASONING PHASE ENABLED (Step {step} >= {reasoning_start})")
+                
+                # Check 2: Stability (Frequency of low loss)
+                # "Frequently below 2" -> If 50% of last 100 steps are below threshold
+                elif reasoning_thr > 0.0 and len(self._loss_history) >= 20:
+                    hits = sum(1 for lv in self._loss_history if lv < reasoning_thr)
+                    hit_rate = hits / len(self._loss_history)
+                    if hit_rate > 0.5:
+                        self.config.reasoning_enabled = True
+                        self.logger.info(f"🚀 REASONING PHASE ENABLED (Stability: {hits}/{len(self._loss_history)} steps < {reasoning_thr})")
 
             # Opt-in step diagnostics: Phase 1 (before unscale)
             _step_diag_ctx = _step_diag.StepDiagnostics(step=step, active=(step in _diag_steps))
@@ -2095,8 +2260,10 @@ class Trainer:
             pre_clip_norm = float(pre_clip_norm_t) if torch.is_tensor(pre_clip_norm_t) else float(pre_clip_norm_t)
 
             # Update gradient norm EMA (R4 mitigation: skip NaN/Inf)
+            # Cap input to prevent runaway feedback loop (grad spikes → EMA up → clip up → grads up)
             if _use_dynamic_clip and math.isfinite(pre_clip_norm):
-                _grad_norm_ema = _clip_ema_alpha * pre_clip_norm + (1 - _clip_ema_alpha) * _grad_norm_ema
+                capped_norm = min(pre_clip_norm, _clip_ema_cap)
+                _grad_norm_ema = _clip_ema_alpha * capped_norm + (1 - _clip_ema_alpha) * _grad_norm_ema
                 self._grad_norm_ema = _grad_norm_ema  # Store for checkpoint save
 
             clipped_this_step = math.isfinite(pre_clip_norm) and (pre_clip_norm > float(effective_clip))
@@ -2257,7 +2424,19 @@ class Trainer:
                     # Each group has lr_scale stored from _setup_optimizer
                     lr_scale = float(pg.get("lr_scale", 1.0))
                     pg["lr"] = lr * lr_scale
-            if use_scaler:
+            
+            # Skip optimizer updates for first N steps when optimizer state was reset
+            # This lets grad norm EMA adapt before making weight changes
+            skip_until = getattr(self, "_resume_skip_optimizer_until", 0)
+            if skip_until > 0 and step < skip_until:
+                # Don't update weights, just update scaler state
+                if use_scaler:
+                    scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                # Log that we skipped
+                if step == (skip_until - 1):
+                    self.logger.info(f"  📐 Optimizer updates will resume at step {skip_until}")
+            elif use_scaler:
                 scaler.step(optimizer)
                 scaler.update()
             else:
@@ -2577,18 +2756,12 @@ class Trainer:
                         wandb_payload["moe_aux_loss"] = moe_val
                     wandb_mod.log(wandb_payload)
                 if use_mod_mor and step % 100 == 0:
-                    # Compute VRAM for dashboard
-                    _vram_gb = 0.0
-                    if _track_peak_vram:
-                        try:
-                            _vram_gb = float(torch.cuda.max_memory_allocated(device=_cuda_device_idx)) / (1024.0 ** 3)
-                        except Exception:
-                            pass
-                    self._log_layer_diagnostics(
-                        step, accum_loss, lr, grad_norm, ce_step=accum_ce_f,
-                        tokens_per_sec=float(tps), vram_gb=_vram_gb
-                    )
-            
+                    self._log_layer_diagnostics(step, accum_loss, lr, grad_norm, ce_step=accum_ce_f)
+
+                # MEMORY FIX: Periodically flush diagnostics to disk to prevent unbounded growth
+                if step % 10000 == 0 and step > 0:
+                    self._flush_diagnostics_to_disk()
+
             # MoE divergence tracking (optional, adds CPU overhead)
             if (self.config.moe_enabled and 
                 getattr(self.config, "moe_track_divergence", False) and 
@@ -2684,8 +2857,7 @@ class Trainer:
         return metrics
 
     def _log_layer_diagnostics(
-        self, step: int, loss: float, lr: float, grad_norm: float, *, ce_step: float,
-        tokens_per_sec: float = 0.0, vram_gb: float = 0.0
+        self, step: int, loss: float, lr: float, grad_norm: float, *, ce_step: float
     ) -> None:
         model = self.model
         if hasattr(model, "_orig_mod"):
@@ -2710,11 +2882,6 @@ class Trainer:
             "lr": lr,
             "grad_norm": grad_norm,
             "grad_norm_pre_clip": getattr(self, "_last_pre_clip_norm", grad_norm),  # Raw norm before clipping
-            # Performance metrics for dashboard
-            "tokens_per_sec": tokens_per_sec,
-            "vram_gb": vram_gb,
-            "batch_size": self.config.batch_size,
-            "seq_len": self._current_seq_len,
             "mod_layers": [],
             "mor_layers": [],
         }
@@ -2790,7 +2957,11 @@ class Trainer:
             avg_depth = layer_stat.get("avg_depth", 0)
             expected_depth = layer_stat.get("expected_avg_depth", 1.5)
             router_probs = layer_stat.get("router_probs_mean", 0.5)
-            depth_hist = layer_stat.get("depth_histogram", [])
+            # Use MoD-filtered histogram for collapse detection if available
+            # This only counts tokens that MoD actually processed
+            depth_hist_filtered = layer_stat.get("depth_histogram_mod_filtered")
+            depth_hist_raw = layer_stat.get("depth_histogram", [])
+            depth_hist = depth_hist_filtered if depth_hist_filtered else depth_hist_raw
             status = "OK"
             
             # Only flag router collapse if we are in adaptive phase
@@ -2818,7 +2989,8 @@ class Trainer:
                     "avg_depth": avg_depth,
                     "expected_depth": expected_depth,
                     "router_probs_mean": router_probs,
-                    "depth_histogram": depth_hist,
+                    "depth_histogram": depth_hist_raw,  # Raw histogram (all tokens)
+                    "depth_histogram_mod_filtered": depth_hist_filtered,  # MoD-filtered (may be None)
                     "status": status,
                 }
             )
@@ -2876,12 +3048,14 @@ class Trainer:
             ):
                 # Confirm collapse ratio if histogram present; this avoids nudging
                 # on weak/noisy stats. Check if collapsed to depth 0 or min_depth.
+                # Use MoD-filtered histogram if available (only count tokens MoD processed).
                 confirmed = False
                 collapse_depth = -1
                 for layer in record.get("mor_layers", []):
                     if layer.get("status") not in collapse_statuses:
                         continue
-                    hist = layer.get("depth_histogram", []) or []
+                    # Prefer MoD-filtered histogram for accurate collapse detection
+                    hist = layer.get("depth_histogram_mod_filtered") or layer.get("depth_histogram", []) or []
                     total = float(sum(hist) or 0.0)
                     if total <= 0.0:
                         continue
@@ -2989,6 +3163,29 @@ class Trainer:
             logger=self.logger,
             run_id=self.config.run_id,
         )
+
+    def _flush_diagnostics_to_disk(self) -> None:
+        """Periodically flush diagnostics to disk to prevent memory accumulation.
+
+        MEMORY FIX: For long training runs (100K+ steps), keeping all diagnostics
+        in memory can consume 50-100+ MB. This method saves to disk and clears the
+        in-memory list, keeping only the most recent entries for potential logging.
+
+        Call this every 10K steps to keep memory bounded.
+        """
+        if len(self._diagnostics_data) < 100:
+            # Not enough to bother flushing
+            return
+
+        # Save all diagnostics to disk
+        self._save_diagnostics()
+
+        # Keep only last 50 entries in memory (for recent stats if needed)
+        # This bounds memory to ~1-2 MB regardless of training length
+        keep_count = 50
+        if len(self._diagnostics_data) > keep_count:
+            self._diagnostics_data = self._diagnostics_data[-keep_count:]
+            self.logger.debug(f"📊 Flushed diagnostics to disk, keeping last {keep_count} entries in memory")
 
     def _update_training_db(self) -> None:
         """Load diagnostics JSON into training database for cross-run analysis."""

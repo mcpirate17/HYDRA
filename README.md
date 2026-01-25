@@ -974,9 +974,8 @@ The fused backward kernels reduce kernel launch overhead dramatically:
 All fused backward kernels are **enabled by default** when `--triton_kernels` is set.
 
 **Flash Attention**
-- Flash Attention 2/3 auto-detected and enabled
+- Flash Attention 2 auto-detected and enabled
 - Memory-efficient attention (no QK^T materialization)
-- FP8 support on Flash Attention 3
 
 ### Training Infrastructure
 
@@ -998,6 +997,34 @@ All fused backward kernels are **enabled by default** when `--triton_kernels` is
 - Auto-trigger cooldown on loss spikes
 - Stochastic Weight Averaging (last 25% of training)
 - Batch filtering (skip corrupted/noisy batches)
+
+### Memory Optimization
+
+HYDRA includes several memory optimizations to prevent OOM during long training runs:
+
+**Reasoning Training Memory Fixes:**
+- **Chunked log_softmax**: Computes log probabilities without materializing full `[B, L, V]` logits tensor (saves 4-12GB for large vocab)
+- **Gradient checkpointing**: Forward passes in reasoning use `torch.utils.checkpoint` to trade compute for memory
+- **Router tensor detachment**: MoR router tensors used only for diagnostics are `.detach()`ed to prevent gradient graph accumulation
+
+**Attention Memory Fixes:**
+- **On-demand causal masks**: Causal masks computed per-forward instead of pre-allocated (saves ~67MB per attention module)
+- **BF16 RoPE cache**: RoPE embeddings cached in bfloat16 instead of float32 (saves ~28MB for typical configs)
+
+**Routing Memory Fixes:**
+- **Per-iteration MoR masks**: Depth masks computed inside the recursion loop instead of pre-allocating `[R, B, L]` tensors
+- **Clone optimization**: MoD only clones tensors when dtype conversion isn't already creating a new tensor
+
+**Training Loop Fixes:**
+- **MoR cache clearing**: Router caches cleared after backward pass to release gradient graphs
+- **Diagnostics flush**: Diagnostics data flushed to disk every 10K steps to prevent memory accumulation
+
+**Environment Variables for Memory:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HYDRA_ROPE_CACHE_DTYPE` | `bf16` | RoPE cache dtype (`bf16`, `fp16`, `fp32`) |
+| `PYTORCH_CUDA_ALLOC_CONF` | - | Set to `expandable_segments:True` to reduce fragmentation |
 
 ### Environment Variables
 

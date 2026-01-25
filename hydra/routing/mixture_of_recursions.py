@@ -422,21 +422,9 @@ class MoRExecutor(nn.Module):
         dtype = x.dtype
         n_rec = self.config.n_recursions
 
-        # Pre-compute masks for all depths
-        depth_indices = torch.arange(n_rec, device=device)
-
-        # exit_at_depth[i, b, l] = 1 if token (b,l) exits at depth i
-        exit_at_depth = (depths.unsqueeze(0) == depth_indices.view(-1, 1, 1))  # [R, B, L]
-
-        # active_at_depth[i, b, l] = 1 if token (b,l) is active at depth i
-        active_at_depth = (depths.unsqueeze(0) >= depth_indices.view(-1, 1, 1))  # [R, B, L]
-
-        # STE weights: Gaussian centered on continuous depth
+        # MEMORY OPTIMIZATION: Compute masks per-iteration instead of pre-allocating [R, B, L]
+        # This saves ~3x memory for typical n_rec=4 setups by avoiding large upfront allocations
         depth_continuous = probs * (n_rec - 1)
-        depth_indices_f = depth_indices.to(dtype)
-        ste_weights = torch.exp(
-            -((depth_continuous.unsqueeze(0) - depth_indices_f.view(-1, 1, 1)) ** 2)
-        )  # [R, B, L]
 
         # Accumulation
         output = torch.zeros_like(x)
@@ -447,14 +435,16 @@ class MoRExecutor(nn.Module):
             self._recursion_tokens_processed = []
 
         for i in range(n_rec):
-            # Masks for this depth
-            active_mask = active_at_depth[i].unsqueeze(-1).to(dtype)  # [B, L, 1]
-            exit_mask = exit_at_depth[i].unsqueeze(-1).to(dtype)  # [B, L, 1]
-            ste_weight_i = ste_weights[i].unsqueeze(-1)  # [B, L, 1]
+            # Compute masks for this depth only (saves memory vs pre-computing all)
+            active_mask = (depths >= i).unsqueeze(-1).to(dtype)  # [B, L, 1]
+            exit_mask = (depths == i).unsqueeze(-1).to(dtype)  # [B, L, 1]
+
+            # STE weight for this depth: Gaussian centered on continuous depth
+            ste_weight_i = torch.exp(-((depth_continuous - i) ** 2)).unsqueeze(-1)  # [B, L, 1]
 
             # Diagnostics
             if self.training:
-                self._recursion_tokens_processed.append(active_at_depth[i].sum().detach())
+                self._recursion_tokens_processed.append((depths >= i).sum().detach())
 
             # Add recursion embeddings
             rec_bias = self.recursion_bias[i].squeeze()  # [D]

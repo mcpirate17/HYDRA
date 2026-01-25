@@ -25,6 +25,32 @@ def resolve_micro_diag_tensors(micro_diag: list[dict]) -> None:
                 md[k] = v.item()
 
 
+def clear_mor_caches(model: torch.nn.Module) -> None:
+    """Clear cached MoR routing tensors to prevent gradient graph accumulation.
+
+    After backward(), the MoR blocks may still hold _last_probs tensors that
+    reference the now-freed computation graph. This causes memory to accumulate
+    until the next forward() overwrites them. Call this after backward() to
+    immediately release these references.
+
+    This is critical for preventing OOM during long training runs.
+    """
+    base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    layers = getattr(base_model, "layers", [])
+    for layer in layers:
+        # Clear MoR-related cached tensors that may hold gradient graphs
+        if hasattr(layer, "_last_probs"):
+            layer._last_probs = None
+        if hasattr(layer, "_last_depths"):
+            layer._last_depths = None
+        if hasattr(layer, "_last_router_logits"):
+            layer._last_router_logits = None
+        if hasattr(layer, "_last_router_probs_tensor"):
+            layer._last_router_probs_tensor = None
+        if hasattr(layer, "_last_target_depths"):
+            layer._last_target_depths = None
+
+
 @torch.no_grad()
 def compute_token_losses_from_hidden(
     hidden: torch.Tensor,
