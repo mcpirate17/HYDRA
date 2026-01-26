@@ -8,8 +8,8 @@ from __future__ import annotations
 import argparse
 import logging
 import math
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
 
 _log = logging.getLogger(__name__)
 
@@ -300,7 +300,9 @@ class TrainingConfig:
     use_profiler: bool = False
 
     # Reasoning / System 2 (GRPO-based online RL)
-    reasoning_enabled: bool = False
+    # NOTE: Generation runs one sequence at a time on GPU with aggressive memory clearing
+    # to prevent unpredictable OOM. Logprobs computed in micro-batches of 4.
+    reasoning_enabled: bool = True          # Auto-activates at reasoning_start_step
     reasoning_start_step: int = 10000       # Step to auto-enable reasoning (if loss threshold not met)
     reasoning_loss_threshold: float = 2.0   # Enable when loss frequently below this (0 = disabled)
     reasoning_interval: int = 100           # Run GRPO step every N training steps
@@ -760,6 +762,18 @@ def build_config_from_args(
         manifold_warmup_steps=getattr(args, "manifold_warmup_steps", 1000),
         manifold_placement_interval=getattr(args, "manifold_placement_interval", 2),
         manifold_curvature=getattr(args, "manifold_curvature", 1.0),
+        # Reasoning / System 2 (GRPO) - generation on GPU one at a time, logprobs micro-batched
+        reasoning_enabled=getattr(args, "reasoning_enabled", True),
+        reasoning_start_step=getattr(args, "reasoning_start_step", 10000),
+        reasoning_loss_threshold=getattr(args, "reasoning_loss_threshold", 2.0),
+        reasoning_interval=getattr(args, "reasoning_interval", 100),
+        reasoning_batch_size=getattr(args, "reasoning_batch_size", 2),
+        reasoning_max_tokens=getattr(args, "reasoning_max_tokens", 256),
+        reasoning_temperature=getattr(args, "reasoning_temperature", 0.7),
+        reasoning_top_p=getattr(args, "reasoning_top_p", 0.95),
+        reasoning_reward_function=getattr(args, "reasoning_reward_function", "format_reward"),
+        grpo_num_generations=getattr(args, "grpo_num_generations", 4),
+        grpo_kl_coef=getattr(args, "grpo_kl_coef", 0.01),
     )
 
 

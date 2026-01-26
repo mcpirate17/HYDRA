@@ -19,7 +19,6 @@ from __future__ import annotations
 import gc
 import logging
 import re
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -30,32 +29,6 @@ if TYPE_CHECKING:
     from .config import TrainingConfig
 
 _log = logging.getLogger("HYDRA")
-
-
-@dataclass
-class ReasoningConfig:
-    """Configuration for System 2 / Reasoning training."""
-    enabled: bool = False
-    
-    # GRPO settings
-    num_generations: int = 4      # G: Number of samples to generate per prompt
-    kl_coef: float = 0.01         # Beta: KL penalty coefficient
-    clip_epsilon: float = 0.2     # PPO-style clipping epsilon (unused in simple GRPO)
-    max_completion_length: int = 512  # Max tokens to generate per completion
-    temperature: float = 0.7      # Sampling temperature for diversity
-    top_p: float = 0.95           # Nucleus sampling threshold
-    
-    # Execution parameters
-    reasoning_interval: int = 100       # Run reasoning step every N training steps
-    reasoning_batch_size: int = 2       # Prompts per reasoning step (total samples = batch * G)
-    reasoning_grad_accum: int = 1       # Gradient accumulation for reasoning updates
-    
-    # "Thinking" token definitions (for process masking)
-    start_thought_token_id: Optional[int] = None
-    end_thought_token_id: Optional[int] = None
-    
-    # Reward configuration
-    reward_function: str = "format_reward"  # 'exact_match', 'format_reward', 'length_penalty'
 
 
 # ============================================================================
@@ -399,24 +372,24 @@ def compute_sequence_logprobs(
     base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
 
     # Define forward function for checkpointing
+    # NOTE: No exception handling here - if OOM occurs, we want to fail cleanly
+    # rather than retry and allocate even more memory (cascading OOM)
     def forward_fn(ids):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            try:
-                outputs = base_model(ids)
-                if isinstance(outputs, tuple):
-                    return outputs[0]
-                return outputs
-            except Exception:
-                try:
-                    logits, _ = base_model(ids, return_losses=False)
-                    return logits
-                except Exception:
-                    return base_model(ids)
+            outputs = base_model(ids)
+            if isinstance(outputs, tuple):
+                return outputs[0]
+            return outputs
 
     # Forward pass with optional gradient checkpointing
-    if use_gradient_checkpointing and input_ids.requires_grad:
+    # NOTE: We check use_gradient_checkpointing directly, NOT input_ids.requires_grad
+    # because input_ids comes from generation (no_grad) but we still want checkpointing
+    # for memory efficiency. The model's internal checkpointing handles gradient flow.
+    if use_gradient_checkpointing:
         from torch.utils.checkpoint import checkpoint
-        logits = checkpoint(forward_fn, input_ids, use_reentrant=False)
+        # Enable requires_grad temporarily for checkpoint to work
+        ids_for_ckpt = input_ids.detach().requires_grad_(True)
+        logits = checkpoint(forward_fn, ids_for_ckpt, use_reentrant=False)
     else:
         logits = forward_fn(input_ids)
 
@@ -613,17 +586,6 @@ class GRPOTrainerMixin:
             if hasattr(layer, "_last_target_depths"):
                 layer._last_target_depths = None
 
-    @torch.no_grad()
-    def _snapshot_model_state(self) -> Dict[str, torch.Tensor]:
-        """Create lightweight copy of model params for reference policy."""
-        base_model = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
-        return {k: v.clone() for k, v in base_model.state_dict().items()}
-    
-    def _restore_model_state(self, state: Dict[str, torch.Tensor]) -> None:
-        """Restore model from snapshot (for reference policy)."""
-        base_model = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
-        base_model.load_state_dict(state)
-    
     def _run_reasoning_step(self, step: int) -> Optional[Dict[str, float]]:
         """
         Execute a full GRPO reasoning step:
@@ -656,6 +618,7 @@ class GRPOTrainerMixin:
         torch._dynamo.reset()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()  # Free GPU memory before CPU generation
         
         # Get reward function
         reward_fn = REWARD_FUNCTIONS.get(reward_fn_name, reward_format_check)
@@ -679,21 +642,59 @@ class GRPOTrainerMixin:
         # Store reference logprobs BEFORE generation (model is still in current state)
         base_model.eval()
         
-        # Generate G completions per prompt (using unwrapped model for generation)
+        # Generate completions ONE AT A TIME to avoid GPU memory spikes
+        # This is slower but prevents unpredictable OOM from memory fragmentation
         eos_id = tokenizer.eos_token_id
         pad_id = tokenizer.pad_token_id or eos_id
         
-        generated_ids, completion_mask = generate_completions(
-            model=base_model,
-            prompt_ids=prompt_ids,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=50,
-            eos_token_id=eos_id,
-            pad_token_id=pad_id,
-            num_return_sequences=G,
-        )
+        all_generated = []
+        all_masks = []
+        
+        self.logger.info(f"  🧠 Generating {batch_size * G} completions (1 at a time to avoid OOM)...")
+        
+        for prompt_idx in range(batch_size):
+            single_prompt = prompt_ids[prompt_idx:prompt_idx+1]  # [1, prompt_len]
+            
+            for gen_idx in range(G):
+                # Generate single completion
+                gen_ids, gen_mask = generate_completions(
+                    model=base_model,
+                    prompt_ids=single_prompt,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=50,
+                    eos_token_id=eos_id,
+                    pad_token_id=pad_id,
+                    num_return_sequences=1,
+                )
+                all_generated.append(gen_ids)
+                all_masks.append(gen_mask)
+                
+                # Aggressive memory clearing between generations
+                del gen_ids, gen_mask
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
+        # Pad all sequences to same length and stack
+        max_len = max(g.shape[1] for g in all_generated)
+        padded_generated = []
+        padded_masks = []
+        
+        for gen_ids, gen_mask in zip(all_generated, all_masks):
+            pad_len = max_len - gen_ids.shape[1]
+            if pad_len > 0:
+                gen_ids = torch.cat([gen_ids, torch.full((1, pad_len), pad_id, device=gen_ids.device)], dim=1)
+                gen_mask = torch.cat([gen_mask, torch.zeros((1, pad_len), device=gen_mask.device)], dim=1)
+            padded_generated.append(gen_ids)
+            padded_masks.append(gen_mask)
+        
+        generated_ids = torch.cat(padded_generated, dim=0)  # [B*G, max_len]
+        completion_mask = torch.cat(padded_masks, dim=0)    # [B*G, max_len]
+        
+        del all_generated, all_masks, padded_generated, padded_masks
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         # generated_ids: [B * G, total_len]
         total_samples = generated_ids.shape[0]
@@ -726,24 +727,103 @@ class GRPOTrainerMixin:
             self.logger.info(f"  Reasoning step {step}: skipped (no reward variance)")
             # Clear cached MoR tensors to prevent graph conflicts with next training step
             self._clear_mor_caches(base_model)
-            # Reset dynamo state to clear any compiled graph remnants
-            torch._dynamo.reset()
-            # Clear CUDA cache to free generation tensors
+            # Clear CUDA cache to free generation tensors (don't reset dynamo - causes fragmentation)
             del generated_ids, completion_mask
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             return {"grpo/skipped": 1.0, "grpo/reward_mean": rewards_tensor.mean().item()}
         
+        # Already on GPU - no move needed
+
+        # MEMORY SAFETY: Check available VRAM before expensive logprobs computation
+        # Require at least 2GB free to avoid sporadic OOM during forward pass
+        MIN_FREE_VRAM_GB = 2.0
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            free_vram = torch.cuda.mem_get_info()[0] / (1024**3)
+            if free_vram < MIN_FREE_VRAM_GB:
+                self.logger.warning(
+                    f"  ⚠️ Reasoning step skipped: only {free_vram:.2f}GB free (need {MIN_FREE_VRAM_GB}GB)"
+                )
+                self._clear_mor_caches(base_model)
+                del generated_ids, completion_mask, rewards_tensor
+                gc.collect()
+                torch.cuda.empty_cache()
+                return {"grpo/skipped": 1.0, "grpo/reason": "low_vram", "grpo/free_vram_gb": free_vram}
+
+        # SEQUENCE LENGTH SAFETY: Truncate very long sequences to prevent OOM
+        # Long sequences consume O(L^2) memory in attention - cap at 512 for safety
+        MAX_LOGPROB_SEQ_LEN = 512
+        if total_len > MAX_LOGPROB_SEQ_LEN:
+            self.logger.info(f"  ⚡ Truncating sequences from {total_len} to {MAX_LOGPROB_SEQ_LEN} for logprobs")
+            generated_ids = generated_ids[:, :MAX_LOGPROB_SEQ_LEN]
+            completion_mask = completion_mask[:, :MAX_LOGPROB_SEQ_LEN]
+            total_len = MAX_LOGPROB_SEQ_LEN
+
         # Compute log probs under current policy (use base_model for consistency)
         base_model.train()
+
+        # MICRO-BATCH logprobs computation to avoid OOM
+        # Process sequences in small chunks to limit GPU memory usage
+        # Use micro_batch_size=2 for large models (>500M params)
+        micro_batch_size = 2 if total_len > 384 else 4
+        all_logprobs = []
+
+        # OOM recovery pattern: PyTorch docs recommend handling cleanup OUTSIDE
+        # the except block because the exception object holds references to the
+        # stack frame, preventing tensor deallocation. See:
+        # https://pytorch.org/docs/stable/notes/faq.html#my-out-of-memory-exception-handler-can-t-allocate-memory
+        oom_occurred = False
+        oom_message = ""
+
+        for i in range(0, total_samples, micro_batch_size):
+            if oom_occurred:
+                break
+
+            end_idx = min(i + micro_batch_size, total_samples)
+            chunk_ids = generated_ids[i:end_idx]
+            chunk_mask = completion_mask[i:end_idx]
+
+            try:
+                chunk_logprobs = compute_sequence_logprobs(
+                    base_model,
+                    chunk_ids,
+                    chunk_mask,
+                )
+                all_logprobs.append(chunk_logprobs.detach())  # Detach to free graph memory
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" in str(e).lower():
+                    oom_occurred = True
+                    oom_message = str(e)
+                else:
+                    raise
+
+            # Free intermediate memory (always, even on OOM path)
+            # Use try/except for chunk_logprobs since it may not exist on OOM
+            try:
+                del chunk_ids, chunk_mask, chunk_logprobs
+            except NameError:
+                del chunk_ids, chunk_mask
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # OOM cleanup OUTSIDE the except block - this is critical!
+        # The exception object holds references that prevent tensor deallocation.
+        if oom_occurred:
+            self.logger.warning(f"  ⚠️ OOM during logprobs computation, skipping reasoning step: {oom_message}")
+            self._clear_mor_caches(base_model)
+            # Delete all tensors that might hold GPU memory
+            del all_logprobs, generated_ids, completion_mask, rewards_tensor
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return {"grpo/skipped": 1.0, "grpo/reason": "oom_logprobs"}
         
-        # Reshape for batch processing: [B*G, L] -> compute logprobs -> [B, G, L]
-        current_logprobs = compute_sequence_logprobs(
-            base_model,
-            generated_ids,
-            completion_mask,
-        )  # [B*G, L]
+        current_logprobs = torch.cat(all_logprobs, dim=0)  # [B*G, L]
+        current_logprobs.requires_grad_(True)  # Re-enable grads for GRPO loss
+        del all_logprobs
+        
         current_logprobs = current_logprobs.view(batch_size, G, total_len)
         
         # For simple online GRPO, use current logprobs as reference (KL ≈ 0)
@@ -787,8 +867,9 @@ class GRPOTrainerMixin:
         # Clear cached MoR tensors to prevent graph conflicts with next training step
         self._clear_mor_caches(base_model)
         
-        # Reset dynamo state to clear any compiled graph remnants after reasoning step
-        torch._dynamo.reset()
+        # NOTE: Do NOT call torch._dynamo.reset() here. Repeated resets cause memory
+        # fragmentation from recompilation cycles. The dynamo reset at the START of
+        # _run_reasoning_step is sufficient to avoid graph capture conflicts.
         
         # CRITICAL: Clear CUDA memory to prevent accumulation across reasoning steps
         # The logprobs computation creates large intermediate tensors that can fragment memory
@@ -805,40 +886,5 @@ class GRPOTrainerMixin:
             f"reward={metrics['grpo/reward_mean']:.3f}±{metrics['grpo/reward_std']:.3f} | "
             f"adv={metrics['grpo/advantage_mean']:.3f}"
         )
-        
+
         return metrics
-
-
-# ============================================================================
-# THOUGHT BOUNDARY DETECTION
-# ============================================================================
-
-def detect_thought_boundaries(
-    input_ids: torch.Tensor, 
-    start_id: int, 
-    end_id: int
-) -> torch.Tensor:
-    """
-    Returns a mask where 1 = inside a thought block, 0 = outside.
-    Useful for 'Thought Masking' (blocking gradients on thought tokens 
-    to prevent mimicking human errors, or vice versa).
-    """
-    B, L = input_ids.shape
-    mask = torch.zeros_like(input_ids, dtype=torch.bool)
-    
-    # Simple state machine for vectorized thinking detection
-    is_thinking = torch.zeros((B,), dtype=torch.bool, device=input_ids.device)
-    
-    for i in range(L):
-        token = input_ids[:, i]
-        # Entering thought
-        starts = (token == start_id)
-        is_thinking = is_thinking | starts
-        
-        mask[:, i] = is_thinking
-        
-        # Exiting thought
-        ends = (token == end_id)
-        is_thinking = is_thinking & (~ends)
-        
-    return mask

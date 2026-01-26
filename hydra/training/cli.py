@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 from typing import List
 
 __all__ = [
@@ -104,6 +103,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     _add_observability_args(parser)
     _add_moe_args(parser)
     _add_manifold_args(parser)
+    _add_reasoning_args(parser)
     _add_experimental_args(parser)
     return parser
 
@@ -715,6 +715,77 @@ def _add_manifold_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=1.0,
         help="Poincare ball curvature (hyperbolic manifold only)",
+    )
+
+
+def _add_reasoning_args(parser: argparse.ArgumentParser) -> None:
+    """Add System 2 / Reasoning (GRPO) training arguments."""
+    parser.add_argument(
+        "--reasoning_enabled",
+        type=lambda x: x.lower() in ("true", "1", "yes"),
+        default=True,
+        help="Enable System 2 reasoning (GRPO) - activates at reasoning_start_step",
+    )
+    parser.add_argument(
+        "--reasoning_start_step",
+        type=int,
+        default=10000,
+        help="Step to auto-enable reasoning (if loss threshold not met)",
+    )
+    parser.add_argument(
+        "--reasoning_loss_threshold",
+        type=float,
+        default=2.0,
+        help="Enable reasoning when loss frequently below this (0=disabled)",
+    )
+    parser.add_argument(
+        "--reasoning_interval",
+        type=int,
+        default=100,
+        help="Run reasoning/GRPO step every N training steps",
+    )
+    parser.add_argument(
+        "--reasoning_batch_size",
+        type=int,
+        default=2,
+        help="Prompts per reasoning step",
+    )
+    parser.add_argument(
+        "--reasoning_max_tokens",
+        type=int,
+        default=256,
+        help="Max completion length for reasoning generation",
+    )
+    parser.add_argument(
+        "--reasoning_temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature for reasoning",
+    )
+    parser.add_argument(
+        "--reasoning_top_p",
+        type=float,
+        default=0.95,
+        help="Nucleus sampling threshold",
+    )
+    parser.add_argument(
+        "--reasoning_reward_function",
+        type=str,
+        default="format_reward",
+        choices=["exact_match", "format_reward", "length_penalty"],
+        help="Reward function for GRPO",
+    )
+    parser.add_argument(
+        "--grpo_num_generations",
+        type=int,
+        default=4,
+        help="Number of completions per prompt (G in GRPO)",
+    )
+    parser.add_argument(
+        "--grpo_kl_coef",
+        type=float,
+        default=0.01,
+        help="KL penalty coefficient for GRPO",
     )
 
 

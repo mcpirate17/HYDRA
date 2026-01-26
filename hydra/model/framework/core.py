@@ -915,7 +915,7 @@ class CCGQAMoRBlock(nn.Module):
             dim_ref=dim_ref,
             depth_alpha=depth_alpha,
             depth_scale_max=depth_scale_max,
-            advantage_loss_scale=attention_kwargs.pop("mor_advantage_loss_scale", 0.1),
+            advantage_loss_scale=attention_kwargs.pop("mor_advantage_loss_scale", 0.02),
         )
         self.mor_router = MoRRouter(mor_config)
         self.mor_executor = MoRExecutor(mor_config)

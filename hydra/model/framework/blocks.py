@@ -577,7 +577,7 @@ class HydraMoRBlock(nn.Module):
             dim_ref=dim_ref,
             depth_alpha=depth_alpha,
             depth_scale_max=depth_scale_max,
-            advantage_loss_scale=attention_kwargs.pop("mor_advantage_loss_scale", 0.1),
+            advantage_loss_scale=attention_kwargs.pop("mor_advantage_loss_scale", 0.02),
             min_depth=mor_min_depth,
             static_routing_mode=static_routing_mode,
         )

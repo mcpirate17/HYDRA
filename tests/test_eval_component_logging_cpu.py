@@ -106,6 +106,7 @@ def test_eval_component_logging_path_cpu(monkeypatch, tmp_path):
         gradient_checkpointing=False,
         checkpoint_dir=str(tmp_path),
         report_dir=str(tmp_path),
+        reasoning_enabled=False,  # Disable: tiny model vocab (128) incompatible with GPT-2 tokenizer
     )
     # TrainingConfig.__post_init__ overrides some fields based on mode; force the smoke to be 1 step.
     cfg.max_steps = 1
