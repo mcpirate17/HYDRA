@@ -763,9 +763,11 @@ class GRPOTrainerMixin:
                     chunk_mask,
                 )  # [chunk_size, L]
 
-                # Compute policy loss for this chunk: -A * sum(log_probs)
-                # Sum log probs over completion tokens
-                completion_logprobs = (chunk_logprobs * chunk_mask).sum(dim=1)  # [chunk_size]
+                # Compute policy loss for this chunk: -A * mean(log_probs)
+                # IMPORTANT: Use mean over tokens, not sum, to keep loss scale independent
+                # of sequence length and comparable to cross-entropy loss (~2-4 range)
+                num_tokens = chunk_mask.sum(dim=1).clamp(min=1)  # [chunk_size]
+                completion_logprobs = (chunk_logprobs * chunk_mask).sum(dim=1) / num_tokens  # [chunk_size]
                 chunk_policy_loss = -(chunk_advantages * completion_logprobs).mean()
 
                 # Scale loss for gradient accumulation (average over all micro-batches)
