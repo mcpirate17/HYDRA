@@ -708,7 +708,9 @@ DATASET_CONFIGS = {
     },
     # Small datasets for testing
     "wikitext2": {
-        "path": "wikitext",
+        # NOTE: Original "wikitext" dataset deprecated on HuggingFace (404 errors).
+        # Using Salesforce mirror which is actively maintained.
+        "path": "Salesforce/wikitext",
         "name": "wikitext-2-raw-v1",
         "text_column": "text",
         "description": "Small Wikipedia text (~2M tokens)",

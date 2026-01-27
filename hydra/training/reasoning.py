@@ -366,15 +366,16 @@ def compute_sequence_logprobs(
     model: torch.nn.Module,
     input_ids: torch.Tensor,    # [B, L]
     mask: torch.Tensor,         # [B, L] - which tokens to compute logprobs for
-    use_gradient_checkpointing: bool = True,
+    use_gradient_checkpointing: bool = True,  # Ignored - model has internal checkpointing
     chunk_size: int = 4096,     # Vocab chunk size for memory-efficient log_softmax
 ) -> torch.Tensor:
     """
     Compute per-token log probabilities for sequences.
 
-    Memory-optimized version that:
-    1. Uses gradient checkpointing to reduce activation memory
-    2. Uses chunked log_softmax to avoid [B, L, V] allocation
+    Memory-optimized version that uses chunked log_softmax to avoid [B, L, V] allocation.
+
+    Note: use_gradient_checkpointing is ignored because input_ids are integers (token IDs)
+    which cannot require gradients. The model's internal checkpointing handles memory.
 
     Returns: [B, L] tensor of log probs (0 where mask is 0)
     """
@@ -394,17 +395,11 @@ def compute_sequence_logprobs(
                 return outputs[0]
             return outputs
 
-    # Forward pass with optional gradient checkpointing
-    # NOTE: We check use_gradient_checkpointing directly, NOT input_ids.requires_grad
-    # because input_ids comes from generation (no_grad) but we still want checkpointing
-    # for memory efficiency. The model's internal checkpointing handles gradient flow.
-    if use_gradient_checkpointing:
-        from torch.utils.checkpoint import checkpoint
-        # Enable requires_grad temporarily for checkpoint to work
-        ids_for_ckpt = input_ids.detach().requires_grad_(True)
-        logits = checkpoint(forward_fn, ids_for_ckpt, use_reentrant=False)
-    else:
-        logits = forward_fn(input_ids)
+    # Forward pass - model's internal gradient checkpointing handles memory efficiency
+    # NOTE: We cannot use torch.utils.checkpoint here because input_ids are integers
+    # (token IDs) which cannot require gradients. The HYDRA model already has internal
+    # gradient checkpointing enabled via --checkpoint_every flag.
+    logits = forward_fn(input_ids)
 
     # Shift for next-token prediction: logits[t] predicts token[t+1]
     shift_logits = logits[:, :-1, :]              # [B, L-1, V] - view, not copy
