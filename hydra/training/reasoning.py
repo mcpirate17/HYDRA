@@ -202,21 +202,33 @@ def generate_completions(
         prompt_ids = prompt_ids.repeat_interleave(num_return_sequences, dim=0)
     
     total_batch = prompt_ids.shape[0]
-    generated = prompt_ids.clone()
-    
+    pad_id = pad_token_id if pad_token_id is not None else 0
+
+    # PRE-ALLOCATE output buffer to avoid O(L²) memory from repeated torch.cat
+    # This eliminates ~256 temporary tensor allocations during generation
+    max_total_len = prompt_len + max_new_tokens
+    generated = torch.full(
+        (total_batch, max_total_len), pad_id, device=device, dtype=prompt_ids.dtype
+    )
+    generated[:, :prompt_len] = prompt_ids
+    current_len = prompt_len
+
     # Track which sequences have finished (hit EOS)
     finished = torch.zeros(total_batch, dtype=torch.bool, device=device)
-    
+
     # Use inference_mode for generation (more efficient than no_grad)
     with torch.inference_mode():
         for _ in range(max_new_tokens):
             if finished.all():
                 break
-            
+
             # Forward pass - get logits for last position
+            # Only pass tokens up to current_len (not the full pre-allocated buffer)
+            input_ids = generated[:, :current_len]
+
             # Handle different model forward signatures
             try:
-                outputs = base_model(generated)
+                outputs = base_model(input_ids)
                 if isinstance(outputs, tuple):
                     logits = outputs[0]
                 else:
@@ -224,16 +236,16 @@ def generate_completions(
             except Exception:
                 # Fallback for models expecting return_losses kwarg
                 try:
-                    logits, _ = base_model(generated, return_losses=False)
+                    logits, _ = base_model(input_ids, return_losses=False)
                 except Exception:
-                    logits = base_model(generated)
-            
+                    logits = base_model(input_ids)
+
             next_logits = logits[:, -1, :]  # [B*G, vocab]
-            
+
             # Temperature scaling
             if temperature > 0:
                 next_logits = next_logits / temperature
-            
+
             # Top-k filtering
             if top_k > 0:
                 top_k_vals, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
@@ -243,42 +255,43 @@ def generate_completions(
                     torch.full_like(next_logits, float("-inf")),
                     next_logits,
                 )
-            
+
             # Top-p (nucleus) filtering
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
                 cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                
+
                 # Remove tokens with cumulative probability above threshold
                 sorted_mask = cumulative_probs > top_p
                 # Shift to keep first token above threshold
                 sorted_mask[:, 1:] = sorted_mask[:, :-1].clone()
                 sorted_mask[:, 0] = False
-                
+
                 # Scatter mask back to original order
                 mask = sorted_mask.scatter(1, sorted_indices, sorted_mask)
                 next_logits = next_logits.masked_fill(mask, float("-inf"))
-            
+
             # Sample
             probs = F.softmax(next_logits, dim=-1)
-            next_tokens = torch.multinomial(probs, num_samples=1)  # [B*G, 1]
-            
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [B*G]
+
             # Don't update finished sequences
-            next_tokens = torch.where(
-                finished.unsqueeze(-1),
-                torch.full_like(next_tokens, pad_token_id or 0),
-                next_tokens,
-            )
-            
-            generated = torch.cat([generated, next_tokens], dim=1)
-            
+            next_tokens = torch.where(finished, torch.full_like(next_tokens, pad_id), next_tokens)
+
+            # Write in-place to pre-allocated buffer (no torch.cat!)
+            generated[:, current_len] = next_tokens
+            current_len += 1
+
             # Check for EOS
             if eos_token_id is not None:
-                finished = finished | (next_tokens.squeeze(-1) == eos_token_id)
-    
+                finished = finished | (next_tokens == eos_token_id)
+
+    # Truncate to actual length (creates a view, not a copy)
+    generated = generated[:, :current_len].contiguous()
+    total_len = current_len
+
     # Build completion mask (1 for generated tokens, 0 for prompt)
-    total_len = generated.shape[1]
-    completion_mask = torch.zeros_like(generated, dtype=torch.float)
+    completion_mask = torch.zeros(total_batch, total_len, device=device, dtype=torch.float)
     completion_mask[:, prompt_len:] = 1.0
     
     # Mask out padding for finished sequences
@@ -322,26 +335,26 @@ def _chunked_log_softmax_gather(
 
     # Compute logsumexp over vocab dimension in chunks to reduce peak memory
     # logsumexp(x) = max(x) + log(sum(exp(x - max(x))))
-    if V <= chunk_size:
-        # Small vocab - just compute directly in float32
-        logsumexp = torch.logsumexp(logits.float(), dim=-1)  # [B, L]
-    else:
-        # Large vocab - chunked computation in float32
-        # First pass: find max across all chunks
-        max_logit = logits[:, :, :chunk_size].float().max(dim=-1).values
-        for start in range(chunk_size, V, chunk_size):
-            end = min(start + chunk_size, V)
-            chunk_max = logits[:, :, start:end].float().max(dim=-1).values
-            max_logit = torch.maximum(max_logit, chunk_max)
+    # Always use chunked computation to avoid allocating full [B, L, V] in float32
+    # even for small vocab (the overhead is minimal and behavior is consistent)
 
-        # Second pass: compute sum of exp(x - max) across chunks
-        sum_exp = torch.zeros(B, L, device=device, dtype=torch.float32)
-        for start in range(0, V, chunk_size):
-            end = min(start + chunk_size, V)
-            chunk = logits[:, :, start:end].float()
-            sum_exp = sum_exp + torch.exp(chunk - max_logit.unsqueeze(-1)).sum(dim=-1)
+    # First pass: find max across all chunks (compute in original dtype, result is [B, L])
+    max_logit = logits[:, :, :chunk_size].max(dim=-1).values.float()
+    for start in range(chunk_size, V, chunk_size):
+        end = min(start + chunk_size, V)
+        chunk_max = logits[:, :, start:end].max(dim=-1).values.float()
+        max_logit = torch.maximum(max_logit, chunk_max)
 
-        logsumexp = max_logit + sum_exp.log()
+    # Second pass: compute sum of exp(x - max) across chunks
+    # Only convert each chunk to float32, not the entire tensor
+    sum_exp = torch.zeros(B, L, device=device, dtype=torch.float32)
+    for start in range(0, V, chunk_size):
+        end = min(start + chunk_size, V)
+        # Subtract max in original dtype to keep values small, then convert
+        chunk_shifted = (logits[:, :, start:end] - max_logit.unsqueeze(-1).to(logits.dtype))
+        sum_exp = sum_exp + torch.exp(chunk_shifted.float()).sum(dim=-1)
+
+    logsumexp = max_logit + sum_exp.log()
 
     # log_softmax at label = label_logit - logsumexp (in float32)
     token_logprobs = label_logits - logsumexp
@@ -511,59 +524,6 @@ class GRPOTrainerMixin:
             _log.error(f"Failed to get tokenizer: {e}")
             return None
     
-    def compute_grpo_loss(
-        self,
-        model_logprobs: torch.Tensor,     # [B, G, SeqLen]
-        ref_logprobs: torch.Tensor,       # [B, G, SeqLen]
-        rewards: torch.Tensor,            # [B, G]
-        mask: torch.Tensor,               # [B, G, SeqLen] - 1 for generated tokens
-        kl_coef: float = 0.01,
-    ) -> Tuple[torch.Tensor, dict]:
-        """
-        Computes GRPO loss (simplified DeepSeek-R1 style).
-        
-        L = -E[ A_i * log π(y|x) ] + β * KL(π || π_ref)
-        
-        Where Advantage A_i is computed relative to the GROUP:
-        A_i = (r_i - mean(r_group)) / (std(r_group) + eps)
-        """
-        B, G, S = model_logprobs.shape
-        
-        # 1. Group-Relative Advantages
-        mean_rewards = rewards.mean(dim=1, keepdim=True)  # [B, 1]
-        std_rewards = rewards.std(dim=1, keepdim=True) + 1e-8
-        advantages = (rewards - mean_rewards) / std_rewards  # [B, G]
-        
-        # 2. KL Divergence (token-level)
-        # Approximate KL = log(π) - log(π_ref)
-        token_kl = (model_logprobs - ref_logprobs)  # [B, G, S]
-        
-        # 3. Policy Loss
-        # Sum log probs over completion tokens
-        completion_logprobs = (model_logprobs * mask).sum(dim=2)  # [B, G]
-        
-        # Weighted by advantage: -A * log π(completion)
-        policy_loss = -(advantages * completion_logprobs)  # [B, G]
-        
-        # 4. KL Penalty
-        kl_per_sample = (token_kl * mask).sum(dim=2)  # [B, G]
-        kl_loss = kl_coef * kl_per_sample
-        
-        # Total loss (mean over batch and group)
-        total_loss = (policy_loss + kl_loss).mean()
-        
-        # Metrics (resolve to Python floats outside compiled regions)
-        metrics = {
-            "grpo/loss": total_loss.detach().item(),
-            "grpo/reward_mean": rewards.mean().item(),
-            "grpo/reward_std": rewards.std().item(),
-            "grpo/kl_mean": token_kl.mean().item(),
-            "grpo/advantage_mean": advantages.mean().item(),
-            "grpo/advantage_std": advantages.std().item(),
-        }
-        
-        return total_loss, metrics
-
     def _clear_mor_caches(self, base_model: torch.nn.Module) -> None:
         """Clear cached MoR routing tensors to prevent graph conflicts.
         
@@ -764,11 +724,19 @@ class GRPOTrainerMixin:
         # Compute log probs under current policy (use base_model for consistency)
         base_model.train()
 
-        # MICRO-BATCH logprobs computation to avoid OOM
-        # Process sequences in small chunks to limit GPU memory usage
-        # Use micro_batch_size=2 for large models (>500M params)
+        # PRE-COMPUTE ADVANTAGES from rewards (no gradients needed)
+        # This allows us to process logprobs in micro-batches with immediate backward
+        # Advantages: A_i = (r_i - mean(r_group)) / (std(r_group) + eps)
+        mean_rewards = rewards_tensor.mean(dim=1, keepdim=True)  # [B, 1]
+        std_rewards = rewards_tensor.std(dim=1, keepdim=True) + 1e-8
+        advantages = (rewards_tensor - mean_rewards) / std_rewards  # [B, G]
+        advantages_flat = advantages.view(-1)  # [B*G] for micro-batch indexing
+
+        # MICRO-BATCH with gradient accumulation
+        # Process sequences in small chunks, backward immediately to free graph memory
+        # This fixes the gradient disconnect bug: gradients now flow to the model
         micro_batch_size = 2 if total_len > 384 else 4
-        all_logprobs = []
+        num_micro_batches = (total_samples + micro_batch_size - 1) // micro_batch_size
 
         # OOM recovery pattern: PyTorch docs recommend handling cleanup OUTSIDE
         # the except block because the exception object holds references to the
@@ -777,21 +745,44 @@ class GRPOTrainerMixin:
         oom_occurred = False
         oom_message = ""
 
+        # Metrics accumulators
+        total_loss = 0.0
+        total_kl = 0.0
+        micro_batches_processed = 0
+
         for i in range(0, total_samples, micro_batch_size):
             if oom_occurred:
                 break
 
             end_idx = min(i + micro_batch_size, total_samples)
+            chunk_size_actual = end_idx - i
             chunk_ids = generated_ids[i:end_idx]
             chunk_mask = completion_mask[i:end_idx]
+            chunk_advantages = advantages_flat[i:end_idx]  # [chunk_size]
 
             try:
+                # Compute logprobs WITH gradients (no detach!)
                 chunk_logprobs = compute_sequence_logprobs(
                     base_model,
                     chunk_ids,
                     chunk_mask,
-                )
-                all_logprobs.append(chunk_logprobs.detach())  # Detach to free graph memory
+                )  # [chunk_size, L]
+
+                # Compute policy loss for this chunk: -A * sum(log_probs)
+                # Sum log probs over completion tokens
+                completion_logprobs = (chunk_logprobs * chunk_mask).sum(dim=1)  # [chunk_size]
+                chunk_policy_loss = -(chunk_advantages * completion_logprobs).mean()
+
+                # Scale loss for gradient accumulation (average over all micro-batches)
+                scaled_loss = chunk_policy_loss / num_micro_batches
+
+                # Backward immediately - this frees the computation graph
+                self.scaler.scale(scaled_loss).backward()
+
+                # Accumulate metrics (detach for logging)
+                total_loss += chunk_policy_loss.detach().item() * chunk_size_actual
+                micro_batches_processed += 1
+
             except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
                 if "out of memory" in str(e).lower():
                     oom_occurred = True
@@ -800,87 +791,66 @@ class GRPOTrainerMixin:
                     raise
 
             # Free intermediate memory (always, even on OOM path)
-            # Use try/except for chunk_logprobs since it may not exist on OOM
             try:
-                del chunk_ids, chunk_mask, chunk_logprobs
+                del chunk_ids, chunk_mask, chunk_advantages, chunk_logprobs
+                del completion_logprobs, chunk_policy_loss, scaled_loss
             except NameError:
-                del chunk_ids, chunk_mask
+                pass  # Some variables may not exist on OOM
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
         # OOM cleanup OUTSIDE the except block - this is critical!
-        # The exception object holds references that prevent tensor deallocation.
         if oom_occurred:
             self.logger.warning(f"  ⚠️ OOM during logprobs computation, skipping reasoning step: {oom_message}")
             self._clear_mor_caches(base_model)
-            # Delete all tensors that might hold GPU memory
-            del all_logprobs, generated_ids, completion_mask, rewards_tensor
+            self.optimizer.zero_grad(set_to_none=True)  # Clear partial gradients
+            del generated_ids, completion_mask, rewards_tensor, advantages, advantages_flat
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             return {"grpo/skipped": 1.0, "grpo/reason": "oom_logprobs"}
-        
-        current_logprobs = torch.cat(all_logprobs, dim=0)  # [B*G, L]
-        current_logprobs.requires_grad_(True)  # Re-enable grads for GRPO loss
-        del all_logprobs
-        
-        current_logprobs = current_logprobs.view(batch_size, G, total_len)
-        
-        # For simple online GRPO, use current logprobs as reference (KL ≈ 0)
-        # In a full implementation, you'd snapshot the model before generation
-        ref_logprobs = current_logprobs.detach()
-        
-        # Reshape mask
-        completion_mask_3d = completion_mask.view(batch_size, G, total_len)
-        
-        # Compute GRPO loss
-        loss, metrics = self.compute_grpo_loss(
-            model_logprobs=current_logprobs,
-            ref_logprobs=ref_logprobs,
-            rewards=rewards_tensor,
-            mask=completion_mask_3d,
-            kl_coef=kl_coef,
-        )
-        
-        # Backward pass (use self.model to ensure compiled graph gets gradients)
-        self.scaler.scale(loss).backward()
-        
-        # Explicitly delete large tensors to free memory before optimizer step
-        del current_logprobs, ref_logprobs, completion_mask_3d, loss
-        del generated_ids, completion_mask, rewards_tensor
-        
-        # Optional: clip gradients
+
+        # Clean up tensors no longer needed
+        del generated_ids, completion_mask, advantages_flat
+
+        # Clip gradients
         self.scaler.unscale_(self.optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.model.parameters(),
             max_norm=getattr(config, "max_grad_norm", 1.0),
         )
-        
+
         # Optimizer step
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
-        
+
         # Restore training mode on main model
         self.model.train()
-        
+
         # Clear cached MoR tensors to prevent graph conflicts with next training step
         self._clear_mor_caches(base_model)
-        
-        # NOTE: Do NOT call torch._dynamo.reset() here. Repeated resets cause memory
-        # fragmentation from recompilation cycles. The dynamo reset at the START of
-        # _run_reasoning_step is sufficient to avoid graph capture conflicts.
-        
+
         # CRITICAL: Clear CUDA memory to prevent accumulation across reasoning steps
-        # The logprobs computation creates large intermediate tensors that can fragment memory
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        
-        # Log
-        metrics["grpo/grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
-        metrics["grpo/num_samples"] = total_samples
-        
+
+        # Build metrics
+        avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
+        metrics = {
+            "grpo/loss": avg_loss,
+            "grpo/reward_mean": rewards_tensor.mean().item(),
+            "grpo/reward_std": rewards_tensor.std().item(),
+            "grpo/kl_mean": 0.0,  # KL is 0 when ref=current (online GRPO)
+            "grpo/advantage_mean": advantages.mean().item(),
+            "grpo/advantage_std": advantages.std().item(),
+            "grpo/grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+            "grpo/num_samples": total_samples,
+        }
+
+        del rewards_tensor, advantages
+
         self.logger.info(
             f"  🧠 Reasoning update: loss={metrics['grpo/loss']:.4f} | "
             f"reward={metrics['grpo/reward_mean']:.3f}±{metrics['grpo/reward_std']:.3f} | "
