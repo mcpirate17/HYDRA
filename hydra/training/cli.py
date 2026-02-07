@@ -723,8 +723,8 @@ def _add_reasoning_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--reasoning_enabled",
         type=lambda x: x.lower() in ("true", "1", "yes"),
-        default=True,
-        help="Enable System 2 reasoning (GRPO) - activates at reasoning_start_step",
+        default=False,
+        help="Enable System 2 reasoning (GRPO) - DISABLED by default, use reasoning_trainer.py instead",
     )
     parser.add_argument(
         "--reasoning_start_step",
@@ -786,6 +786,12 @@ def _add_reasoning_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=0.01,
         help="KL penalty coefficient for GRPO",
+    )
+    parser.add_argument(
+        "--grpo_skip_moe",
+        type=lambda x: x.lower() in ("true", "1", "yes"),
+        default=True,
+        help="Skip MoE layers during GRPO reasoning (huge memory savings, default: True)",
     )
 
 

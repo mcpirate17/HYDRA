@@ -174,13 +174,21 @@ def generate_completions(
     eos_token_id: Optional[int] = None,
     pad_token_id: Optional[int] = None,
     num_return_sequences: int = 1,      # G: generations per prompt
+    repetition_penalty: float = 1.2,
+    no_repeat_ngram_size: int = 3,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Generate completions autoregressively using nucleus sampling.
-    
+
+    Args:
+        repetition_penalty: Penalty for tokens that have already appeared.
+            Values > 1.0 discourage repetition. Default 1.2.
+        no_repeat_ngram_size: Prevent repeating n-grams of this size.
+            Set to 0 to disable. Default 3.
+
     Returns:
         generated_ids: [B * num_return_sequences, prompt_len + gen_len]
-        completion_mask: [B * num_return_sequences, prompt_len + gen_len] 
+        completion_mask: [B * num_return_sequences, prompt_len + gen_len]
                          (1 for generated tokens, 0 for prompt)
     """
     device = prompt_ids.device
@@ -245,6 +253,38 @@ def generate_completions(
             # Temperature scaling
             if temperature > 0:
                 next_logits = next_logits / temperature
+
+            # Apply repetition penalty to tokens already in sequence
+            if repetition_penalty != 1.0:
+                for batch_idx in range(total_batch):
+                    # Get unique tokens generated so far (not prompt)
+                    gen_tokens = generated[batch_idx, prompt_len:current_len]
+                    unique_tokens = gen_tokens.unique()
+                    if unique_tokens.numel() > 0:
+                        # Penalize: divide positive logits, multiply negative logits
+                        penalty_logits = next_logits[batch_idx, unique_tokens]
+                        next_logits[batch_idx, unique_tokens] = torch.where(
+                            penalty_logits > 0,
+                            penalty_logits / repetition_penalty,
+                            penalty_logits * repetition_penalty,
+                        )
+
+            # No-repeat n-gram blocking
+            if no_repeat_ngram_size > 0 and current_len >= prompt_len + no_repeat_ngram_size:
+                for batch_idx in range(total_batch):
+                    # Get the last (n-1) tokens as the current n-gram prefix
+                    ngram_prefix = generated[batch_idx, current_len - no_repeat_ngram_size + 1:current_len].tolist()
+
+                    # Find all previous occurrences of this prefix and block the following tokens
+                    banned_tokens = set()
+                    seq = generated[batch_idx, prompt_len:current_len].tolist()
+                    for i in range(len(seq) - no_repeat_ngram_size + 1):
+                        if seq[i:i + no_repeat_ngram_size - 1] == ngram_prefix:
+                            banned_tokens.add(seq[i + no_repeat_ngram_size - 1])
+
+                    if banned_tokens:
+                        banned_tensor = torch.tensor(list(banned_tokens), device=device, dtype=torch.long)
+                        next_logits[batch_idx, banned_tensor] = float("-inf")
 
             # Top-k filtering
             if top_k > 0:
@@ -541,6 +581,16 @@ class GRPOTrainerMixin:
             if hasattr(layer, "_last_target_depths"):
                 layer._last_target_depths = None
 
+    def _log_memory(self, stage: str) -> None:
+        """Log CUDA memory state for debugging OOM issues."""
+        if not torch.cuda.is_available():
+            return
+        torch.cuda.synchronize()
+        alloc = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        free = torch.cuda.mem_get_info()[0] / (1024**3)
+        _log.info(f"  [MEM] {stage}: alloc={alloc:.2f}GB reserved={reserved:.2f}GB free={free:.2f}GB")
+
     def _run_reasoning_step(self, step: int) -> Optional[Dict[str, float]]:
         """
         Execute a full GRPO reasoning step:
@@ -548,7 +598,7 @@ class GRPOTrainerMixin:
         2. Generate G completions per prompt
         3. Compute rewards
         4. Compute GRPO loss and update
-        
+
         Returns metrics dict or None if skipped.
         """
         config = self.config
@@ -559,21 +609,37 @@ class GRPOTrainerMixin:
         temperature = getattr(config, "reasoning_temperature", 0.7)
         top_p = getattr(config, "reasoning_top_p", 0.95)
         reward_fn_name = getattr(config, "reasoning_reward_function", "format_reward")
-        
+
+        # Log initial memory state
+        self._log_memory("GRPO_START")
+
         tokenizer = self._ensure_tokenizer()
         if tokenizer is None:
             self.logger.warning("Reasoning step skipped: no tokenizer")
             return None
-        
+
         # Get the unwrapped model (avoid torch.compile issues during generation)
         base_model = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
-        
+
+        # Log model info
+        total_params = sum(p.numel() for p in base_model.parameters())
+        num_moe_layers = len(getattr(base_model, 'moe_layers', []))
+        _log.info(f"  [INFO] Model params: {total_params/1e6:.1f}M, MoE layers: {num_moe_layers}")
+
+        # Skip MoE during GRPO for massive memory savings
+        skip_moe = getattr(config, "grpo_skip_moe", True)
+        if skip_moe and num_moe_layers > 0 and hasattr(base_model, "set_skip_moe"):
+            base_model.set_skip_moe(True)
+            _log.info("  [INFO] MoE layers SKIPPED for GRPO (grpo_skip_moe=True)")
+
         # CRITICAL: Reset dynamo state before generation to avoid graph capture conflicts
         # This is needed when torch.compile with CUDA graphs is used for training
         torch._dynamo.reset()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()  # Free GPU memory before CPU generation
+
+        self._log_memory("AFTER_CACHE_CLEAR")
         
         # Get reward function
         reward_fn = REWARD_FUNCTIONS.get(reward_fn_name, reward_format_check)
@@ -606,6 +672,7 @@ class GRPOTrainerMixin:
         all_masks = []
         
         self.logger.info(f"  🧠 Generating {batch_size * G} completions (1 at a time to avoid OOM)...")
+        self._log_memory("BEFORE_GENERATION")
         
         for prompt_idx in range(batch_size):
             single_prompt = prompt_ids[prompt_idx:prompt_idx+1]  # [1, prompt_len]
@@ -650,10 +717,13 @@ class GRPOTrainerMixin:
         del all_generated, all_masks, padded_generated, padded_masks
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        
+
+        self._log_memory("AFTER_GENERATION")
+
         # generated_ids: [B * G, total_len]
         total_samples = generated_ids.shape[0]
         total_len = generated_ids.shape[1]
+        _log.info(f"  [INFO] Generated {total_samples} sequences of length {total_len}")
         
         # Decode completions for reward computation
         completions = []
@@ -692,8 +762,10 @@ class GRPOTrainerMixin:
         # Already on GPU - no move needed
 
         # MEMORY SAFETY: Check available VRAM before expensive logprobs computation
-        # Require at least 2GB free to avoid sporadic OOM during forward pass
-        MIN_FREE_VRAM_GB = 2.0
+        # MoE models need significantly more headroom due to expert activations
+        # 500M+MoE (6 layers, 6 experts) needs ~12GB for logprobs alone
+        has_moe = hasattr(base_model, "moe_blocks") and len(getattr(base_model, "moe_blocks", [])) > 0
+        MIN_FREE_VRAM_GB = 12.0 if has_moe else 6.0
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             free_vram = torch.cuda.mem_get_info()[0] / (1024**3)
@@ -708,8 +780,9 @@ class GRPOTrainerMixin:
                 return {"grpo/skipped": 1.0, "grpo/reason": "low_vram", "grpo/free_vram_gb": free_vram}
 
         # SEQUENCE LENGTH SAFETY: Truncate very long sequences to prevent OOM
-        # Long sequences consume O(L^2) memory in attention - cap at 512 for safety
-        MAX_LOGPROB_SEQ_LEN = 512
+        # Long sequences consume O(L^2) memory in attention
+        # MoE models need shorter sequences due to expert activation memory
+        MAX_LOGPROB_SEQ_LEN = 256 if has_moe else 512
         if total_len > MAX_LOGPROB_SEQ_LEN:
             self.logger.info(f"  ⚡ Truncating sequences from {total_len} to {MAX_LOGPROB_SEQ_LEN} for logprobs")
             generated_ids = generated_ids[:, :MAX_LOGPROB_SEQ_LEN]
@@ -718,6 +791,8 @@ class GRPOTrainerMixin:
 
         # Compute log probs under current policy (use base_model for consistency)
         base_model.train()
+
+        self._log_memory("BEFORE_LOGPROBS")
 
         # PRE-COMPUTE ADVANTAGES from rewards (no gradients needed)
         # This allows us to process logprobs in micro-batches with immediate backward
@@ -730,7 +805,16 @@ class GRPOTrainerMixin:
         # MICRO-BATCH with gradient accumulation
         # Process sequences in small chunks, backward immediately to free graph memory
         # This fixes the gradient disconnect bug: gradients now flow to the model
-        micro_batch_size = 2 if total_len > 384 else 4
+        # Memory scaling: log-prob computation uses ~0.4GB per sequence at seq_len=512
+        # MoE models need smaller micro-batches due to expert activation memory
+        if has_moe:
+            micro_batch_size = 1  # Always single-sequence for MoE
+        elif total_len > 400:
+            micro_batch_size = 1  # Ultra-conservative for long sequences
+        elif total_len > 256:
+            micro_batch_size = 2
+        else:
+            micro_batch_size = 4
         num_micro_batches = (total_samples + micro_batch_size - 1) // micro_batch_size
 
         # OOM recovery pattern: PyTorch docs recommend handling cleanup OUTSIDE
@@ -745,6 +829,8 @@ class GRPOTrainerMixin:
         total_kl = 0.0
         micro_batches_processed = 0
 
+        _log.info(f"  [INFO] Processing {total_samples} sequences in micro-batches of {micro_batch_size}")
+
         for i in range(0, total_samples, micro_batch_size):
             if oom_occurred:
                 break
@@ -754,6 +840,9 @@ class GRPOTrainerMixin:
             chunk_ids = generated_ids[i:end_idx]
             chunk_mask = completion_mask[i:end_idx]
             chunk_advantages = advantages_flat[i:end_idx]  # [chunk_size]
+
+            if i == 0:
+                self._log_memory(f"MICRO_BATCH_0_START (seq_len={chunk_ids.shape[1]})")
 
             try:
                 # Compute logprobs WITH gradients (no detach!)
@@ -773,8 +862,14 @@ class GRPOTrainerMixin:
                 # Scale loss for gradient accumulation (average over all micro-batches)
                 scaled_loss = chunk_policy_loss / num_micro_batches
 
+                if i == 0:
+                    self._log_memory("MICRO_BATCH_0_LOGPROBS_DONE")
+
                 # Backward immediately - this frees the computation graph
                 self.scaler.scale(scaled_loss).backward()
+
+                if i == 0:
+                    self._log_memory("MICRO_BATCH_0_BACKWARD_DONE")
 
                 # Accumulate metrics (detach for logging)
                 total_loss += chunk_policy_loss.detach().item() * chunk_size_actual
@@ -847,6 +942,10 @@ class GRPOTrainerMixin:
         }
 
         del rewards_tensor, advantages
+
+        # Re-enable MoE for regular training
+        if skip_moe and num_moe_layers > 0 and hasattr(base_model, "set_skip_moe"):
+            base_model.set_skip_moe(False)
 
         self.logger.info(
             f"  🧠 Reasoning update: loss={metrics['grpo/loss']:.4f} | "

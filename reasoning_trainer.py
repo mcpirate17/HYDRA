@@ -1,0 +1,1119 @@
+#!/usr/bin/env python3
+"""
+HYDRA Reasoning Trainer - Standalone System 2 Training
+
+Dedicated trainer for reasoning/thinking capabilities using GRPO.
+Runs independently from the main pretraining loop, allowing:
+- Longer sequence lengths for extended thinking
+- Think loops (multiple reasoning iterations)
+- Optional teacher LLM integration
+- More aggressive memory optimization (no shared state with pretraining)
+
+Usage:
+    # Basic reasoning training
+    source /home/tim/venvs/llm/bin/activate && python reasoning_trainer.py \
+        --checkpoint checkpoints/hydra_500m_step_282000.pt \
+        --max_steps 1000
+
+    # Extended thinking with longer sequences
+    source /home/tim/venvs/llm/bin/activate && python reasoning_trainer.py \
+        --checkpoint checkpoints/hydra_500m_step_282000.pt \
+        --max_seq_len 1024 \
+        --max_thinking_tokens 512 \
+        --think_loops 3
+
+    # With teacher model (future)
+    source /home/tim/venvs/llm/bin/activate && python reasoning_trainer.py \
+        --checkpoint checkpoints/hydra_500m_step_282000.pt \
+        --teacher_model "meta-llama/Llama-3-8B-Instruct"
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import logging
+import os
+import signal
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# Set CUDA allocator config before importing torch
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import warnings
+# Suppress dtype mismatch warning from PyTorch RMSNorm - we use autocast for all forward passes
+warnings.filterwarnings("ignore", message="Mismatch dtype between input and weight")
+
+import torch
+import torch.nn.functional as F
+from torch.amp import autocast
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+_log = logging.getLogger("ReasoningTrainer")
+
+# Global shutdown flag for graceful ctrl+c handling
+_SHUTDOWN_REQUESTED = False
+
+
+def _signal_handler(signum, frame):
+    """Handle ctrl+c gracefully."""
+    global _SHUTDOWN_REQUESTED
+    if _SHUTDOWN_REQUESTED:
+        _log.warning("Force quit requested, exiting immediately...")
+        sys.exit(1)
+    _SHUTDOWN_REQUESTED = True
+    _log.info("\n" + "=" * 60)
+    _log.info("SHUTDOWN REQUESTED - will save checkpoint after current step")
+    _log.info("Press Ctrl+C again to force quit (will lose progress)")
+    _log.info("=" * 60)
+
+
+@dataclass
+class ReasoningConfig:
+    """Configuration for standalone reasoning training."""
+
+    # Checkpoint
+    checkpoint_path: str = ""
+    output_dir: str = "checkpoints/reasoning"
+    save_every: int = 100
+
+    # Training
+    max_steps: int = 1000
+    learning_rate: float = 1e-5
+    weight_decay: float = 0.1
+    grad_clip: float = 1.0
+    warmup_steps: int = 50
+
+    # Reasoning generation
+    batch_size: int = 2  # Prompts per step
+    num_generations: int = 4  # Completions per prompt (G in GRPO)
+    max_thinking_tokens: int = 512  # Max tokens for thinking/reasoning
+    max_seq_len: int = 1024  # Total sequence length cap
+    temperature: float = 0.7
+    top_p: float = 0.95
+    repetition_penalty: float = 1.2  # Penalty for repeated tokens (>1.0 discourages)
+    no_repeat_ngram_size: int = 3  # Block repeating n-grams of this size
+
+    # Think loops - multiple reasoning passes
+    think_loops: int = 1  # Number of thinking iterations per problem
+    think_loop_temperature_decay: float = 0.9  # Cool down temperature each loop
+
+    # Reward function
+    reward_function: str = "exact_match"  # exact_match, format_reward, length_penalty
+
+    # Memory optimization
+    skip_moe: bool = True  # Skip MoE layers for memory savings
+    micro_batch_size: int = 1  # Process sequences one at a time
+    gradient_checkpointing: bool = True
+    use_8bit_adam: bool = True
+
+    # Distillation (offline teacher)
+    distillation_dataset: Optional[str] = None  # Path to teacher completions JSONL
+    distillation_weight: float = 0.5  # Weight for distillation loss vs GRPO
+    distillation_only: bool = False  # Only distillation, no GRPO self-play
+
+    # Logging
+    log_interval: int = 10
+    eval_interval: int = 100
+
+
+def log_memory(stage: str) -> Dict[str, float]:
+    """Log and return CUDA memory state."""
+    if not torch.cuda.is_available():
+        return {}
+    torch.cuda.synchronize()
+    alloc = torch.cuda.memory_allocated() / (1024**3)
+    reserved = torch.cuda.memory_reserved() / (1024**3)
+    free = torch.cuda.mem_get_info()[0] / (1024**3)
+    _log.info(f"[MEM] {stage}: alloc={alloc:.2f}GB reserved={reserved:.2f}GB free={free:.2f}GB")
+    return {"allocated_gb": alloc, "reserved_gb": reserved, "free_gb": free}
+
+
+def load_checkpoint(checkpoint_path: str, device: str = "cuda") -> Tuple[torch.nn.Module, Dict, Dict]:
+    """Load model from checkpoint.
+
+    Returns:
+        model: The loaded model
+        checkpoint: Full checkpoint dict
+        model_config: Model architecture config (for saving later)
+    """
+    from hydra.model.framework import HydraModel
+
+    _log.info(f"Loading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+    # Extract config - prefer model_config (from reasoning checkpoints), fall back to config
+    cfg = checkpoint.get("model_config", checkpoint.get("config", {}))
+    model_state = checkpoint.get("model", checkpoint.get("model_state_dict", {}))
+
+    # Infer mlp_ratio from checkpoint weights (not stored in config)
+    # SwiGLU: gate_up has shape [2*hidden, dim], so hidden = gate_up[0] / 2
+    mlp_ratio = 2.67  # default
+    dim = cfg.get("mod_mor_dim", 1792)
+    for key, value in model_state.items():
+        if "mlp.gate_up.weight" in key and hasattr(value, "shape"):
+            hidden_size = value.shape[0] // 2
+            mlp_ratio = hidden_size / dim
+            _log.info(f"  Inferred mlp_ratio from weights: {mlp_ratio:.4f}")
+            break
+
+    # Log key config values
+    _log.info(f"  Model dim: {dim}")
+    _log.info(f"  MoR blocks: {cfg.get('n_mor_blocks', 14)}")
+    _log.info(f"  MoR recursions: {cfg.get('mor_recursions', 4)}")
+    _log.info(f"  MLP ratio: {mlp_ratio:.4f}")
+    _log.info(f"  MoE enabled: {cfg.get('moe_enabled', False)}")
+    _log.info(f"  MoE experts: {cfg.get('moe_num_experts', 0)}")
+    _log.info(f"  MoE layers: {cfg.get('moe_num_layers', 0)}")
+
+    # Build model with config from checkpoint
+    model = HydraModel(
+        dim=dim,
+        n_mor_blocks=cfg.get("n_mor_blocks", 14),
+        recursions_per_block=cfg.get("mor_recursions", 4),
+        n_heads=cfg.get("mod_mor_n_heads", 28),
+        n_kv_heads=cfg.get("mod_mor_n_kv_heads", 4),
+        vocab_size=cfg.get("vocab_size", 50257),
+        max_seq_len=cfg.get("max_seq_len", 2048),
+        mlp_ratio=mlp_ratio,
+        mod_capacity=cfg.get("mod_capacity", 0.75),
+        adaptive=cfg.get("mor_adaptive", True),
+        static_routing_mode=cfg.get("static_routing_mode", False),
+        # MoE config
+        moe_enabled=cfg.get("moe_enabled", False),
+        moe_num_experts=cfg.get("moe_num_experts", 0),
+        moe_num_layers=cfg.get("moe_num_layers", 0),
+        moe_top_k=cfg.get("moe_top_k", 1),
+        moe_aux_weight=cfg.get("moe_aux_weight", 0.01),
+        moe_identity_init=cfg.get("moe_identity_init", True),
+    )
+
+    # Load weights - handle different checkpoint formats
+    # Prefer "model" (standard format, used by main trainer and new reasoning checkpoints)
+    # Fall back to "model_state_dict" for old reasoning checkpoints
+    if "model" in checkpoint:
+        model.load_state_dict(checkpoint["model"], strict=False)
+    elif "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    else:
+        raise KeyError(f"Checkpoint missing model weights. Keys: {list(checkpoint.keys())}")
+    model = model.to(device).to(torch.bfloat16)
+
+    # Count params
+    total_params = sum(p.numel() for p in model.parameters())
+    _log.info(f"Model loaded: {total_params/1e6:.1f}M parameters")
+
+    # Build model_config dict for saving (preserves architecture for future loads)
+    model_config = {
+        "mod_mor_dim": dim,
+        "n_mor_blocks": cfg.get("n_mor_blocks", 14),
+        "mor_recursions": cfg.get("mor_recursions", 4),
+        "mod_mor_n_heads": cfg.get("mod_mor_n_heads", 28),
+        "mod_mor_n_kv_heads": cfg.get("mod_mor_n_kv_heads", 4),
+        "vocab_size": cfg.get("vocab_size", 50257),
+        "max_seq_len": cfg.get("max_seq_len", 2048),
+        "mlp_ratio": mlp_ratio,
+        "mod_capacity": cfg.get("mod_capacity", 0.75),
+        "mor_adaptive": cfg.get("mor_adaptive", True),
+        "static_routing_mode": cfg.get("static_routing_mode", False),
+        "moe_enabled": cfg.get("moe_enabled", False),
+        "moe_num_experts": cfg.get("moe_num_experts", 0),
+        "moe_num_layers": cfg.get("moe_num_layers", 0),
+        "moe_top_k": cfg.get("moe_top_k", 1),
+        "moe_aux_weight": cfg.get("moe_aux_weight", 0.01),
+        "moe_identity_init": cfg.get("moe_identity_init", True),
+    }
+
+    return model, checkpoint, model_config
+
+
+def create_optimizer(
+    model: torch.nn.Module,
+    config: ReasoningConfig,
+) -> torch.optim.Optimizer:
+    """Create optimizer for reasoning training."""
+    if config.use_8bit_adam:
+        try:
+            import bitsandbytes as bnb
+            optimizer = bnb.optim.Adam8bit(
+                model.parameters(),
+                lr=config.learning_rate,
+                weight_decay=config.weight_decay,
+            )
+            _log.info("Using 8-bit Adam optimizer")
+            return optimizer
+        except ImportError:
+            _log.warning("bitsandbytes not available, using standard AdamW")
+
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+
+
+def get_tokenizer(tokenizer_name: str = "gpt2"):
+    """Get tokenizer."""
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def load_reasoning_prompts(max_prompts: int = 1000) -> List[Dict[str, Any]]:
+    """Load reasoning prompts from OpenMathInstruct or similar."""
+    prompts = []
+
+    try:
+        from datasets import load_dataset
+
+        ds = load_dataset(
+            "nvidia/OpenMathInstruct-2",
+            split="train_1M",
+            streaming=True,
+        )
+
+        count = 0
+        for example in ds:
+            if count >= max_prompts:
+                break
+            problem = example.get("problem", "")
+            answer = example.get("expected_answer", "")
+            if problem and len(problem) > 20:
+                prompts.append({
+                    "prompt": f"Solve this math problem step by step. Show your reasoning.\n\nProblem: {problem}\n\nSolution:",
+                    "expected_answer": answer,
+                })
+                count += 1
+
+        _log.info(f"Loaded {len(prompts)} reasoning prompts from OpenMathInstruct-2")
+
+    except Exception as e:
+        _log.warning(f"Failed to load reasoning prompts: {e}")
+        # Fallback prompts
+        prompts = [
+            {"prompt": "What is 15 * 17? Think step by step.\n\nSolution:", "expected_answer": "255"},
+            {"prompt": "If x + 5 = 12, what is x? Show your work.\n\nSolution:", "expected_answer": "7"},
+            {"prompt": "What is the area of a rectangle with width 8 and height 6?\n\nSolution:", "expected_answer": "48"},
+        ]
+
+    return prompts
+
+
+def load_distillation_dataset(dataset_path: str) -> List[Dict[str, Any]]:
+    """Load teacher completions for distillation training.
+
+    Expects JSONL with fields:
+    - prompt: the problem/question
+    - teacher_completion: high-quality reasoning from teacher model
+    - expected_answer: (optional) ground truth answer
+    """
+    import json
+
+    data = []
+    with open(dataset_path) as f:
+        for line in f:
+            if line.strip():
+                item = json.loads(line)
+                if item.get("prompt") and item.get("teacher_completion"):
+                    data.append({
+                        "prompt": item["prompt"],
+                        "teacher_completion": item["teacher_completion"],
+                        "expected_answer": item.get("expected_answer", ""),
+                    })
+
+    _log.info(f"Loaded {len(data)} teacher completions from {dataset_path}")
+    return data
+
+
+def run_distillation_step(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    distill_data: List[Dict[str, Any]],
+    tokenizer,
+    config: ReasoningConfig,
+    step: int,
+) -> Dict[str, float]:
+    """Run a distillation training step.
+
+    Trains the student model to match teacher completions using
+    standard language modeling loss on teacher outputs.
+    """
+    import random
+
+    device = next(model.parameters()).device
+    base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+
+    # Skip MoE if configured
+    if config.skip_moe and hasattr(base_model, "set_skip_moe"):
+        base_model.set_skip_moe(True)
+
+    # Sample batch from distillation data
+    batch = random.sample(distill_data, min(config.batch_size, len(distill_data)))
+
+    # Prepare sequences: prompt + teacher completion
+    full_texts = []
+    prompt_lengths = []
+    for item in batch:
+        prompt = item["prompt"]
+        completion = item["teacher_completion"]
+        full_text = prompt + " " + completion
+        full_texts.append(full_text)
+
+        # Track prompt length for masking
+        prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+        prompt_lengths.append(len(prompt_tokens))
+
+    # Tokenize
+    encoded = tokenizer(
+        full_texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=config.max_seq_len,
+    )
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+
+    # Create loss mask (only compute loss on completion tokens)
+    batch_size, seq_len = input_ids.shape
+    loss_mask = torch.zeros(batch_size, seq_len, device=device)
+    for i, plen in enumerate(prompt_lengths):
+        # Mask out prompt tokens, only train on completion
+        loss_mask[i, plen:] = attention_mask[i, plen:]
+
+    # Forward pass
+    base_model.train()
+    optimizer.zero_grad(set_to_none=True)
+
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        outputs = base_model(input_ids)
+        logits = outputs["logits"] if isinstance(outputs, dict) else outputs
+
+        # Shift for next-token prediction
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+        shift_mask = loss_mask[:, 1:].contiguous()
+
+        # Cross-entropy loss on completion tokens only
+        loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
+        token_losses = loss_fn(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        ).view(batch_size, -1)
+
+        # Masked mean
+        masked_loss = (token_losses * shift_mask).sum() / (shift_mask.sum() + 1e-8)
+
+    # Backward
+    masked_loss.backward()
+
+    # Gradient clipping and optimizer step
+    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+    optimizer.step()
+
+    # Re-enable MoE
+    if config.skip_moe and hasattr(base_model, "set_skip_moe"):
+        base_model.set_skip_moe(False)
+
+    # Compute perplexity
+    with torch.no_grad():
+        perplexity = torch.exp(masked_loss).item()
+
+    metrics = {
+        "distill_loss": masked_loss.item(),
+        "distill_ppl": perplexity,
+        "distill_tokens": shift_mask.sum().item(),
+    }
+
+    _log.info(f"  Step {step} distillation: loss={masked_loss.item():.4f}, ppl={perplexity:.2f}")
+
+    return metrics
+
+
+@torch.no_grad()
+def generate_completion(
+    model: torch.nn.Module,
+    prompt_ids: torch.Tensor,
+    max_new_tokens: int,
+    temperature: float = 0.7,
+    top_p: float = 0.95,
+    eos_token_id: Optional[int] = None,
+    repetition_penalty: float = 1.2,
+    no_repeat_ngram_size: int = 3,
+) -> torch.Tensor:
+    """Generate a single completion.
+
+    Args:
+        repetition_penalty: Penalty for tokens that have already appeared.
+            Values > 1.0 discourage repetition. Default 1.2.
+        no_repeat_ngram_size: Prevent repeating n-grams of this size.
+            Set to 0 to disable. Default 3.
+    """
+    device = prompt_ids.device
+    prompt_len = prompt_ids.shape[1]
+
+    # Pre-allocate buffer
+    max_len = prompt_len + max_new_tokens
+    generated = torch.zeros((1, max_len), device=device, dtype=prompt_ids.dtype)
+    generated[:, :prompt_len] = prompt_ids
+    current_len = prompt_len
+
+    model.eval()
+
+    with torch.inference_mode(), autocast("cuda", dtype=torch.bfloat16):
+        for _ in range(max_new_tokens):
+            input_ids = generated[:, :current_len]
+
+            outputs = model(input_ids)
+            if isinstance(outputs, tuple):
+                logits = outputs[0]
+            else:
+                logits = outputs
+
+            next_logits = logits[:, -1, :] / temperature
+
+            # Apply repetition penalty to tokens already in sequence
+            if repetition_penalty != 1.0:
+                # Get unique tokens in the generated sequence (not just prompt)
+                generated_tokens = generated[0, prompt_len:current_len].unique()
+                if generated_tokens.numel() > 0:
+                    # Penalize: divide positive logits, multiply negative logits
+                    penalty_logits = next_logits[:, generated_tokens]
+                    next_logits[:, generated_tokens] = torch.where(
+                        penalty_logits > 0,
+                        penalty_logits / repetition_penalty,
+                        penalty_logits * repetition_penalty,
+                    )
+
+            # No-repeat n-gram blocking
+            if no_repeat_ngram_size > 0 and current_len >= no_repeat_ngram_size:
+                # Get the last (n-1) tokens as the current n-gram prefix
+                ngram_prefix = generated[0, current_len - no_repeat_ngram_size + 1:current_len].tolist()
+
+                # Find all previous occurrences of this prefix and block the following tokens
+                banned_tokens = set()
+                seq = generated[0, :current_len].tolist()
+                for i in range(len(seq) - no_repeat_ngram_size + 1):
+                    if seq[i:i + no_repeat_ngram_size - 1] == ngram_prefix:
+                        # The token that followed this prefix before
+                        banned_tokens.add(seq[i + no_repeat_ngram_size - 1])
+
+                if banned_tokens:
+                    banned_tensor = torch.tensor(list(banned_tokens), device=device, dtype=torch.long)
+                    next_logits[:, banned_tensor] = float("-inf")
+
+            # Top-p sampling
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_mask = cumulative_probs > top_p
+                sorted_mask[:, 1:] = sorted_mask[:, :-1].clone()
+                sorted_mask[:, 0] = False
+                mask = sorted_mask.scatter(1, sorted_indices, sorted_mask)
+                next_logits = next_logits.masked_fill(mask, float("-inf"))
+
+            probs = F.softmax(next_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+            generated[:, current_len] = next_token
+            current_len += 1
+
+            if eos_token_id is not None and next_token.item() == eos_token_id:
+                break
+
+    return generated[:, :current_len]
+
+
+def compute_reward(
+    prompt: str,
+    completion: str,
+    expected_answer: Optional[str],
+    reward_fn: str = "exact_match",
+) -> float:
+    """Compute reward for a completion."""
+    import re
+
+    if reward_fn == "exact_match":
+        if expected_answer is None:
+            return 0.0
+
+        completion_lower = completion.lower().strip()
+        expected_lower = expected_answer.lower().strip()
+
+        # Try to extract boxed answer
+        boxed_match = re.search(r'\\boxed\{([^}]+)\}', completion)
+        if boxed_match:
+            extracted = boxed_match.group(1).strip().lower()
+            if extracted == expected_lower:
+                return 1.0
+
+        # Try answer patterns
+        answer_patterns = [
+            r'(?:the\s+)?answer\s+is[:\s]+([^\n.]+)',
+            r'(?:final\s+)?answer[:\s]+([^\n.]+)',
+            r'=\s*([^\n.]+)$',
+        ]
+        for pattern in answer_patterns:
+            match = re.search(pattern, completion_lower)
+            if match:
+                extracted = match.group(1).strip()
+                try:
+                    if abs(float(extracted) - float(expected_lower)) < 1e-6:
+                        return 1.0
+                except ValueError:
+                    if extracted == expected_lower:
+                        return 1.0
+
+        # Partial credit for containing answer
+        if expected_lower in completion_lower:
+            return 0.5
+
+        return 0.0
+
+    elif reward_fn == "format_reward":
+        if not completion or len(completion.strip()) < 10:
+            return 0.0
+
+        score = 0.5
+        # Reward structure
+        structure_patterns = [r'\d+\.', r'(?:first|then|therefore)', r'```']
+        structure_hits = sum(1 for p in structure_patterns if re.search(p, completion.lower()))
+        score += min(0.3, structure_hits * 0.1)
+
+        if expected_answer and expected_answer.lower() in completion.lower():
+            score += 0.2
+
+        return max(0.0, min(1.0, score))
+
+    else:
+        return 0.5  # Default
+
+
+def compute_sequence_logprobs(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Compute per-token log probabilities."""
+    model.train()
+
+    with autocast("cuda", dtype=torch.bfloat16):
+        outputs = model(input_ids)
+        if isinstance(outputs, tuple):
+            logits = outputs[0]
+        else:
+            logits = outputs
+
+    # Shift for next-token prediction
+    shift_logits = logits[:, :-1, :]
+    shift_labels = input_ids[:, 1:].contiguous()
+    shift_mask = mask[:, 1:].contiguous()
+
+    # Log softmax + gather (memory efficient)
+    log_probs = F.log_softmax(shift_logits, dim=-1)
+    token_logprobs = torch.gather(
+        log_probs, dim=-1, index=shift_labels.unsqueeze(-1)
+    ).squeeze(-1)
+
+    token_logprobs = token_logprobs * shift_mask
+
+    # Pad to original length
+    B, L = input_ids.shape
+    result = torch.zeros(B, L, device=input_ids.device, dtype=token_logprobs.dtype)
+    result[:, 1:] = token_logprobs
+
+    return result
+
+
+def run_grpo_step(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    prompts: List[Dict[str, Any]],
+    tokenizer,
+    config: ReasoningConfig,
+    step: int,
+) -> Dict[str, float]:
+    """Run a single GRPO training step."""
+    device = next(model.parameters()).device
+    base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+
+    # Skip MoE if configured
+    if config.skip_moe and hasattr(base_model, "set_skip_moe"):
+        base_model.set_skip_moe(True)
+
+    # Enable gradient checkpointing
+    if config.gradient_checkpointing and hasattr(base_model, "enable_gradient_checkpointing"):
+        base_model.enable_gradient_checkpointing(every_n=1)
+
+    # Sample prompts
+    import random
+    batch_prompts = random.sample(prompts, min(config.batch_size, len(prompts)))
+
+    # Tokenize
+    prompt_texts = [p["prompt"] for p in batch_prompts]
+    expected_answers = [p.get("expected_answer") for p in batch_prompts]
+
+    encoded = tokenizer(
+        prompt_texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=512,
+    )
+    prompt_ids = encoded["input_ids"].to(device)
+
+    # Generate completions
+    all_generated = []
+    all_masks = []
+    all_rewards = []
+
+    for prompt_idx in range(len(batch_prompts)):
+        single_prompt = prompt_ids[prompt_idx:prompt_idx + 1]
+        prompt_text = prompt_texts[prompt_idx]
+        expected = expected_answers[prompt_idx]
+
+        for gen_idx in range(config.num_generations):
+            # Think loops - multiple passes with cooling temperature
+            temp = config.temperature
+            current_ids = single_prompt
+
+            for loop in range(config.think_loops):
+                gen_ids = generate_completion(
+                    model=base_model,
+                    prompt_ids=current_ids,
+                    max_new_tokens=config.max_thinking_tokens,
+                    temperature=temp,
+                    top_p=config.top_p,
+                    eos_token_id=tokenizer.eos_token_id,
+                    repetition_penalty=config.repetition_penalty,
+                    no_repeat_ngram_size=config.no_repeat_ngram_size,
+                )
+
+                if loop < config.think_loops - 1:
+                    # Prepare for next think loop
+                    temp *= config.think_loop_temperature_decay
+                    # Could extend context here for multi-turn reasoning
+
+            # Create completion mask
+            prompt_len = single_prompt.shape[1]
+            total_len = gen_ids.shape[1]
+            mask = torch.zeros(1, total_len, device=device)
+            mask[:, prompt_len:] = 1.0
+
+            # Decode and compute reward
+            completion_tokens = gen_ids[0, prompt_len:]
+            completion_text = tokenizer.decode(completion_tokens, skip_special_tokens=True)
+            reward = compute_reward(prompt_text, completion_text, expected, config.reward_function)
+
+            all_generated.append(gen_ids)
+            all_masks.append(mask)
+            all_rewards.append(reward)
+
+            # Clear cache between generations
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    # Pad sequences to same length
+    max_len = max(g.shape[1] for g in all_generated)
+    padded_generated = []
+    padded_masks = []
+
+    for gen_ids, mask in zip(all_generated, all_masks):
+        pad_len = max_len - gen_ids.shape[1]
+        if pad_len > 0:
+            gen_ids = torch.cat([gen_ids, torch.zeros((1, pad_len), device=device, dtype=gen_ids.dtype)], dim=1)
+            mask = torch.cat([mask, torch.zeros((1, pad_len), device=device)], dim=1)
+        padded_generated.append(gen_ids)
+        padded_masks.append(mask)
+
+    generated_ids = torch.cat(padded_generated, dim=0)
+    completion_mask = torch.cat(padded_masks, dim=0)
+    rewards_tensor = torch.tensor(all_rewards, device=device)
+
+    # Log generation stats
+    _log.info(f"  Step {step} generation: prompts={len(batch_prompts)}, "
+              f"gens/prompt={config.num_generations}, think_loops={config.think_loops}, "
+              f"total_seqs={generated_ids.shape[0]}")
+    _log.info(f"  Step {step} rewards: mean={rewards_tensor.mean():.3f}, "
+              f"std={rewards_tensor.std():.3f}, min={rewards_tensor.min():.3f}, "
+              f"max={rewards_tensor.max():.3f}")
+    _log.info(f"  Step {step} rewards breakdown: {[f'{r:.2f}' for r in all_rewards]}")
+
+    # Skip if no reward variance
+    if rewards_tensor.std() < 1e-6:
+        _log.info(f"  Step {step}: skipped (no reward variance - all generations got same score)")
+        if config.skip_moe and hasattr(base_model, "set_skip_moe"):
+            base_model.set_skip_moe(False)
+        return {"skipped": 1.0, "reward_mean": rewards_tensor.mean().item()}
+
+    # Compute advantages
+    total_samples = generated_ids.shape[0]
+    rewards_grouped = rewards_tensor.view(config.batch_size, config.num_generations)
+    mean_rewards = rewards_grouped.mean(dim=1, keepdim=True)
+    std_rewards = rewards_grouped.std(dim=1, keepdim=True) + 1e-8
+    advantages = ((rewards_grouped - mean_rewards) / std_rewards).view(-1)
+
+    # Truncate sequences if too long
+    if generated_ids.shape[1] > config.max_seq_len:
+        generated_ids = generated_ids[:, :config.max_seq_len]
+        completion_mask = completion_mask[:, :config.max_seq_len]
+
+    # Micro-batched forward/backward
+    base_model.train()
+    optimizer.zero_grad(set_to_none=True)
+
+    total_loss = 0.0
+    num_micro_batches = (total_samples + config.micro_batch_size - 1) // config.micro_batch_size
+
+    for i in range(0, total_samples, config.micro_batch_size):
+        end_idx = min(i + config.micro_batch_size, total_samples)
+        chunk_ids = generated_ids[i:end_idx]
+        chunk_mask = completion_mask[i:end_idx]
+        chunk_adv = advantages[i:end_idx]
+
+        # Forward + logprobs
+        chunk_logprobs = compute_sequence_logprobs(base_model, chunk_ids, chunk_mask)
+
+        # Compute loss
+        num_tokens = chunk_mask.sum(dim=1).clamp(min=1)
+        completion_logprobs = (chunk_logprobs * chunk_mask).sum(dim=1) / num_tokens
+        chunk_loss = -(chunk_adv * completion_logprobs).mean()
+
+        # Backward
+        (chunk_loss / num_micro_batches).backward()
+
+        total_loss += chunk_loss.detach().item()
+
+        # Cleanup
+        del chunk_logprobs, completion_logprobs, chunk_loss
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Gradient clipping and optimizer step
+    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    # Re-enable MoE
+    if config.skip_moe and hasattr(base_model, "set_skip_moe"):
+        base_model.set_skip_moe(False)
+
+    # Cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    avg_loss = total_loss / num_micro_batches
+    metrics = {
+        "loss": avg_loss,
+        "reward_mean": rewards_tensor.mean().item(),
+        "reward_std": rewards_tensor.std().item(),
+        "advantage_mean": advantages.mean().item(),
+        "num_samples": total_samples,
+    }
+
+    return metrics
+
+
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    metrics: Dict[str, float],
+    model_config: Dict[str, Any],
+    output_path: str,
+):
+    """Save reasoning training checkpoint.
+
+    Compatible with main trainer.py format:
+    - 'model' for weights (main trainer expects this)
+    - 'model_config' for architecture (reasoning trainer needs this)
+    - 'config' copied from model_config for trainer.py compatibility
+    """
+    base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+
+    # Get state_dict once to avoid duplicating in memory
+    model_state = base_model.state_dict()
+
+    checkpoint = {
+        "model": model_state,  # Main trainer expects 'model'
+        # NOTE: Do NOT save duplicate "model_state_dict" - wastes memory and disk
+        "optimizer": optimizer.state_dict(),  # Main trainer expects 'optimizer'
+        "step": step,
+        "metrics": metrics,
+        "model_config": model_config,  # Architecture for reasoning trainer
+        "config": model_config,  # Main trainer uses 'config' for architecture
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    torch.save(checkpoint, output_path)
+    _log.info(f"Saved checkpoint: {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="HYDRA Reasoning Trainer")
+
+    # Required
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to model checkpoint")
+
+    # Training
+    parser.add_argument("--max_steps", type=int, default=1000,
+                        help="Maximum training steps")
+    parser.add_argument("--lr", type=float, default=1e-5,
+                        help="Learning rate")
+    parser.add_argument("--warmup_steps", type=int, default=50,
+                        help="LR warmup steps")
+    parser.add_argument("--grad_clip", type=float, default=1.0,
+                        help="Gradient clipping")
+
+    # Generation
+    parser.add_argument("--batch_size", type=int, default=2,
+                        help="Prompts per step")
+    parser.add_argument("--num_generations", type=int, default=4,
+                        help="Completions per prompt")
+    parser.add_argument("--max_thinking_tokens", type=int, default=512,
+                        help="Max tokens for thinking")
+    parser.add_argument("--max_seq_len", type=int, default=1024,
+                        help="Max sequence length")
+    parser.add_argument("--temperature", type=float, default=0.7,
+                        help="Sampling temperature")
+    parser.add_argument("--repetition_penalty", type=float, default=1.2,
+                        help="Penalty for repeated tokens (>1.0 discourages repetition)")
+    parser.add_argument("--no_repeat_ngram_size", type=int, default=3,
+                        help="Block repeating n-grams of this size (0 to disable)")
+
+    # Think loops
+    parser.add_argument("--think_loops", type=int, default=1,
+                        help="Number of thinking iterations")
+    parser.add_argument("--think_loop_temp_decay", type=float, default=0.9,
+                        help="Temperature decay per think loop")
+
+    # Reward
+    parser.add_argument("--reward_function", type=str, default="exact_match",
+                        choices=["exact_match", "format_reward", "length_penalty"],
+                        help="Reward function")
+
+    # Memory
+    parser.add_argument("--skip_moe", action="store_true", default=True,
+                        help="Skip MoE layers for memory")
+    parser.add_argument("--no_skip_moe", action="store_false", dest="skip_moe")
+    parser.add_argument("--micro_batch_size", type=int, default=1,
+                        help="Micro batch size")
+
+    # Distillation
+    parser.add_argument("--distillation_dataset", type=str, default=None,
+                        help="Path to teacher completions JSONL for distillation")
+    parser.add_argument("--distillation_weight", type=float, default=0.5,
+                        help="Weight for distillation loss (0=GRPO only, 1=distill only)")
+    parser.add_argument("--distillation_only", action="store_true",
+                        help="Only do distillation, no GRPO self-play")
+
+    # Output
+    parser.add_argument("--output_dir", type=str, default="checkpoints/reasoning",
+                        help="Output directory")
+    parser.add_argument("--save_every", type=int, default=100,
+                        help="Save checkpoint every N steps")
+    parser.add_argument("--log_interval", type=int, default=10,
+                        help="Log every N steps")
+
+    args = parser.parse_args()
+
+    # Create config
+    config = ReasoningConfig(
+        checkpoint_path=args.checkpoint,
+        output_dir=args.output_dir,
+        save_every=args.save_every,
+        max_steps=args.max_steps,
+        learning_rate=args.lr,
+        warmup_steps=args.warmup_steps,
+        grad_clip=args.grad_clip,
+        batch_size=args.batch_size,
+        num_generations=args.num_generations,
+        max_thinking_tokens=args.max_thinking_tokens,
+        max_seq_len=args.max_seq_len,
+        temperature=args.temperature,
+        repetition_penalty=args.repetition_penalty,
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
+        think_loops=args.think_loops,
+        think_loop_temperature_decay=args.think_loop_temp_decay,
+        reward_function=args.reward_function,
+        skip_moe=args.skip_moe,
+        micro_batch_size=args.micro_batch_size,
+        distillation_dataset=args.distillation_dataset,
+        distillation_weight=args.distillation_weight,
+        distillation_only=args.distillation_only,
+        log_interval=args.log_interval,
+    )
+
+    # Setup
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    os.makedirs(config.output_dir, exist_ok=True)
+
+    _log.info("=" * 60)
+    _log.info("HYDRA REASONING TRAINER")
+    _log.info("=" * 60)
+    _log.info(f"Checkpoint: {config.checkpoint_path}")
+    _log.info(f"Max steps: {config.max_steps}")
+    _log.info(f"Think loops: {config.think_loops}")
+    _log.info(f"Max thinking tokens: {config.max_thinking_tokens}")
+    _log.info(f"Skip MoE: {config.skip_moe}")
+    if config.distillation_dataset:
+        _log.info(f"Distillation dataset: {config.distillation_dataset}")
+        _log.info(f"Distillation weight: {config.distillation_weight}")
+        _log.info(f"Distillation only: {config.distillation_only}")
+    _log.info("=" * 60)
+
+    log_memory("STARTUP")
+
+    # Load model
+    model, checkpoint, model_config = load_checkpoint(config.checkpoint_path, device)
+    log_memory("MODEL_LOADED")
+
+    # Single output file (overwrites each save)
+    output_path = os.path.join(config.output_dir, "reasoning_checkpoint.pt")
+    _log.info(f"Output checkpoint: {output_path}")
+
+    # Create optimizer
+    optimizer = create_optimizer(model, config)
+    log_memory("OPTIMIZER_CREATED")
+
+    # Get tokenizer
+    tokenizer = get_tokenizer("gpt2")
+
+    # Load prompts for GRPO
+    prompts = None
+    if not config.distillation_only:
+        prompts = load_reasoning_prompts(max_prompts=1000)
+        _log.info(f"Loaded {len(prompts)} reasoning prompts")
+
+    # Load distillation dataset if provided
+    distill_data = None
+    if config.distillation_dataset:
+        distill_data = load_distillation_dataset(config.distillation_dataset)
+
+    # Register signal handler for graceful shutdown
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    # Training loop
+    mode = "distillation only" if config.distillation_only else (
+        f"mixed (distill_weight={config.distillation_weight})" if distill_data else "GRPO only"
+    )
+    _log.info(f"\nStarting reasoning training... (mode: {mode})")
+    _log.info("(Press Ctrl+C to save and exit gracefully)")
+    start_time = time.time()
+    total_reward = 0.0
+    total_loss = 0.0
+    total_distill_loss = 0.0
+    num_grpo_completed = 0
+    num_distill_completed = 0
+
+    for step in range(1, config.max_steps + 1):
+        # Check for graceful shutdown
+        if _SHUTDOWN_REQUESTED:
+            _log.info(f"Saving checkpoint at step {step - 1} before shutdown...")
+            save_checkpoint(model, optimizer, step - 1, metrics, model_config, output_path)
+            _log.info("Checkpoint saved. Exiting.")
+            return
+
+        # Warmup LR
+        if step <= config.warmup_steps:
+            lr_scale = step / config.warmup_steps
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = config.learning_rate * lr_scale
+
+        metrics = {}
+
+        # Distillation step
+        if distill_data and (config.distillation_only or config.distillation_weight > 0):
+            distill_metrics = run_distillation_step(
+                model=model,
+                optimizer=optimizer,
+                distill_data=distill_data,
+                tokenizer=tokenizer,
+                config=config,
+                step=step,
+            )
+            metrics.update(distill_metrics)
+            total_distill_loss += distill_metrics["distill_loss"]
+            num_distill_completed += 1
+
+        # GRPO step (if not distillation-only)
+        if not config.distillation_only and prompts:
+            grpo_metrics = run_grpo_step(
+                model=model,
+                optimizer=optimizer,
+                prompts=prompts,
+                tokenizer=tokenizer,
+                config=config,
+                step=step,
+            )
+            metrics.update(grpo_metrics)
+
+            if "skipped" not in grpo_metrics:
+                total_loss += grpo_metrics.get("loss", 0)
+                total_reward += grpo_metrics.get("reward_mean", 0)
+                num_grpo_completed += 1
+
+        # Logging
+        if step % config.log_interval == 0:
+            elapsed = time.time() - start_time
+            avg_reward = total_reward / max(1, num_grpo_completed)
+            avg_distill_loss = total_distill_loss / max(1, num_distill_completed)
+
+            log_parts = [f"Step {step}/{config.max_steps}"]
+
+            if distill_data:
+                log_parts.append(f"distill_loss={metrics.get('distill_loss', 0):.4f}")
+                log_parts.append(f"distill_ppl={metrics.get('distill_ppl', 0):.2f}")
+
+            if not config.distillation_only:
+                log_parts.append(f"grpo_loss={metrics.get('loss', 0):.4f}")
+                log_parts.append(f"reward={metrics.get('reward_mean', 0):.3f}")
+                log_parts.append(f"avg_reward={avg_reward:.3f}")
+
+            log_parts.append(f"time={elapsed:.1f}s")
+            _log.info(" | ".join(log_parts))
+            log_memory(f"STEP_{step}")
+
+        # Save checkpoint (single file, overwrites each time)
+        if step % config.save_every == 0:
+            save_checkpoint(model, optimizer, step, metrics, model_config, output_path)
+
+        # Check for graceful shutdown after step completes
+        if _SHUTDOWN_REQUESTED:
+            _log.info(f"Saving checkpoint at step {step} before shutdown...")
+            save_checkpoint(model, optimizer, step, metrics, model_config, output_path)
+            _log.info("Checkpoint saved. Exiting.")
+            return
+
+    # Final save
+    save_checkpoint(model, optimizer, config.max_steps, metrics, model_config, output_path)
+
+    _log.info("\n" + "=" * 60)
+    _log.info("REASONING TRAINING COMPLETE")
+    _log.info(f"Total steps: {config.max_steps}")
+    if distill_data:
+        _log.info(f"Avg distillation loss: {total_distill_loss / max(1, num_distill_completed):.4f}")
+    if not config.distillation_only:
+        _log.info(f"Average reward: {total_reward / max(1, num_grpo_completed):.3f}")
+    _log.info(f"Final checkpoint: {output_path}")
+    _log.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

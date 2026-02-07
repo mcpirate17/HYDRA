@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 # CRITICAL: Set CUDA allocator config BEFORE importing torch.
-# This reduces memory fragmentation from ~80% to ~10%, especially important
-# for reasoning steps that cause repeated alloc/free cycles.
+# This reduces memory fragmentation from ~80% to ~10%.
 import os
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+import gc
 import math
 import signal
 import time
@@ -52,12 +52,12 @@ from . import step_diagnostics as _step_diag
 from . import db as _db
 from .safe_optimizations import SafeOptimizations, OptimizationConfig
 from .pretest_hook import PretestHook
-from .reasoning import GRPOTrainerMixin  # Added for System 2 training
+# NOTE: Reasoning/GRPO training is handled by standalone reasoning_trainer.py
 
 _RUNTIME_STATUS = configure_runtime()
 
 
-class Trainer(GRPOTrainerMixin):
+class Trainer:
     """Optimized trainer with all performance best practices."""
 
     __slots__ = (
@@ -128,11 +128,10 @@ class Trainer(GRPOTrainerMixin):
         "_grad_norm_ema",  # For dynamic gradient clipping
         "_safe_opts",  # SafeOptimizations wrapper for experimental optimizations
         "_pretest_hook",  # Hook for automatic pretest runs on config/checkpoint changes
-        # Reasoning / GRPO state
-        "_reasoning_prompts",      # Cached reasoning prompts
-        "_reasoning_prompt_idx",   # Current index into prompts
-        "_tokenizer",              # Cached tokenizer for generation
-        "_last_grpo_metrics",      # Last GRPO step metrics
+        "_manifold_needs_unfreeze",  # Manifold warmup state
+        "_manifold_unfreeze_step",  # Step to unfreeze manifold gradients
+        "_current_step",  # Current training step (for emergency checkpoint)
+        "_resume_skip_optimizer_until",  # Skip optimizer updates until this step after incomplete resume
     )
 
     def __init__(self, config: TrainingConfig):
@@ -281,13 +280,6 @@ class Trainer(GRPOTrainerMixin):
         self._mor_advantage_nudge_until_step: int = 0
         self._mor_advantage_nudge_cooldown_until_step: int = 0
         self._mor_advantage_nudge_active: bool = False
-        
-        # Reasoning / GRPO state (System 2)
-        self._reasoning_prompts = None
-        self._reasoning_prompt_idx = 0
-        self._tokenizer = None
-        self._last_grpo_metrics = None
-        
         if config.resume_from:
             self._checkpoint_config = self._peek_checkpoint_config(config.resume_from)
             self._checkpoint_seq_len = self._checkpoint_config.get("max_seq_len", config.max_seq_len)
@@ -963,13 +955,21 @@ class Trainer(GRPOTrainerMixin):
         self.logger.info(f"\n{'='*70}")
         self.logger.info(f"RESUMING FROM CHECKPOINT: {checkpoint_path}")
         self.logger.info(f"{'='*70}")
-        
+
         # Load checkpoint to CPU first to avoid OOM from loading large optimizer states
         # Model weights will be moved to device during load_state_dict
         checkpoint = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
         model = self.model
         if hasattr(model, "_orig_mod"):
             model = model._orig_mod
+
+        # MEMORY FIX: reasoning_trainer.py used to save both "model" and "model_state_dict"
+        # which doubles checkpoint size. Delete the duplicate immediately to save RAM.
+        if "model" in checkpoint and "model_state_dict" in checkpoint:
+            del checkpoint["model_state_dict"]
+            self.logger.info("  Removed duplicate 'model_state_dict' key from checkpoint to save memory")
+            import gc
+            gc.collect()
 
         # RoPE caches are derived buffers whose shape depends on max_seq_len.
         # When resuming with a different --seq_len (or seq schedule), the checkpoint
@@ -1207,7 +1207,8 @@ class Trainer(GRPOTrainerMixin):
         self.logger.info(f"  Loaded step: {self._start_step}")
         self._prev_run_best_loss = float(ckpt_metrics.get("best_loss", float("inf")) or float("inf"))
         self.logger.info(f"  Previous best loss (from checkpoint): {self._prev_run_best_loss if math.isfinite(self._prev_run_best_loss) else 'N/A'}")
-        self.logger.info(f"  Previous total tokens: {ckpt_metrics.get('total_tokens', 'N/A'):,}")
+        prev_tokens = ckpt_metrics.get('total_tokens')
+        self.logger.info(f"  Previous total tokens: {prev_tokens:,}" if prev_tokens else "  Previous total tokens: N/A")
         self.logger.info(f"  Will continue to step: {self.config.max_steps}")
         self.logger.info(f"  Remaining steps: {self.config.max_steps - self._start_step:,}")
         if ckpt_metrics:
@@ -1965,22 +1966,7 @@ class Trainer(GRPOTrainerMixin):
         while step < max_steps:
             step_start = time.time()
             self._current_step = step  # Track for emergency checkpoint on error
-            
-            # System 2 / Reasoning Phase: GRPO step REPLACES regular training step
-            # This runs as a complete standalone step (own optimizer cycle) to avoid
-            # graph conflicts with torch.compile. Step counter advances after completion.
-            reasoning_interval = int(getattr(self.config, "reasoning_interval", 100))
-            if getattr(self.config, "reasoning_enabled", False) and step % reasoning_interval == 0:
-                self.logger.info(f"🧠 System 2 Reasoning Active (Step {step})")
-                grpo_metrics = self._run_reasoning_step(step)
-                if grpo_metrics:
-                    self._last_grpo_metrics = grpo_metrics
-                # Advance step and continue (skip regular training this step)
-                step += 1
-                if hasattr(self.train_loader, "set_step"):
-                    self.train_loader.set_step(step)
-                continue
-            
+
             optimizer.zero_grad(set_to_none=True)
             accum_loss = torch.zeros((), device=self.device)
             accum_ce = torch.zeros((), device=self.device)
@@ -2205,31 +2191,6 @@ class Trainer(GRPOTrainerMixin):
             # Resolve accumulated losses (sync points)
             accum_loss = accum_loss.item()
             accum_ce_f = float(accum_ce.item())
-
-            # Automatic System 2 / Reasoning Phase Transition
-            # (Must run after accum_loss is resolved)
-            if not getattr(self.config, "reasoning_enabled", False):
-                reasoning_start = getattr(self.config, "reasoning_start_step", 1_000_000)
-                reasoning_thr = getattr(self.config, "reasoning_loss_threshold", 0.0)
-                
-                # Update Stability Window (last 100 steps of Total Loss)
-                if not hasattr(self, "_loss_history"):
-                    self._loss_history = deque(maxlen=100)
-                self._loss_history.append(accum_loss)
-
-                # Check 1: Forced Step
-                if step >= reasoning_start:
-                    self.config.reasoning_enabled = True
-                    self.logger.info(f"🚀 REASONING PHASE ENABLED (Step {step} >= {reasoning_start})")
-                
-                # Check 2: Stability (Frequency of low loss)
-                # "Frequently below 2" -> If 50% of last 100 steps are below threshold
-                elif reasoning_thr > 0.0 and len(self._loss_history) >= 20:
-                    hits = sum(1 for lv in self._loss_history if lv < reasoning_thr)
-                    hit_rate = hits / len(self._loss_history)
-                    if hit_rate > 0.5:
-                        self.config.reasoning_enabled = True
-                        self.logger.info(f"🚀 REASONING PHASE ENABLED (Stability: {hits}/{len(self._loss_history)} steps < {reasoning_thr})")
 
             # Opt-in step diagnostics: Phase 1 (before unscale)
             _step_diag_ctx = _step_diag.StepDiagnostics(step=step, active=(step in _diag_steps))
@@ -3078,10 +3039,10 @@ class Trainer(GRPOTrainerMixin):
                             break
                 if confirmed:
                     # Choose action based on collapse type:
-                    # - Depth-0 collapse: BOOST advantage to encourage deeper routing
+                    # - Depth-0 collapse: Gentle boost (was 2.0, reduced to 1.15 for stability) to encourage deeper routing
                     # - Min-depth collapse: DAMPEN advantage to reduce penalty on depth
                     if collapse_depth == 0:
-                        nudge_mult = float(getattr(self.config, "mor_advantage_nudge_mult", 2.0) or 2.0)
+                        nudge_mult = float(getattr(self.config, "mor_advantage_nudge_mult", 1.15) or 1.15)
                         action = "boost"
                     else:
                         # Min-depth collapse: negative advantage penalizes depth

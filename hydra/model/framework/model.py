@@ -438,6 +438,7 @@ class HydraModel(nn.Module):
 
 	_gradient_checkpointing: bool = False
 	_checkpoint_every_n: int = 1
+	_skip_moe: bool = False  # Skip MoE layers during forward (for memory-efficient GRPO)
 
 	def enable_gradient_checkpointing(self, every_n: int = 1) -> None:
 		self._gradient_checkpointing = True
@@ -449,6 +450,22 @@ class HydraModel(nn.Module):
 	@property
 	def is_gradient_checkpointing(self) -> bool:
 		return self._gradient_checkpointing
+
+	def set_skip_moe(self, skip: bool) -> None:
+		"""Enable/disable MoE layer skipping for memory-efficient GRPO.
+
+		When skip=True, MoE layers are bypassed during forward pass.
+		This dramatically reduces memory for reasoning training while
+		still training the base transformer layers.
+
+		Args:
+			skip: If True, skip all MoE layers during forward pass.
+		"""
+		self._skip_moe = skip
+		if skip:
+			_log.info("MoE layers DISABLED (skip_moe=True)")
+		else:
+			_log.info("MoE layers ENABLED (skip_moe=False)")
 
 	def forward(
 		self,
@@ -472,8 +489,9 @@ class HydraModel(nn.Module):
 		h = _safe_embedding_lookup(self.tok_emb, x, scale=math.sqrt(self.dim))
 
 		# Build MoE placement lookup for efficient routing
+		# Skip MoE if _skip_moe flag is set (for memory-efficient GRPO)
 		moe_after_block = {}
-		if self.moe_enabled and self.moe_layers:
+		if self.moe_enabled and self.moe_layers and not self._skip_moe:
 			for moe_idx, block_idx in enumerate(self._moe_placement):
 				moe_after_block[block_idx] = moe_idx
 
