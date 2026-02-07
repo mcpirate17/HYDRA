@@ -132,6 +132,15 @@ class Trainer:
         "_manifold_unfreeze_step",  # Step to unfreeze manifold gradients
         "_current_step",  # Current training step (for emergency checkpoint)
         "_resume_skip_optimizer_until",  # Skip optimizer updates until this step after incomplete resume
+        # Compile warmup: conservative memory settings during torch.compile warmup
+        "_compile_warmup_steps",  # Number of steps to use conservative settings
+        "_compile_warmup_batch_size",  # Reduced batch size during warmup
+        "_compile_warmup_seq_len",  # Reduced seq len during warmup
+        "_compile_warmup_checkpoint_every",  # Aggressive checkpointing during warmup
+        "_target_batch_size",  # Target batch size after warmup
+        "_target_seq_len",  # Target seq len after warmup
+        "_target_checkpoint_every",  # Target checkpoint interval after warmup
+        "_compile_warmup_complete",  # Flag indicating warmup is done
     )
 
     def __init__(self, config: TrainingConfig):
@@ -280,6 +289,18 @@ class Trainer:
         self._mor_advantage_nudge_until_step: int = 0
         self._mor_advantage_nudge_cooldown_until_step: int = 0
         self._mor_advantage_nudge_active: bool = False
+
+        # Compile warmup: conservative memory settings during torch.compile warmup
+        # This helps large models that OOM during the compile graph capture phase
+        self._compile_warmup_steps: int = int(getattr(config, "compile_warmup_steps", 0) or 0)
+        self._compile_warmup_batch_size: int = int(getattr(config, "compile_warmup_batch_size", 1) or 1)
+        self._compile_warmup_seq_len: int = int(getattr(config, "compile_warmup_seq_len", 512) or 512)
+        self._compile_warmup_checkpoint_every: int = int(getattr(config, "compile_warmup_checkpoint_every", 1) or 1)
+        self._target_batch_size: int = config.batch_size
+        self._target_seq_len: int = config.max_seq_len
+        self._target_checkpoint_every: int = int(getattr(config, "checkpoint_every_n", 2) or 2)
+        self._compile_warmup_complete: bool = (self._compile_warmup_steps == 0)
+
         if config.resume_from:
             self._checkpoint_config = self._peek_checkpoint_config(config.resume_from)
             self._checkpoint_seq_len = self._checkpoint_config.get("max_seq_len", config.max_seq_len)
@@ -1550,14 +1571,23 @@ class Trainer:
         if isinstance(sn, str) and sn:
             self._source_name_counts[sn] = self._source_name_counts.get(sn, 0) + 1
             self._source_name_counts_total[sn] = self._source_name_counts_total.get(sn, 0) + 1
+
+        input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+        labels = batch["labels"].to(self.device, non_blocking=True)
         mask = batch.get("attention_mask")
         if mask is not None:
             mask = mask.to(self.device, non_blocking=True)
-        return (
-            batch["input_ids"].to(self.device, non_blocking=True),
-            batch["labels"].to(self.device, non_blocking=True),
-            mask,
-        )
+
+        # Compile warmup: truncate to reduced seq_len to save memory during torch.compile
+        if not self._compile_warmup_complete and self._compile_warmup_steps > 0:
+            warmup_seq_len = self._compile_warmup_seq_len
+            if input_ids.size(1) > warmup_seq_len:
+                input_ids = input_ids[:, :warmup_seq_len]
+                labels = labels[:, :warmup_seq_len]
+                if mask is not None:
+                    mask = mask[:, :warmup_seq_len]
+
+        return (input_ids, labels, mask)
 
     def train(self) -> TrainingMetrics:
         config = self.config
@@ -1963,9 +1993,57 @@ class Trainer:
             except Exception as e:
                 self.logger.warning(f"SafeOptimizations pretest skipped: {e}")
 
+        # Compile warmup: apply conservative memory settings during torch.compile warmup
+        # This helps large models avoid OOM during the graph capture phase
+        _compile_warmup_end_step = start_step + self._compile_warmup_steps
+        if self._compile_warmup_steps > 0 and not self._compile_warmup_complete:
+            self.logger.info(f"\n{'='*60}")
+            self.logger.info("🔥 COMPILE WARMUP: Using conservative memory settings")
+            self.logger.info(f"{'='*60}")
+            self.logger.info(f"  Duration: {self._compile_warmup_steps} steps (until step {_compile_warmup_end_step})")
+            self.logger.info(f"  Batch size: {self._compile_warmup_batch_size} (target: {self._target_batch_size})")
+            self.logger.info(f"  Seq length: {self._compile_warmup_seq_len} (target: {self._target_seq_len})")
+            self.logger.info(f"  Checkpoint every: {self._compile_warmup_checkpoint_every} layers (target: {self._target_checkpoint_every})")
+            self.logger.info(f"{'='*60}\n")
+
+            # Apply conservative settings
+            grad_accum = self._compile_warmup_batch_size  # Override for warmup
+            self._current_seq_len = self._compile_warmup_seq_len
+
+            # Update gradient checkpointing to be more aggressive
+            base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+            if hasattr(base_model, "enable_gradient_checkpointing"):
+                base_model.enable_gradient_checkpointing(every_n=self._compile_warmup_checkpoint_every)
+
         while step < max_steps:
             step_start = time.time()
             self._current_step = step  # Track for emergency checkpoint on error
+
+            # Check if compile warmup is complete and transition to target settings
+            if not self._compile_warmup_complete and step >= _compile_warmup_end_step:
+                self._compile_warmup_complete = True
+                self.logger.info(f"\n{'='*60}")
+                self.logger.info("✅ COMPILE WARMUP COMPLETE: Transitioning to target settings")
+                self.logger.info(f"{'='*60}")
+                self.logger.info(f"  Batch size: {self._compile_warmup_batch_size} → {self._target_batch_size}")
+                self.logger.info(f"  Seq length: {self._compile_warmup_seq_len} → {self._target_seq_len}")
+                self.logger.info(f"  Checkpoint every: {self._compile_warmup_checkpoint_every} → {self._target_checkpoint_every}")
+                self.logger.info(f"{'='*60}\n")
+
+                # Restore target settings
+                grad_accum = self.config.grad_accum_steps
+                self._current_seq_len = self._target_seq_len
+
+                # Restore gradient checkpointing
+                base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+                if hasattr(base_model, "enable_gradient_checkpointing"):
+                    base_model.enable_gradient_checkpointing(every_n=self._target_checkpoint_every)
+
+                # Clear CUDA cache to release warmup allocations
+                if self.device == "cuda":
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    self.logger.info("  Cleared CUDA cache after warmup")
 
             optimizer.zero_grad(set_to_none=True)
             accum_loss = torch.zeros((), device=self.device)

@@ -114,6 +114,54 @@ if use_mod_mor:
     clear_mor_caches(model)
 ```
 
+## Compile Warmup (NEW)
+
+For large models that OOM during torch.compile graph capture, use compile warmup:
+
+```bash
+--compile_warmup_steps 10 \           # Conservative settings for first 10 steps
+--compile_warmup_batch_size 1 \       # Reduced batch during warmup
+--compile_warmup_seq_len 512 \        # Reduced seq len during warmup
+--compile_warmup_checkpoint_every 1   # Aggressive checkpointing during warmup
+```
+
+This dramatically reduces memory during the torch.compile graph capture phase:
+- **Step 0-9**: batch=1, seq=512, checkpoint every layer → ~20GB peak
+- **Step 10+**: batch=4, seq=1024, normal checkpointing → ~28GB peak
+
+The transition happens automatically after warmup steps complete.
+
+### How It Works
+
+1. During warmup, the trainer uses conservative settings:
+   - Smaller batch size (default: 1)
+   - Shorter sequences (default: 512)
+   - Checkpoint every layer (default: every 1)
+
+2. torch.compile captures the graph with these small tensors
+
+3. After warmup completes, trainer transitions to target settings:
+   - Restores original batch size
+   - Restores original sequence length
+   - Restores original checkpointing interval
+   - Clears CUDA cache to release warmup allocations
+
+### Example for 2B Model
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python trainer.py \
+    --model_size 500M \
+    --moe --moe_num_layers 6 \
+    --resume checkpoints/reasoning/reasoning_checkpoint.pt \
+    --compile_warmup_steps 10 \
+    --compile_warmup_batch_size 1 \
+    --compile_warmup_seq_len 512 \
+    --8bit_adam \
+    --gradient_checkpointing
+```
+
+---
+
 ## Recommended Configuration for 32GB GPU
 
 For 2B model (500M + MoE):

@@ -815,6 +815,33 @@ def _add_experimental_args(parser: argparse.ArgumentParser) -> None:
         help="Steps before CUDA graph capture (warmup period)",
     )
 
+    # Compile warmup: conservative memory settings during torch.compile warmup
+    parser.add_argument(
+        "--compile_warmup_steps",
+        type=int,
+        default=0,
+        help="Steps to use conservative memory settings during compile warmup (0=disabled). "
+             "Useful for large models that OOM during torch.compile graph capture.",
+    )
+    parser.add_argument(
+        "--compile_warmup_batch_size",
+        type=int,
+        default=1,
+        help="Reduced batch size during compile warmup (default: 1)",
+    )
+    parser.add_argument(
+        "--compile_warmup_seq_len",
+        type=int,
+        default=512,
+        help="Reduced sequence length during compile warmup (default: 512)",
+    )
+    parser.add_argument(
+        "--compile_warmup_checkpoint_every",
+        type=int,
+        default=1,
+        help="Gradient checkpoint every N layers during compile warmup (default: 1 = every layer)",
+    )
+
     # Blackwell-specific Triton tuning
     parser.add_argument(
         "--experimental_blackwell_tuning",
