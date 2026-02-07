@@ -512,6 +512,59 @@ For 1B model with longer context, use stepped sequence scheduling:
 
 ---
 
+## 🧠 Reasoning Training (GRPO)
+
+HYDRA supports System 2 reasoning training via Group Relative Policy Optimization (GRPO) using a **dedicated reasoning trainer**.
+
+### Architecture
+
+Reasoning training is handled by `reasoning_trainer.py`, which is separate from the main `trainer.py`. This separation:
+- Prevents memory issues when resuming normal pre-training after reasoning
+- Allows specialized GRPO optimizations (e.g., skipping MoE layers)
+- Keeps the main training loop simple and focused
+
+### Quick Start
+
+```bash
+# Run reasoning training (GRPO + optional distillation)
+python reasoning_trainer.py \
+    --resume checkpoints/hydra_500m_step_200000.pt \
+    --max_steps 10000 \
+    --grpo_batch_size 4 \
+    --grpo_num_generations 4 \
+    --grpo_skip_moe  # Skip MoE for memory efficiency
+```
+
+### Key Features
+
+| Feature | Description |
+|---------|-------------|
+| **GRPO Loss** | Group Relative Policy Optimization with KL penalty |
+| **Teacher Distillation** | Optional distillation from teacher model |
+| **MoE Skipping** | `--grpo_skip_moe` bypasses MoE layers (huge memory savings) |
+| **Chunked Log-Probs** | Memory-efficient log probability computation |
+| **Separate Checkpoints** | Saves to `checkpoints/reasoning/` directory |
+
+### Resuming Normal Training After Reasoning
+
+After reasoning training completes, resume normal pre-training:
+
+```bash
+# Resume normal training from reasoning checkpoint
+python trainer.py \
+    --model_size 500M \
+    --resume checkpoints/reasoning/reasoning_checkpoint.pt \
+    --max_steps 300000 \
+    --8bit_adam
+```
+
+The main trainer automatically:
+- Cleans up duplicate model weights from reasoning checkpoints
+- Disables reasoning code paths (reasoning_enabled defaults to False)
+- Restores optimizer state for continued pre-training
+
+---
+
 ## 🔀 Mixture of Experts (MoE)
 
 HYDRA supports optional Mixture of Experts layers for increased model capacity with constant compute per token.
@@ -635,9 +688,10 @@ HYDRA/
 │       ├── trainer.py       # Main trainer class
 │       ├── config.py        # Configuration dataclasses
 │       ├── checkpointing.py # Checkpoint management
-│       ├── reasoning.py     # GRPO reasoning training
+│       ├── reasoning.py     # GRPO reasoning utilities (used by reasoning_trainer.py)
 │       └── metrics.py       # Training metrics
 ├── trainer.py               # Training entrypoint (CLI)
+├── reasoning_trainer.py     # Standalone reasoning/GRPO trainer
 ├── scripts/                 # Utility scripts
 │   ├── compare_mod_mor_effectiveness.py  # MoD/MoR comparison
 │   └── ...

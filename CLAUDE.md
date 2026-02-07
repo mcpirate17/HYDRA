@@ -39,6 +39,14 @@ source /home/tim/venvs/llm/bin/activate && python trainer.py --model_size 500M -
 
 # With static routing (enables CUDA graphs)
 source /home/tim/venvs/llm/bin/activate && python trainer.py --model_size 500M --static_routing_mode --experimental_cuda_graphs
+
+# Reasoning training (GRPO) - uses separate trainer
+source /home/tim/venvs/llm/bin/activate && python reasoning_trainer.py \
+    --resume checkpoints/hydra_500m_step_200000.pt --max_steps 10000 --grpo_skip_moe
+
+# Resume normal training after reasoning
+source /home/tim/venvs/llm/bin/activate && python trainer.py \
+    --model_size 500M --resume checkpoints/reasoning/reasoning_checkpoint.pt --8bit_adam
 ```
 
 ### Testing
@@ -87,6 +95,7 @@ source /home/tim/venvs/llm/bin/activate && python diagnostics/moe_specialization
   - `data/` - Data loading utilities
   - `optim/` - Optimizers and schedulers
 - `trainer.py` - Training entrypoint (CLI)
+- `reasoning_trainer.py` - Standalone reasoning/GRPO trainer (separate from main trainer)
 - `tests/` - Test suite
 - `diagnostics/` - Diagnostic and benchmark scripts (not discovered by pytest)
 - `scripts/` - Utility scripts (query_training_db.py, build_training_db.py, etc.)
@@ -234,3 +243,36 @@ source /home/tim/venvs/llm/bin/activate && python scripts/build_training_db.py -
 | `ema_short` | 0.99 | ~100 steps | Spike detection |
 | `ema_medium` | 0.999 | ~1K steps | Session progress |
 | `ema_long` | 0.9999 | ~10K steps | Cross-run trends |
+
+## TODOs / Known Issues
+
+### MoE Expert Weight Explosion (2026-01-27)
+
+**Problem**: MoE expert weights exploded ~150x since initialization (norm 37 → 5780).
+This causes gradient norms of 3000-5000, requiring aggressive clipping and very low LR (~1e-5).
+
+**Root Cause**: MoE added at step 251K with LR=4e-5, which was too aggressive for newly initialized experts.
+The 3x weight decay scale wasn't enough to prevent weight growth.
+
+**Evidence**:
+| Checkpoint | Step | MoE Expert Avg Norm | MLP Avg Norm |
+|------------|------|---------------------|--------------|
+| 155000_rescaled | 155K | 37.7 | 35.5 |
+| 252000 | 252K | 3,766 | 37.2 |
+| 262381 | 262K | 5,780 | ~60 |
+
+**Remediation Options**:
+1. ✅ Use very low LR (1e-5) and let weight decay gradually shrink experts
+2. Run `scripts/rescale_moe_weights.py` to reset expert weights to healthy range
+3. Roll back to pre-MoE checkpoint (155K) and re-add MoE with lower LR
+
+**Prevention**: When adding MoE to existing model, use:
+- Lower initial LR for experts (--moe_expert_lr_scale 0.1)
+- Higher weight decay (--moe_expert_weight_decay_scale 5.0+)
+- Monitor expert weight norms in diagnostics
+
+### Resume LR Alignment Override
+
+**Problem**: `--max_lr` is ignored on resume due to LR alignment feature preserving checkpoint LR.
+
+**Solution**: Add `--resume_ignore_ckpt_lr` to use the specified LR instead of scaling to match checkpoint.

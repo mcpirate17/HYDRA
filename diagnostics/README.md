@@ -28,6 +28,8 @@ Overview of diagnostic and benchmarking tools in `diagnostics/`.
 - `loss_component_diagnostic.py` — analyze CE, aux, ponder loss components.
 - `diagnose_learning.py` — learning rate and loss diagnostics.
 - `routing_healthcheck.py` — MoD/MoR routing behavior checks.
+- `profile_grpo_memory.py` — memory profiling for GRPO/reasoning training. REQUIRES CUDA.
+- `chat.py` — interactive chat with trained model checkpoints. REQUIRES CUDA.
 
 ### Scaling Analysis
 - `scaling_analysis.py` — multi-scale model analysis with curve fitting and 4B predictions.
