@@ -65,18 +65,21 @@ def compute_token_losses_from_hidden(
     This is used to support loss-driven routing (MoR) and loss-aware MoD
     supervision when training uses chunked CE (logits may be omitted).
     Returns [B, L] float32 losses with ignored positions set to 0.
+
+    Uses chunked token-level F.cross_entropy, computing full-vocab logits for
+    each token chunk at once. This replaces the previous double-loop (token ×
+    vocab) with a single token-chunk loop — reducing kernel launches from ~96
+    to ~8 for typical shapes.
     """
     B, L, D = hidden.shape
     V = weight.shape[0]
     N = B * L
 
-    h = hidden.view(N, D).float()
-    t = targets.view(N)
-    valid = t != ignore_index
+    h = hidden.reshape(N, D)
+    t = targets.reshape(N)
 
     # Defensive bounds check: clamp target IDs to valid vocab range.
-    # Out-of-bounds targets cause CUDA illegal memory access.
-    valid_targets = t[valid]
+    valid_targets = t[t != ignore_index]
     if valid_targets.numel() > 0:
         oob_mask = (valid_targets < 0) | (valid_targets >= V)
         if oob_mask.any():
@@ -88,30 +91,23 @@ def compute_token_losses_from_hidden(
                 f"compute_token_losses_from_hidden: {n_oob} targets out of vocab range "
                 f"[0, {V}). min={t_min}, max={t_max}. Clamping to valid range."
             )
-            # Clamp in-place on the flat view
-            t.clamp_(min=0, max=V - 1)
-            # Recompute valid mask after clamping (ignore_index might have changed)
-            valid = t != ignore_index
+            t = t.clamp(min=0, max=V - 1)
 
-    # Correct-class logits (only for valid positions)
-    correct_logits = torch.zeros((N,), device=hidden.device, dtype=torch.float32)
-    if valid.any():
-        w_y = weight[t[valid]].float()  # [M, D]
-        correct_logits[valid] = (h[valid] * w_y).sum(dim=1)
-
-    losses = torch.zeros((N,), device=hidden.device, dtype=torch.float32)
+    # Single loop over token chunks: compute full-vocab logits per chunk and
+    # use F.cross_entropy which is fused and efficient. Each chunk materializes
+    # [chunk, V] logits (~400MB for chunk=2048, V=50K in fp32) then immediately
+    # computes per-token loss and frees the logits.
+    losses = torch.zeros(N, device=hidden.device, dtype=torch.float32)
+    # Cast weight once (not per chunk)
+    w_f = weight.float()
     for t0 in range(0, N, token_chunk_size):
         t1 = min(N, t0 + token_chunk_size)
-        h_chunk = h[t0:t1]  # [T, D]
-        lse = torch.full((t1 - t0,), -float("inf"), device=hidden.device, dtype=torch.float32)
-        for v0 in range(0, V, vocab_chunk_size):
-            v1 = min(V, v0 + vocab_chunk_size)
-            w_chunk = weight[v0:v1].float()  # [C, D]
-            logits_chunk = h_chunk @ w_chunk.t()  # [T, C]
-            lse = torch.logaddexp(lse, torch.logsumexp(logits_chunk, dim=1))
-        losses[t0:t1] = lse - correct_logits[t0:t1]
+        logits_chunk = h[t0:t1].float() @ w_f.t()  # [chunk, V]
+        losses[t0:t1] = F.cross_entropy(
+            logits_chunk, t[t0:t1], ignore_index=ignore_index, reduction="none"
+        )
+        del logits_chunk  # free immediately
 
-    losses = losses * valid.float()
     return losses.view(B, L)
 
 

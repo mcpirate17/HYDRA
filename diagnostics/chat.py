@@ -6,6 +6,10 @@ Usage:
     python diagnostics/chat.py checkpoints/hydra_500m_final.pt
     python diagnostics/chat.py checkpoints/hydra_500m_final.pt --temperature 0.7
     python diagnostics/chat.py checkpoints/hydra_500m_final.pt --system "You are a helpful assistant."
+
+    # With reasoning (model thinks before responding)
+    python diagnostics/chat.py checkpoints/reasoning/reasoning_checkpoint.pt --format chat --reasoning
+    python diagnostics/chat.py checkpoints/reasoning/reasoning_checkpoint.pt --format chat --reasoning --show-thinking
 """
 
 from __future__ import annotations
@@ -97,13 +101,32 @@ def generate(
     repetition_penalty: float = 1.2,
     stop_strings: list[str] = None,
     device: str = "cuda",
-) -> str:
-    """Generate text with streaming output."""
+    show_thinking: bool = True,
+    reasoning_mode: bool = False,
+) -> tuple[str, str]:
+    """Generate text with streaming output.
+
+    Args:
+        reasoning_mode: If True, the prompt already ends with <think>\\n so
+            generation starts inside the think block.
+
+    Returns:
+        (thinking, response) tuple. thinking is empty if no <think> block.
+    """
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
     generated = input_ids
     generated_text = ""
 
     stop_strings = stop_strings or []
+
+    # Track thinking state for streaming display
+    # If reasoning_mode, we already injected <think> in the prompt so we start inside it
+    in_think_block = reasoning_mode
+    think_block_done = False
+    thinking_text = ""
+
+    if reasoning_mode and show_thinking:
+        print("\033[2m[thinking] ", end="", flush=True)
 
     for _ in range(max_new_tokens):
         logits = model(generated)
@@ -140,7 +163,41 @@ def generate(
         # Decode new token
         new_text = tokenizer.decode(next_token[0], skip_special_tokens=False)
         generated_text += new_text
-        print(new_text, end="", flush=True)
+
+        # Detect <think> / </think> transitions
+        if not in_think_block and not think_block_done and "<think>" in generated_text:
+            in_think_block = True
+            if show_thinking:
+                print("\033[2m[thinking] ", end="", flush=True)
+            continue
+
+        if in_think_block and "</think>" in generated_text:
+            in_think_block = False
+            think_block_done = True
+            # Extract thinking content
+            think_start = generated_text.find("<think>") + 7
+            think_end = generated_text.find("</think>")
+            thinking_text = generated_text[think_start:think_end].strip()
+            if show_thinking:
+                print("\033[0m", flush=True)  # Reset dim
+            continue
+
+        # Stream output
+        if in_think_block:
+            if show_thinking:
+                print(new_text, end="", flush=True)
+        elif think_block_done:
+            # After </think>, only print non-tag content
+            # Skip printing until we're past the </think> tag remnants
+            after_think = generated_text.split("</think>", 1)[-1]
+            if len(after_think) == len(new_text):
+                print(new_text, end="", flush=True)
+            elif after_think:
+                # Transitional token that partially overlaps with tag
+                print(after_think[-len(new_text):] if len(new_text) <= len(after_think) else after_think, end="", flush=True)
+        else:
+            # No think block at all, stream normally
+            print(new_text, end="", flush=True)
 
         # Stop conditions
         if next_token.item() == tokenizer.eos_token_id:
@@ -149,10 +206,16 @@ def generate(
         for stop in stop_strings:
             if stop in generated_text:
                 print()
-                return generated_text.split(stop)[0]
+                response = generated_text.split(stop)[0]
+                if "</think>" in response:
+                    response = response.split("</think>", 1)[-1].strip()
+                return thinking_text, response
 
     print()
-    return generated_text
+    response = generated_text
+    if "</think>" in response:
+        response = response.split("</think>", 1)[-1].strip()
+    return thinking_text, response
 
 
 def main():
@@ -168,7 +231,15 @@ def main():
     parser.add_argument("--format", type=str, default="raw",
                        choices=["raw", "chat", "instruct"],
                        help="Prompt format: raw (just text), chat (<|user|>), instruct (### Instruction)")
+    parser.add_argument("--reasoning", action="store_true",
+                       help="Enable reasoning mode: prompt model to think before responding")
+    parser.add_argument("--show-thinking", action="store_true",
+                       help="Show the <think> block content (dimmed). Hidden by default.")
     args = parser.parse_args()
+
+    if args.reasoning and args.format not in ("chat", "raw"):
+        print("Warning: --reasoning works best with --format chat or raw. Switching to chat format.")
+        args.format = "chat"
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -179,7 +250,12 @@ def main():
 
     print("\n" + "=" * 60)
     print("HYDRA Chat - Type 'quit' to exit, 'clear' to reset")
-    print(f"Format: {args.format} | Temp: {args.temperature} | Max tokens: {args.max_tokens}")
+    mode_str = f"Format: {args.format} | Temp: {args.temperature} | Max tokens: {args.max_tokens}"
+    if args.reasoning:
+        mode_str += " | Reasoning: ON"
+        if args.show_thinking:
+            mode_str += " (visible)"
+    print(mode_str)
     print("=" * 60 + "\n")
 
     history = ""
@@ -212,16 +288,20 @@ def main():
             if not history:
                 history = "<|system|>\nYou are a helpful assistant.\n"
             prompt = f"{history}<|user|>\n{user_input}\n<|assistant|>\n"
+            if args.reasoning:
+                prompt += "<think>\n"
             stop_strings = ["<|user|>", "<|endoftext|>", "<|system|>"]
         elif args.format == "instruct":
             prompt = f"{history}### Instruction:\n{user_input}\n\n### Response:\n"
             stop_strings = ["### Instruction:", "###"]
         else:  # raw
             prompt = f"{history}{user_input}\n"
+            if args.reasoning:
+                prompt += "<think>\n"
             stop_strings = []
 
         print("HYDRA: ", end="", flush=True)
-        response = generate(
+        thinking, response = generate(
             model, tokenizer, prompt,
             max_new_tokens=args.max_tokens,
             temperature=args.temperature,
@@ -230,12 +310,13 @@ def main():
             repetition_penalty=args.repetition_penalty,
             stop_strings=stop_strings,
             device=args.device,
+            show_thinking=args.show_thinking,
+            reasoning_mode=args.reasoning,
         )
 
-        # Update history
+        # Update history (store the response only, not thinking)
         if args.format == "chat":
-            # Keep system prompt, accumulate conversation
-            history = f"{prompt}{response}\n"
+            history = f"{history}<|user|>\n{user_input}\n<|assistant|>\n{response}\n"
         elif args.format == "instruct":
             history = f"{prompt}{response}\n\n"
         else:

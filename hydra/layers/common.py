@@ -99,13 +99,17 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        # Cache env vars at init time — avoids syscall overhead on every forward pass
+        # (~112 RMSNorm forward calls per step with 14 MoR blocks × 4 recursions × 2 norms)
+        self._prefer_fused = os.environ.get("HYDRA_PREFER_FUSED_RMS_NORM", "0") == "1"
+        self._allow_fused_backward = os.environ.get("HYDRA_ALLOW_FUSED_RMS_NORM_BACKWARD", "0") == "1"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Prefer PyTorch's native RMSNorm when available (fast + stable).
         # HYDRA's Triton fused RMSNorm is opt-in because its backward has been
         # observed to be incorrect on some stacks.
-        prefer_fused = os.environ.get("HYDRA_PREFER_FUSED_RMS_NORM", "0") == "1"
-        allow_fused_backward = os.environ.get("HYDRA_ALLOW_FUSED_RMS_NORM_BACKWARD", "0") == "1"
+        prefer_fused = self._prefer_fused
+        allow_fused_backward = self._allow_fused_backward
 
         if prefer_fused and FUSED_KERNELS_AVAILABLE and fused_rms_norm is not None:
             # Safety: do not allow training/backward to silently use a potentially-wrong fused backward.

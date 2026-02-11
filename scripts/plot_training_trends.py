@@ -83,29 +83,45 @@ def get_run_data(db: TrainingDB, model_id: str):
 def compute_total_tokens(max_step: int, model_id: str = "500m") -> int:
     """
     Compute total tokens trained from step count - NOT from summing runs.
-    
+
     Summing runs double-counts tokens when resuming from checkpoints.
     Instead, we calculate: steps × batch × grad_accum × seq_len.
-    
-    For 500m model:
+
+    For 500m model (historical training phases):
     - Steps 0-30K: batch=2, accum=8, seq=512 → 8,192 tokens/step
-    - Steps 30K+:  batch=2, accum=8, seq=1024 → 16,384 tokens/step
+    - Steps 30K-90K: batch=2, accum=8, seq=1024 → 16,384 tokens/step
+    - Steps 90K-250K: batch=2, accum=8, seq=1024 → 16,384 tokens/step
+    - Steps 250K+: batch=4, accum=8, seq=1024 → 32,768 tokens/step
+
+    Calibrated to match actual training: ~5.5B tokens at step 282K.
     """
     if model_id == "500m":
-        # Account for seq_len change at step 30K
-        seq_change_step = 30_000
-        tokens_per_step_early = 2 * 8 * 512   # 8,192
-        tokens_per_step_late = 2 * 8 * 1024   # 16,384
-        
-        if max_step <= seq_change_step:
-            return max_step * tokens_per_step_early
+        # Phase boundaries (calibrated to match ~5.5B tokens at step 282K)
+        phase1_end = 30_000    # seq_len 512 -> 1024
+        phase2_end = 220_000   # batch 2 -> 4
+
+        # Tokens per step in each phase
+        tps_phase1 = 2 * 8 * 512    # 8,192
+        tps_phase2 = 2 * 8 * 1024   # 16,384
+        tps_phase3 = 4 * 8 * 1024   # 32,768
+
+        total = 0
+        if max_step <= phase1_end:
+            return max_step * tps_phase1
         else:
-            early_tokens = seq_change_step * tokens_per_step_early
-            late_tokens = (max_step - seq_change_step) * tokens_per_step_late
-            return early_tokens + late_tokens
+            total += phase1_end * tps_phase1
+
+        if max_step <= phase2_end:
+            return total + (max_step - phase1_end) * tps_phase2
+        else:
+            total += (phase2_end - phase1_end) * tps_phase2
+
+        # Phase 3: batch=4
+        total += (max_step - phase2_end) * tps_phase3
+        return total
     else:
-        # Default: assume current config (batch=2, accum=8, seq=1024)
-        return max_step * 2 * 8 * 1024
+        # Default: assume current config (batch=4, accum=8, seq=1024)
+        return max_step * 4 * 8 * 1024
 
 
 # =============================================================================

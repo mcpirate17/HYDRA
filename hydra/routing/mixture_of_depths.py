@@ -38,7 +38,6 @@ Usage:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
@@ -202,7 +201,7 @@ class MoDRouter(BaseRouter):
             
             # Collapse prevention: penalize low variance (all probs near 0 or 1)
             # When router collapses, variance → 0, so we penalize low variance heavily
-            prob_variance = probs.var()
+            prob_variance = probs.var() if probs.numel() > 1 else probs.new_tensor(0.0)
             # Target variance for uniform-ish distribution around target capacity
             # For target=0.5, max variance is 0.25; scale by capacity
             expected_var = target_prob * (1 - target_prob) * 0.5  # ~0.125 for target=0.5
@@ -290,12 +289,8 @@ class MixtureOfDepthsBlock(nn.Module):
         out_selected = self.block(x_selected, **kwargs)  # [B, k, D]
 
         # Scatter back to full sequence (with identity for skipped)
-        # MEMORY FIX: Avoid unnecessary clone when dtypes match.
-        # .to() already creates a new tensor when dtype differs, so clone is redundant.
-        if x.dtype == out_selected.dtype:
-            output = x.clone()  # Clone needed to preserve identity for non-selected tokens
-        else:
-            output = x.to(out_selected.dtype)  # Creates new tensor, clone not needed
+        # Ensure output dtype matches out_selected (for mixed precision)
+        output = x.clone().to(out_selected.dtype)  # Start with identity (residual)
         output.scatter_(1, indices_expanded, out_selected)
 
         return output

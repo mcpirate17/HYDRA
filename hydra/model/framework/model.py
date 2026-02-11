@@ -106,6 +106,7 @@ class HydraBaseModel(nn.Module):
 		super().__init__()
 
 		self.dim = dim
+		self._sqrt_dim = math.sqrt(dim)
 		self.vocab_size = vocab_size
 		self.n_layers = n_layers
 
@@ -160,7 +161,7 @@ class HydraBaseModel(nn.Module):
 		"""
 		# Token embedding with sqrt(dim) scaling (LLaMA style)
 		# Uses safe lookup to prevent Xid 13 GPU crashes from OOB tokens
-		h = _safe_embedding_lookup(self.tok_emb, x, scale=math.sqrt(self.dim))
+		h = _safe_embedding_lookup(self.tok_emb, x, scale=self._sqrt_dim)
 		for layer in self.layers:
 			h = layer(h)
 		h = self.norm(h)
@@ -233,6 +234,7 @@ class HydraModel(nn.Module):
 		super().__init__()
 
 		self.dim = dim
+		self._sqrt_dim = math.sqrt(dim)
 		self.vocab_size = vocab_size
 		self.n_mor_blocks = n_mor_blocks
 		self.recursions_per_block = recursions_per_block
@@ -387,6 +389,18 @@ class HydraModel(nn.Module):
 		self.norm = RMSNorm(dim)
 		self.output = nn.Linear(dim, vocab_size, bias=False)
 
+		# Cache placement lookups — these are constant after __init__ and were
+		# being rebuilt as dicts on every forward() call.
+		self._moe_after_block: dict = {}
+		if self.moe_enabled and self.moe_layers:
+			for moe_idx, block_idx in enumerate(self._moe_placement):
+				self._moe_after_block[block_idx] = moe_idx
+
+		self._manifold_after_block: dict = {}
+		if self.manifold_connections:
+			for mc_idx, block_idx in enumerate(self._manifold_placement):
+				self._manifold_after_block[block_idx] = mc_idx
+
 		self.loss_baseline = MovingAverageBaseline(decay=0.99, warmup_steps=1000)
 
 		self._init_weights()
@@ -443,9 +457,20 @@ class HydraModel(nn.Module):
 	def enable_gradient_checkpointing(self, every_n: int = 1) -> None:
 		self._gradient_checkpointing = True
 		self._checkpoint_every_n = max(1, every_n)
+		# Disable MoR sparse packing — variable-size tensors break checkpoint
+		# recomputation (GPU float non-determinism changes n_active by ±1).
+		self._set_mor_force_dense(True)
 
 	def disable_gradient_checkpointing(self) -> None:
 		self._gradient_checkpointing = False
+		self._set_mor_force_dense(False)
+
+	def _set_mor_force_dense(self, force: bool) -> None:
+		"""Set _force_dense on all MoRExecutor modules."""
+		from hydra.routing.mixture_of_recursions import MoRExecutor
+		for m in self.modules():
+			if isinstance(m, MoRExecutor):
+				m._force_dense = force
 
 	@property
 	def is_gradient_checkpointing(self) -> bool:
@@ -486,20 +511,12 @@ class HydraModel(nn.Module):
 		"""
 		# Token embedding with sqrt(dim) scaling (LLaMA style)
 		# Uses safe lookup to prevent Xid 13 GPU crashes from OOB tokens
-		h = _safe_embedding_lookup(self.tok_emb, x, scale=math.sqrt(self.dim))
+		h = _safe_embedding_lookup(self.tok_emb, x, scale=self._sqrt_dim)
 
-		# Build MoE placement lookup for efficient routing
+		# Use cached placement lookups (built once in __init__)
 		# Skip MoE if _skip_moe flag is set (for memory-efficient GRPO)
-		moe_after_block = {}
-		if self.moe_enabled and self.moe_layers and not self._skip_moe:
-			for moe_idx, block_idx in enumerate(self._moe_placement):
-				moe_after_block[block_idx] = moe_idx
-
-		# Build manifold placement lookup
-		manifold_after_block = {}
-		if self.manifold_connections:
-			for mc_idx, block_idx in enumerate(self._manifold_placement):
-				manifold_after_block[block_idx] = mc_idx
+		moe_after_block = {} if self._skip_moe else self._moe_after_block
+		manifold_after_block = self._manifold_after_block
 
 		if return_losses:
 			if self._gradient_checkpointing and self.training:
@@ -557,10 +574,10 @@ class HydraModel(nn.Module):
 			h = self.norm(h)
 			logits = self.output(h)
 
-			aux_loss = sum(aux_losses) if aux_losses else self._zero_scalar
-			ponder_loss = sum(ponder_losses) if ponder_losses else self._zero_scalar
-			moe_aux_loss = sum(moe_aux_losses) if moe_aux_losses else self._zero_scalar
-			moe_teacher_loss = sum(moe_teacher_losses) if moe_teacher_losses else self._zero_scalar
+			aux_loss = torch.stack(aux_losses).sum() if aux_losses else self._zero_scalar
+			ponder_loss = torch.stack(ponder_losses).sum() if ponder_losses else self._zero_scalar
+			moe_aux_loss = torch.stack(moe_aux_losses).sum() if moe_aux_losses else self._zero_scalar
+			moe_teacher_loss = torch.stack(moe_teacher_losses).sum() if moe_teacher_losses else self._zero_scalar
 			return logits, {"aux_loss": aux_loss, "ponder_loss": ponder_loss, "moe_aux_loss": moe_aux_loss, "moe_teacher_loss": moe_teacher_loss}
 
 		if self._gradient_checkpointing and self.training:
@@ -600,6 +617,44 @@ class HydraModel(nn.Module):
 		h = self.norm(h)
 		return self.output(h)
 
+	def forward_with_cache(
+		self,
+		x: torch.Tensor,
+		past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+		start_pos: int = 0,
+	) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
+		"""Forward pass with KV cache for incremental generation.
+
+		On prefill (past_key_values=None), processes full sequence and returns
+		cached K,V per layer. On decode (past_key_values provided), processes
+		only new tokens and concatenates with cache.
+
+		Skips MoE and manifold connections for generation simplicity.
+
+		Args:
+			x: Token ids [B, S] where S=full seq for prefill, S=1 for decode
+			past_key_values: List of (K_cache, V_cache) per layer, or None
+			start_pos: Position offset for RoPE
+
+		Returns:
+			(logits, new_past_key_values) where logits is [B, S, vocab_size]
+		"""
+		h = _safe_embedding_lookup(self.tok_emb, x, scale=self._sqrt_dim)
+
+		n_layers = len(self.layers)
+		new_past_key_values = []
+
+		for i, layer in enumerate(self.layers):
+			layer_past_kv = past_key_values[i] if past_key_values is not None else None
+			h, new_kv = layer.forward_with_cache(
+				h, past_kv=layer_past_kv, start_pos=start_pos,
+			)
+			new_past_key_values.append(new_kv)
+
+		h = self.norm(h)
+		logits = self.output(h)
+		return logits, new_past_key_values
+
 	def forward_hidden(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
 		"""Return post-norm hidden states (pre-logits).
 
@@ -615,19 +670,12 @@ class HydraModel(nn.Module):
 		"""
 		# Token embedding with sqrt(dim) scaling (LLaMA style)
 		# Uses safe lookup to prevent Xid 13 GPU crashes from OOB tokens
-		h = _safe_embedding_lookup(self.tok_emb, x, scale=math.sqrt(self.dim))
+		h = _safe_embedding_lookup(self.tok_emb, x, scale=self._sqrt_dim)
 
-		# Build MoE placement lookup
-		moe_after_block = {}
-		if self.moe_enabled and self.moe_layers:
-			for moe_idx, block_idx in enumerate(self._moe_placement):
-				moe_after_block[block_idx] = moe_idx
-
-		# Build manifold placement lookup
-		manifold_after_block = {}
-		if self.manifold_connections:
-			for mc_idx, block_idx in enumerate(self._manifold_placement):
-				manifold_after_block[block_idx] = mc_idx
+		# Use cached placement lookups (built once in __init__)
+		# Skip MoE if _skip_moe flag is set (for memory-efficient GRPO)
+		moe_after_block = {} if self._skip_moe else self._moe_after_block
+		manifold_after_block = self._manifold_after_block
 
 		if self._gradient_checkpointing and self.training:
 			for i, layer in enumerate(self.layers):
@@ -678,19 +726,12 @@ class HydraModel(nn.Module):
 		"""
 		# Token embedding with sqrt(dim) scaling (LLaMA style)
 		# Uses safe lookup to prevent Xid 13 GPU crashes from OOB tokens
-		h = _safe_embedding_lookup(self.tok_emb, x, scale=math.sqrt(self.dim))
+		h = _safe_embedding_lookup(self.tok_emb, x, scale=self._sqrt_dim)
 
-		# Build MoE placement lookup
-		moe_after_block = {}
-		if self.moe_enabled and self.moe_layers:
-			for moe_idx, block_idx in enumerate(self._moe_placement):
-				moe_after_block[block_idx] = moe_idx
-
-		# Build manifold placement lookup
-		manifold_after_block = {}
-		if self.manifold_connections:
-			for mc_idx, block_idx in enumerate(self._manifold_placement):
-				manifold_after_block[block_idx] = mc_idx
+		# Use cached placement lookups (built once in __init__)
+		# Skip MoE if _skip_moe flag is set (for memory-efficient GRPO)
+		moe_after_block = {} if self._skip_moe else self._moe_after_block
+		manifold_after_block = self._manifold_after_block
 
 		if self._gradient_checkpointing and self.training:
 			layer_results = []
@@ -736,10 +777,10 @@ class HydraModel(nn.Module):
 		moe_aux_losses = [losses.get("moe_aux_loss", self._zero_scalar) for losses in moe_results]
 		moe_teacher_losses = [losses.get("moe_teacher_loss", self._zero_scalar) for losses in moe_results]
 
-		aux_loss = sum(aux_losses) if aux_losses else self._zero_scalar
-		ponder_loss = sum(ponder_losses) if ponder_losses else self._zero_scalar
-		moe_aux_loss = sum(moe_aux_losses) if moe_aux_losses else self._zero_scalar
-		moe_teacher_loss = sum(moe_teacher_losses) if moe_teacher_losses else self._zero_scalar
+		aux_loss = torch.stack(aux_losses).sum() if aux_losses else self._zero_scalar
+		ponder_loss = torch.stack(ponder_losses).sum() if ponder_losses else self._zero_scalar
+		moe_aux_loss = torch.stack(moe_aux_losses).sum() if moe_aux_losses else self._zero_scalar
+		moe_teacher_loss = torch.stack(moe_teacher_losses).sum() if moe_teacher_losses else self._zero_scalar
 		return self.norm(h), {"aux_loss": aux_loss, "ponder_loss": ponder_loss, "moe_aux_loss": moe_aux_loss, "moe_teacher_loss": moe_teacher_loss}
 
 	def get_aux_losses(self) -> dict:

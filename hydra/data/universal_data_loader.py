@@ -1905,9 +1905,15 @@ class HFStreamingDataLoader:
             start_wait = time.time()
             self._refill_buffer()
 
-        # Extract tokens from buffer
+        # Extract tokens from buffer — bulk consume via list conversion + deque rebuild.
+        # Converting the deque to a list once and slicing is O(n) in C, much faster
+        # than N individual popleft() calls which are O(N) Python-level iterations.
         with self._buffer_lock:
-            batch_tokens = [self.token_buffer.popleft() for _ in range(needed)]
+            all_tokens = list(self.token_buffer)
+            batch_tokens = all_tokens[:needed]
+            remaining = all_tokens[needed:]
+            self.token_buffer.clear()
+            self.token_buffer.extend(remaining)
         # If training on CUDA, pinned memory allows non_blocking H2D copies.
         pin = (self.device != "cpu") and torch.cuda.is_available()
         tokens = torch.tensor(batch_tokens, dtype=torch.long, pin_memory=pin)

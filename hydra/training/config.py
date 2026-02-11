@@ -685,6 +685,8 @@ def build_config_from_args(
         n_macro_blocks=3,
         n_heads=12,
         n_kv_heads=3,
+        # LR schedule
+        lr_schedule=(args.lr_schedule if args.lr_schedule is not None else "wsd_adaptive"),
         # Adaptive LR
         adaptive_lr=args.adaptive_lr,
         adaptive_metric=args.adaptive_metric,
@@ -853,7 +855,10 @@ def apply_schedule_overrides(
             warmup_pct = 0.01
             decay_start_pct = 0.85
 
-        config.warmup_steps = max(1, int(round(config.max_steps * warmup_pct)))
+        if getattr(args, "warmup_steps", None) is not None:
+            config.warmup_steps = args.warmup_steps
+        else:
+            config.warmup_steps = max(1, int(round(config.max_steps * warmup_pct)))
         config.decay_start_step = max(0, int(round(config.max_steps * decay_start_pct)))
         config.decay_start_step = min(config.decay_start_step, max(0, config.max_steps - 1))
         config.decay_steps = max(1, config.max_steps - config.decay_start_step)

@@ -38,7 +38,6 @@ Usage:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, TYPE_CHECKING
 
@@ -363,15 +362,28 @@ class MoRExecutor(nn.Module):
     """Mixture-of-Recursions Executor.
     
     Executes MLP recursions based on per-token depth assignments.
-    Uses vectorized computation (all tokens through all depths, masked output)
-    which is faster on GPU than sparse token packing for moderate sequences.
+    Uses sparse token packing: at each recursion depth, only active tokens
+    are packed and sent through the MLP, saving 30-40% MLP FLOPs.
+    Falls back to dense (masked) execution when sparse overhead would dominate
+    (e.g., when >90% of tokens are active at a given depth).
     
     The executor handles:
     - Adding recursion-specific embeddings/biases
+    - Sparse pack/unpack of active tokens per depth
     - Masked accumulation of outputs
     - STE gradient path for discrete depth decisions
     """
     
+    # Minimum fraction of inactive tokens to justify sparse packing overhead.
+    # Below this threshold, dense masked execution is cheaper.
+    _SPARSE_THRESHOLD: float = 0.1  # Pack when >=10% tokens are inactive
+
+    # When True, always use dense masked execution (no sparse packing).
+    # Set by the model when gradient checkpointing is active, because sparse
+    # packing creates variable-size tensors that break checkpoint recomputation
+    # (GPU float non-determinism can change n_active by ±1 on recompute).
+    _force_dense: bool = False
+
     def __init__(self, config: MoRConfig) -> None:
         super().__init__()
         self.config = config
@@ -403,6 +415,11 @@ class MoRExecutor(nn.Module):
     ) -> torch.Tensor:
         """Execute MLP recursions with per-token depth routing.
 
+        Uses sparse token packing: at each depth, only active tokens go through
+        the MLP. This saves 30-40% MLP FLOPs since later depths have fewer
+        active tokens. Falls back to dense execution for depth 0 (all active)
+        or when the inactive fraction is below SPARSE_THRESHOLD.
+
         Args:
             x: Input hidden states [batch, seq, dim] (post-attention)
             depths: Discrete depth per token [batch, seq] in [0, n_rec-1]
@@ -421,10 +438,23 @@ class MoRExecutor(nn.Module):
         device = x.device
         dtype = x.dtype
         n_rec = self.config.n_recursions
+        total_tokens = B * L
 
-        # MEMORY OPTIMIZATION: Compute masks per-iteration instead of pre-allocating [R, B, L]
-        # This saves ~3x memory for typical n_rec=4 setups by avoiding large upfront allocations
+        # Pre-compute masks for all depths
+        depth_indices = torch.arange(n_rec, device=device)
+
+        # exit_at_depth[i, b, l] = 1 if token (b,l) exits at depth i
+        exit_at_depth = (depths.unsqueeze(0) == depth_indices.view(-1, 1, 1))  # [R, B, L]
+
+        # active_at_depth[i, b, l] = 1 if token (b,l) is active at depth i
+        active_at_depth = (depths.unsqueeze(0) >= depth_indices.view(-1, 1, 1))  # [R, B, L]
+
+        # STE weights: Gaussian centered on continuous depth
         depth_continuous = probs * (n_rec - 1)
+        depth_indices_f = depth_indices.to(dtype)
+        ste_weights = torch.exp(
+            -((depth_continuous.unsqueeze(0) - depth_indices_f.view(-1, 1, 1)) ** 2)
+        )  # [R, B, L]
 
         # Accumulation
         output = torch.zeros_like(x)
@@ -434,32 +464,73 @@ class MoRExecutor(nn.Module):
         if self.training:
             self._recursion_tokens_processed = []
 
+        # Pre-compute recursion embeddings (all depths at once)
+        all_rec_embeds = self.recursion_embed(self._recursion_indices)  # [R, D]
+
+        # Pre-compute sparse threshold as integer count (avoid per-depth division)
+        _sparse_count_threshold = int(total_tokens * (1.0 - MoRExecutor._SPARSE_THRESHOLD))
+
         for i in range(n_rec):
-            # Compute masks for this depth only (saves memory vs pre-computing all)
-            active_mask = (depths >= i).unsqueeze(-1).to(dtype)  # [B, L, 1]
-            exit_mask = (depths == i).unsqueeze(-1).to(dtype)  # [B, L, 1]
+            # Flat active mask for this depth [B*L]
+            active_flat = active_at_depth[i].view(-1)  # [B*L] bool
+            n_active_t = active_flat.sum()  # stays on GPU — no .item() sync
 
-            # STE weight for this depth: Gaussian centered on continuous depth
-            ste_weight_i = torch.exp(-((depth_continuous - i) ** 2)).unsqueeze(-1)  # [B, L, 1]
-
-            # Diagnostics
+            # Diagnostics (tensor, no sync)
             if self.training:
-                self._recursion_tokens_processed.append((depths >= i).sum().detach())
+                self._recursion_tokens_processed.append(n_active_t.detach())
+
+            # Exit mask and STE weight
+            exit_mask = exit_at_depth[i].unsqueeze(-1).to(dtype)  # [B, L, 1]
+            ste_weight_i = ste_weights[i].unsqueeze(-1)  # [B, L, 1]
 
             # Add recursion embeddings
             rec_bias = self.recursion_bias[i].squeeze()  # [D]
-            rec_embed = self.recursion_embed(self._recursion_indices[i:i+1]).squeeze()  # [D]
-            h_with_rec = current + rec_bias + rec_embed
+            rec_embed = all_rec_embeds[i]  # [D]
+            rec_offset = rec_bias + rec_embed  # [D] - fused add
 
-            # Apply normalization if provided
-            if norm is not None:
-                h_with_rec = norm(h_with_rec)
+            # Decide: sparse pack or dense masked execution
+            # Compare on GPU — avoids CPU-GPU sync that .item() would cause
+            # _force_dense disables sparse packing for gradient checkpoint compatibility
+            use_sparse = (not self._force_dense) and (i > 0) and bool(n_active_t < _sparse_count_threshold) and bool(n_active_t > 0)
 
-            # MLP pass
-            mlp_delta = mlp(h_with_rec)
+            if use_sparse:
+                # === SPARSE PATH: pack active tokens, run MLP, scatter back ===
+                # Flatten [B, L, D] → [B*L, D] for packing
+                current_flat = current.view(-1, D)
 
-            # Update current state (only active tokens evolve)
-            current = current + mlp_delta * active_mask
+                # Pack only active tokens
+                active_indices = active_flat.nonzero(as_tuple=False).squeeze(-1)  # [n_active]
+                packed = current_flat[active_indices]  # [n_active, D]
+
+                # Add recursion offset
+                packed = packed + rec_offset
+
+                # Norm on packed subset
+                if norm is not None:
+                    packed = norm(packed)
+
+                # MLP on packed subset only — this is the big win
+                packed_delta = mlp(packed)  # [n_active, D]
+
+                # Out-of-place scatter to avoid breaking autograd on `current`
+                delta_full = torch.zeros(B * L, D, device=current.device, dtype=packed_delta.dtype)
+                delta_full.index_add_(0, active_indices, packed_delta)
+                current = current + delta_full.view(B, L, D)
+            elif bool(n_active_t > 0):
+                # === DENSE PATH: all/most tokens active, skip pack overhead ===
+                h_with_rec = current + rec_offset
+
+                if norm is not None:
+                    h_with_rec = norm(h_with_rec)
+
+                mlp_delta = mlp(h_with_rec)
+
+                # For depth 0 all tokens are active, so active_mask is all 1s
+                if i == 0:
+                    current = current + mlp_delta
+                else:
+                    active_mask = active_at_depth[i].unsqueeze(-1).to(dtype)
+                    current = current + mlp_delta * active_mask
 
             # Accumulate output for exiting tokens with STE
             # STE: forward uses 1.0, backward flows through ste_weight

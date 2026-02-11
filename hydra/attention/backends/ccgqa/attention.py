@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import contextlib
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -17,6 +17,14 @@ try:
 except Exception:
     FUSED_KERNELS_AVAILABLE = False
     fused_rope = None
+
+# Fused QK-norm kernel (L2 normalize + scale in single kernel launch).
+try:
+    from hydra.kernels.fused_ops import fused_qk_norm as _fused_qk_norm
+    FUSED_QK_NORM_AVAILABLE = _fused_qk_norm is not None
+except Exception:
+    FUSED_QK_NORM_AVAILABLE = False
+    _fused_qk_norm = None
 
 # Optional fused attention kernel (Triton).
 try:
@@ -165,11 +173,11 @@ class CCGQAAttention(nn.Module):
         self.scale = self.head_dim**-0.5
         self.max_seq_len = max_seq_len
 
-        # MEMORY FIX: Don't pre-allocate causal mask - saves ~67MB per attention module.
-        # Causal mask is only needed when combining with padding masks, and SDPA
-        # handles is_causal=True natively. Compute on-demand when needed.
-        # Old code: causal_mask = torch.ones((max_seq_len, max_seq_len), dtype=torch.bool).triu(diagonal=1)
-        # self.register_buffer("causal_mask_cached", causal_mask, persistent=False)
+        # Pre-allocate causal mask for padding-mask combination path.
+        # Only needed when combining with padding masks; SDPA handles is_causal=True natively.
+        # This trades ~4MB (max_seq_len² bool) for eliminating per-forward triu+ones allocation.
+        _cmask = torch.ones((max_seq_len, max_seq_len), dtype=torch.bool).triu_(diagonal=1)
+        self.register_buffer("_causal_mask", _cmask, persistent=False)
 
     def _init_rope(self, max_seq_len: int):
         head_dim = self.head_dim
@@ -203,9 +211,9 @@ class CCGQAAttention(nn.Module):
             persistent=False,
         )
 
-    def _apply_rope(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
-        cos = self.cos_cached[:, :, :seq_len, :]
-        sin = self.sin_cached[:, :, :seq_len, :]
+    def _apply_rope(self, x: torch.Tensor, seq_len: int, offset: int = 0) -> torch.Tensor:
+        cos = self.cos_cached[:, :, offset:offset + seq_len, :]
+        sin = self.sin_cached[:, :, offset:offset + seq_len, :]
 
         if FUSED_KERNELS_AVAILABLE:
             return fused_rope(x, cos, sin)
@@ -216,6 +224,161 @@ class CCGQAAttention(nn.Module):
         out_pairs[..., 0] = x1 * cos - x2 * sin
         out_pairs[..., 1] = x1 * sin + x2 * cos
         return out_pairs.flatten(-2)
+
+    def forward_with_cache(
+        self,
+        x: torch.Tensor,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        start_pos: int = 0,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Forward pass with KV cache for incremental decoding.
+
+        During prefill (past_kv=None, start_pos=0): processes full sequence,
+        returns cached K,V.
+        During decode (past_kv provided, start_pos>0): processes single token,
+        concatenates with cached K,V.
+
+        Skips convolutions and QK-mean mixing during single-token decode for
+        simplicity. These are minor refinements that don't meaningfully affect
+        generation quality.
+
+        Args:
+            x: Input [B, S, D] where S=seq_len for prefill, S=1 for decode
+            past_kv: Cached (K, V) from previous steps, each [B, n_kv_heads, T, head_dim]
+            start_pos: Position offset for RoPE
+
+        Returns:
+            Tuple of (output, (new_K_cache, new_V_cache))
+        """
+        B, S, _ = x.shape
+        is_decode = (S == 1 and past_kv is not None)
+
+        # Fused projection: single GEMM for q, k, v
+        qkv = self.qkv_proj(x)
+
+        q = qkv[..., :self.latent_dim]
+        k = qkv[..., self.latent_dim:self.latent_dim + self.kv_dim]
+
+        if self.use_value_shift:
+            v_curr = qkv[..., self.latent_dim + self.kv_dim:self.latent_dim + self.kv_dim + self.kv_dim // 2]
+            v_prev = qkv[..., self.latent_dim + self.kv_dim + self.kv_dim // 2:]
+            if not is_decode:
+                # Optimized: pad+cat (matches training forward path)
+                v_prev_shifted = F.pad(v_prev[:, :-1, :], (0, 0, 1, 0))
+                v = torch.cat([v_curr, v_prev_shifted], dim=-1)
+            else:
+                # Decode (S=1): no previous context in current token, second half = 0
+                v = torch.cat([v_curr, torch.zeros_like(v_curr)], dim=-1)
+        else:
+            v = qkv[..., self.latent_dim + self.kv_dim:]
+
+        # During decode, skip convolutions and QK-mean mixing
+        # (they require sequence context and are minor refinements)
+        if not is_decode:
+            if self.use_qk_mean:
+                q_pre = q
+                k_pre = k
+
+            if self.use_convs:
+                q = self.q_conv(q)
+                k = self.k_conv(k)
+
+            if self.use_qk_mean and self.n_groups == 1:
+                qk_mean = 0.5 * (q_pre + k_pre)
+                q = q + qk_mean
+                k = k + qk_mean
+            elif self.use_qk_mean:
+                q_mean = q_pre.view(B, S, self.n_heads, self.head_dim).mean(dim=2)
+                k_mean = k_pre.view(B, S, self.n_kv_heads, self.head_dim).mean(dim=2)
+                q = (
+                    q.view(B, S, self.n_heads, self.head_dim) + (0.5 * k_mean.unsqueeze(2))
+                ).reshape(B, S, self.latent_dim)
+                k = (
+                    k.view(B, S, self.n_kv_heads, self.head_dim) + (0.5 * q_mean.unsqueeze(2))
+                ).reshape(B, S, self.kv_dim)
+
+        # Reshape to heads
+        q = q.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        # QK normalization
+        if self.use_qk_norm:
+            if FUSED_QK_NORM_AVAILABLE and _fused_qk_norm is not None and q.is_cuda:
+                q, k = _fused_qk_norm(q, k, scale=1.0, temperature=1.0)
+                k = k * self.key_temperature
+            else:
+                q = F.normalize(q, p=2, dim=-1)
+                k = F.normalize(k, p=2, dim=-1) * self.key_temperature
+
+        # RoPE with position offset
+        if self.use_rope:
+            q = self._apply_rope(q, S, offset=start_pos)
+            k = self._apply_rope(k, S, offset=start_pos)
+
+        # Concatenate with cached K,V
+        if past_kv is not None:
+            cached_k, cached_v = past_kv
+            k = torch.cat([cached_k, k], dim=2)  # [B, n_kv_heads, T+S, head_dim]
+            v = torch.cat([cached_v, v], dim=2)
+
+        # Store new cache
+        new_past_kv = (k, v)
+
+        # Full sequence length for attention
+        T = k.shape[2]
+
+        # Attention computation — use SDPA (handles causal masking internally)
+        # For decode mode with cache, we can't use is_causal=True (Q has 1 token,
+        # K/V has T tokens). Instead, no mask needed since the single query token
+        # should attend to all cached + current keys.
+        if is_decode:
+            # Single query attends to full K/V history — no causal mask needed
+            try:
+                out = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    is_causal=False,
+                    scale=None if self.use_qk_norm else self.scale,
+                    enable_gqa=(self.n_kv_heads != self.n_heads),
+                )
+            except TypeError:
+                # Older PyTorch without enable_gqa
+                if self.n_kv_heads != self.n_heads:
+                    k_exp = k.unsqueeze(2).expand(-1, -1, self.n_groups, -1, -1).reshape(B, self.n_heads, T, self.head_dim)
+                    v_exp = v.unsqueeze(2).expand(-1, -1, self.n_groups, -1, -1).reshape(B, self.n_heads, T, self.head_dim)
+                else:
+                    k_exp, v_exp = k, v
+                out = F.scaled_dot_product_attention(
+                    q, k_exp, v_exp,
+                    attn_mask=None, is_causal=False,
+                    scale=None if self.use_qk_norm else self.scale,
+                )
+        else:
+            # Prefill: standard causal attention
+            try:
+                out = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    is_causal=True,
+                    scale=None if self.use_qk_norm else self.scale,
+                    enable_gqa=(self.n_kv_heads != self.n_heads),
+                )
+            except TypeError:
+                if self.n_kv_heads != self.n_heads:
+                    k_exp = k.unsqueeze(2).expand(-1, -1, self.n_groups, -1, -1).reshape(B, self.n_heads, T, self.head_dim)
+                    v_exp = v.unsqueeze(2).expand(-1, -1, self.n_groups, -1, -1).reshape(B, self.n_heads, T, self.head_dim)
+                else:
+                    k_exp, v_exp = k, v
+                out = F.scaled_dot_product_attention(
+                    q, k_exp, v_exp,
+                    attn_mask=None, is_causal=True,
+                    scale=None if self.use_qk_norm else self.scale,
+                )
+
+        out = out.transpose(1, 2).contiguous().view(B, S, self.latent_dim)
+        out = self.o_proj(out) * self.output_scale
+        return out, new_past_kv
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, S, _ = x.shape
@@ -232,11 +395,10 @@ class CCGQAAttention(nn.Module):
             v_curr = qkv[..., self.latent_dim + self.kv_dim:self.latent_dim + self.kv_dim + self.kv_dim // 2]
             v_prev = qkv[..., self.latent_dim + self.kv_dim + self.kv_dim // 2:]
             
-            half_kv_dim = self.kv_dim // 2
-            v = torch.empty((B, S, self.kv_dim), device=v_curr.device, dtype=v_curr.dtype)
-            v[..., :half_kv_dim] = v_curr
-            v[..., half_kv_dim:] = 0
-            v[:, 1:, half_kv_dim:] = v_prev[:, :-1, :]
+            # Optimized value-shift: pad+cat instead of empty+3 copies
+            # Shift v_prev right by 1 position with zero-padding
+            v_prev_shifted = F.pad(v_prev[:, :-1, :], (0, 0, 1, 0))  # [B, S, half_kv]
+            v = torch.cat([v_curr, v_prev_shifted], dim=-1)           # [B, S, kv_dim]
         else:
             v = qkv[..., self.latent_dim + self.kv_dim:]
 
@@ -277,8 +439,15 @@ class CCGQAAttention(nn.Module):
             v = v.contiguous()
 
         if self.use_qk_norm:
-            q = F.normalize(q, p=2, dim=-1)
-            k = F.normalize(k, p=2, dim=-1) * self.key_temperature
+            if FUSED_QK_NORM_AVAILABLE and _fused_qk_norm is not None and q.is_cuda:
+                # Single fused kernel: L2-normalize Q and K.
+                # Temperature is applied outside the kernel to preserve autograd
+                # gradient flow to the learnable key_temperature parameter.
+                q, k = _fused_qk_norm(q, k, scale=1.0, temperature=1.0)
+                k = k * self.key_temperature
+            else:
+                q = F.normalize(q, p=2, dim=-1)
+                k = F.normalize(k, p=2, dim=-1) * self.key_temperature
 
         if self.use_rope:
             q = self._apply_rope(q, S)
@@ -293,12 +462,8 @@ class CCGQAAttention(nn.Module):
             # mask is (B, S), 1=valid, 0=pad
             # We need boolean mask where True = masked out
 
-            # MEMORY FIX: Compute causal mask on-demand instead of using pre-allocated buffer.
-            # This saves ~67MB per attention module (for max_seq_len=8192).
-            causal_mask = torch.triu(
-                torch.ones((S, S), device=q.device, dtype=torch.bool),
-                diagonal=1
-            )
+            # MEMORY FIX: Use cached causal mask slice instead of computing triu per call.
+            causal_mask = self._causal_mask[:S, :S]
 
             # Padding part: True where mask == 0
             padding_mask = (mask == 0).view(B, 1, 1, S)

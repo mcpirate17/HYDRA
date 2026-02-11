@@ -159,6 +159,19 @@ class MoDMLPWrapper(nn.Module):
             self._loss_unlocked = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Handle 2D input from MoR sparse packing path: [n_active, D] → [1, n_active, D]
+        # These tokens are already selected by MoR — skip MoD routing entirely to avoid:
+        #   1. Redundant routing (tokens already selected)
+        #   2. Gradient checkpointing incompatibility (stochastic top-k produces
+        #      different shapes during recomputation, breaking checkpoint verification)
+        #   3. Aggregate tracking dimension mismatches
+        squeezed = x.ndim == 2
+        if squeezed:
+            x = x.unsqueeze(0)
+            self._aux_loss = self._zero_scalar
+            out = self.mlp(x)
+            return out.squeeze(0)
+
         # Static routing mode: compute all tokens, apply soft weights after
         # This enables CUDA graph compatibility (no dynamic shapes)
         if self.static_routing_mode:
@@ -169,11 +182,12 @@ class MoDMLPWrapper(nn.Module):
             B, L, _ = x.shape
             self._tokens_total = L
             self._tokens_processed = L
+
             scores = self.mod_router.forward_logits(x)
             self._last_scores = scores
             probs = torch.sigmoid(scores.clamp(-10.0, 10.0))
             self._last_probs_mean_t = probs.mean().detach()
-            self._last_probs_std_t = probs.std().detach()
+            self._last_probs_std_t = probs.std().detach() if probs.numel() > 1 else probs.new_tensor(0.0)
 
             if self.training and self.aux_loss_weight > 0:
                 mean_prob = probs.mean()
@@ -185,6 +199,7 @@ class MoDMLPWrapper(nn.Module):
                 self._aux_loss = self.aux_loss_weight * (capacity_loss + 0.5 * collapse_loss)
             else:
                 self._aux_loss = self._zero_scalar
+
             return self.mlp(x)
 
         if not self.training:
@@ -220,7 +235,7 @@ class MoDMLPWrapper(nn.Module):
         # Convert to probabilities
         probs = torch.sigmoid(scores.clamp(-10.0, 10.0))  # [B, L]
         self._last_probs_mean_t = probs.mean().detach()
-        self._last_probs_std_t = probs.std().detach()
+        self._last_probs_std_t = probs.std().detach() if probs.numel() > 1 else probs.new_tensor(0.0)
 
         # Compute aux loss for router learning
         if self.training and self.aux_loss_weight > 0:
@@ -257,7 +272,7 @@ class MoDMLPWrapper(nn.Module):
 
         probs = torch.sigmoid(scores.clamp(-10.0, 10.0))
         self._last_probs_mean_t = probs.mean().detach()
-        self._last_probs_std_t = probs.std().detach()
+        self._last_probs_std_t = probs.std().detach() if probs.numel() > 1 else probs.new_tensor(0.0)
         self._tokens_processed = k
         
         # Update aggregate tracking for MoR collapse detection
@@ -287,7 +302,7 @@ class MoDMLPWrapper(nn.Module):
 
         probs = torch.sigmoid(scores.clamp(-10.0, 10.0))
         self._last_probs_mean_t = probs.mean().detach()
-        self._last_probs_std_t = probs.std().detach()
+        self._last_probs_std_t = probs.std().detach() if probs.numel() > 1 else probs.new_tensor(0.0)
         self._tokens_processed = k
         
         # Update aggregate tracking for MoR collapse detection
@@ -713,17 +728,75 @@ class HydraMoRBlock(nn.Module):
         
         return loss
 
+    def _forward_fixed_from_h(self, h: torch.Tensor) -> torch.Tensor:
+        """Fixed-depth MLP recursions starting from post-attention activations.
+
+        Reuses shared attention output during rampup blending to avoid
+        recomputing attention twice (saves ~50% of rampup block compute).
+        """
+        for i in range(self.max_recursions):
+            rec_bias = self.mor_executor.recursion_bias[i].squeeze()
+            rec_embed = self.mor_executor.recursion_embed(self.mor_executor._recursion_indices[i : i + 1]).squeeze()
+            h_with_rec = h + rec_bias + rec_embed
+            if self.mod_mlp_wrapper is not None:
+                h = h + self.mod_mlp_wrapper(self.norm2(h_with_rec))
+            else:
+                h = h + self.mlp(self.norm2(h_with_rec))
+        return self.final_norm(h)
+
+    def _forward_mor_from_h(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Adaptive MoR routing starting from post-attention activations.
+
+        Reuses shared attention output during rampup blending.
+        """
+        depths, probs, logits = self.mor_router(h)
+
+        self._last_target_depths = depths.detach().float()
+        self._last_router_probs_tensor = probs.detach()
+        self._last_router_logits = logits.detach()
+        self._last_depths = depths.detach()
+        self._last_probs = probs
+
+        mlp = self.mod_mlp_wrapper if self.mod_mlp_wrapper is not None else self.mlp
+
+        if self.mod_mlp_wrapper is not None:
+            self.mod_mlp_wrapper.start_aggregate_tracking()
+
+        output = self.mor_executor(h, depths, probs, mlp, self.norm2)
+
+        if self.mod_mlp_wrapper is not None:
+            self._last_mod_selected_mask = self.mod_mlp_wrapper.end_aggregate_tracking()
+        else:
+            self._last_mod_selected_mask = None
+
+        ponder_loss = self.mor_router.compute_ponder_loss(depths, probs, logits, token_losses=None, baseline=None)
+
+        if self.training:
+            n_rec = self.max_recursions
+            depth_continuous = probs * (n_rec - 1)
+            self._ponder_loss = ponder_loss.detach()
+            self._last_avg_depth = depth_continuous.mean().detach()
+
+        return self.final_norm(output), ponder_loss
+
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.adaptive:
             rampup_scale = self.get_mor_rampup_scale()
             if rampup_scale <= 0.0:
                 return self._forward_fixed(x)
 
-            adaptive_output, _ = self._forward_mor(x)
             if rampup_scale >= 1.0:
+                adaptive_output, _ = self._forward_mor(x)
                 return adaptive_output
 
-            fixed_output = self._forward_fixed(x)
+            # Rampup blending: share attention, only branch on MLP strategy
+            attn_out = self.residual_scale * self.attention(self.norm1(x))
+            if self._enable_attn_out_rms:
+                self._update_attn_out_diagnostics(attn_out)
+            h = x + attn_out
+
+            adaptive_output, _ = self._forward_mor_from_h(h)
+            fixed_output = self._forward_fixed_from_h(h)
             return rampup_scale * adaptive_output + (1.0 - rampup_scale) * fixed_output
         return self._forward_fixed(x)
 
@@ -738,16 +811,25 @@ class HydraMoRBlock(nn.Module):
                     self._ponder_loss = zero_loss.detach()
                 return output, {"ponder_loss": zero_loss, "aux_loss": aux_loss}
 
-            adaptive_output, ponder_loss = self._forward_mor(x)
-            ponder_loss = ponder_loss * rampup_scale
-            aux_loss = self.mod_mlp_wrapper.get_aux_loss() if self.mod_mlp_wrapper is not None else self._zero_scalar
-
             if rampup_scale >= 1.0:
+                adaptive_output, ponder_loss = self._forward_mor(x)
+                ponder_loss = ponder_loss * rampup_scale
+                aux_loss = self.mod_mlp_wrapper.get_aux_loss() if self.mod_mlp_wrapper is not None else self._zero_scalar
                 if self.training:
                     self._ponder_loss = ponder_loss.detach()
                 return adaptive_output, {"ponder_loss": ponder_loss, "aux_loss": aux_loss}
 
-            fixed_output = self._forward_fixed(x)
+            # Rampup blending: share attention, only branch on MLP strategy
+            attn_out = self.residual_scale * self.attention(self.norm1(x))
+            if self._enable_attn_out_rms:
+                self._update_attn_out_diagnostics(attn_out)
+            h = x + attn_out
+
+            adaptive_output, ponder_loss = self._forward_mor_from_h(h)
+            ponder_loss = ponder_loss * rampup_scale
+            aux_loss = self.mod_mlp_wrapper.get_aux_loss() if self.mod_mlp_wrapper is not None else self._zero_scalar
+
+            fixed_output = self._forward_fixed_from_h(h)
             output = rampup_scale * adaptive_output + (1.0 - rampup_scale) * fixed_output
             if self.training:
                 self._ponder_loss = ponder_loss.detach()
@@ -762,6 +844,42 @@ class HydraMoRBlock(nn.Module):
 
     def get_ponder_loss(self) -> torch.Tensor:
         return self._ponder_loss
+
+    def forward_with_cache(
+        self,
+        x: torch.Tensor,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        start_pos: int = 0,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Forward pass with KV cache for incremental generation.
+
+        Uses fixed recursion depth (no MoR routing) and skips MoD for
+        simplicity during generation. The attention module handles KV caching.
+
+        Args:
+            x: Input [B, S, D]
+            past_kv: Cached (K, V) for this layer
+            start_pos: Position offset for RoPE
+
+        Returns:
+            (output, new_past_kv) tuple
+        """
+        # Attention with KV cache
+        attn_out, new_past_kv = self.attention.forward_with_cache(
+            self.norm1(x), past_kv=past_kv, start_pos=start_pos,
+        )
+        h = x + self.residual_scale * attn_out
+
+        # Fixed-depth MLP recursions (no routing overhead during generation)
+        for i in range(self.max_recursions):
+            rec_bias = self.mor_executor.recursion_bias[i].squeeze()
+            rec_embed = self.mor_executor.recursion_embed(
+                self.mor_executor._recursion_indices[i:i + 1]
+            ).squeeze()
+            h_with_rec = h + rec_bias + rec_embed
+            h = h + self.mlp(self.norm2(h_with_rec))
+
+        return self.final_norm(h), new_past_kv
 
     @torch.compiler.disable
     def get_routing_stats(self) -> dict:
@@ -952,7 +1070,7 @@ class HydraMoDBlockWrapper(nn.Module):
             aux_loss = self.mod_router.get_aux_loss()
             self._aux_loss = aux_loss.detach()
             self._last_probs_mean_t = probs.mean().detach()
-            self._last_probs_std_t = probs.std().detach()
+            self._last_probs_std_t = probs.std().detach() if probs.numel() > 1 else probs.new_tensor(0.0)
         else:
             aux_loss = self._zero_scalar
 

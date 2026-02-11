@@ -295,6 +295,20 @@ def _add_training_args(parser: argparse.ArgumentParser) -> None:
         help="Override min learning rate",
     )
     parser.add_argument(
+        "--lr_schedule",
+        type=str,
+        default=None,
+        choices=["cosine", "wsd", "wsd_adaptive"],
+        help="LR schedule: cosine (cosine annealing), wsd (warmup-stable-decay), "
+             "wsd_adaptive (WSD with auto-cooldown). Default: wsd_adaptive.",
+    )
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=None,
+        help="Override warmup steps (default: auto-computed from mode and max_steps)",
+    )
+    parser.add_argument(
         "--adaptive_lr",
         action=argparse.BooleanOptionalAction,
         default=True,

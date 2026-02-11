@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 # CRITICAL: Set CUDA allocator config BEFORE importing torch.
-# This reduces memory fragmentation from ~80% to ~10%.
+# This reduces memory fragmentation from ~80% to ~10%, especially important
+# for reasoning steps that cause repeated alloc/free cycles.
 import os
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -52,12 +53,12 @@ from . import step_diagnostics as _step_diag
 from . import db as _db
 from .safe_optimizations import SafeOptimizations, OptimizationConfig
 from .pretest_hook import PretestHook
-# NOTE: Reasoning/GRPO training is handled by standalone reasoning_trainer.py
+from .reasoning import GRPOTrainerMixin  # Added for System 2 training
 
 _RUNTIME_STATUS = configure_runtime()
 
 
-class Trainer:
+class Trainer(GRPOTrainerMixin):
     """Optimized trainer with all performance best practices."""
 
     __slots__ = (
@@ -128,19 +129,11 @@ class Trainer:
         "_grad_norm_ema",  # For dynamic gradient clipping
         "_safe_opts",  # SafeOptimizations wrapper for experimental optimizations
         "_pretest_hook",  # Hook for automatic pretest runs on config/checkpoint changes
-        "_manifold_needs_unfreeze",  # Manifold warmup state
-        "_manifold_unfreeze_step",  # Step to unfreeze manifold gradients
-        "_current_step",  # Current training step (for emergency checkpoint)
-        "_resume_skip_optimizer_until",  # Skip optimizer updates until this step after incomplete resume
-        # Compile warmup: conservative memory settings during torch.compile warmup
-        "_compile_warmup_steps",  # Number of steps to use conservative settings
-        "_compile_warmup_batch_size",  # Reduced batch size during warmup
-        "_compile_warmup_seq_len",  # Reduced seq len during warmup
-        "_compile_warmup_checkpoint_every",  # Aggressive checkpointing during warmup
-        "_target_batch_size",  # Target batch size after warmup
-        "_target_seq_len",  # Target seq len after warmup
-        "_target_checkpoint_every",  # Target checkpoint interval after warmup
-        "_compile_warmup_complete",  # Flag indicating warmup is done
+        # Reasoning / GRPO state
+        "_reasoning_prompts",      # Cached reasoning prompts
+        "_reasoning_prompt_idx",   # Current index into prompts
+        "_tokenizer",              # Cached tokenizer for generation
+        "_last_grpo_metrics",      # Last GRPO step metrics
     )
 
     def __init__(self, config: TrainingConfig):
@@ -289,18 +282,15 @@ class Trainer:
         self._mor_advantage_nudge_until_step: int = 0
         self._mor_advantage_nudge_cooldown_until_step: int = 0
         self._mor_advantage_nudge_active: bool = False
-
-        # Compile warmup: conservative memory settings during torch.compile warmup
-        # This helps large models that OOM during the compile graph capture phase
-        self._compile_warmup_steps: int = int(getattr(config, "compile_warmup_steps", 0) or 0)
-        self._compile_warmup_batch_size: int = int(getattr(config, "compile_warmup_batch_size", 1) or 1)
-        self._compile_warmup_seq_len: int = int(getattr(config, "compile_warmup_seq_len", 512) or 512)
-        self._compile_warmup_checkpoint_every: int = int(getattr(config, "compile_warmup_checkpoint_every", 1) or 1)
-        self._target_batch_size: int = config.batch_size
-        self._target_seq_len: int = config.max_seq_len
-        self._target_checkpoint_every: int = int(getattr(config, "checkpoint_every_n", 2) or 2)
-        self._compile_warmup_complete: bool = (self._compile_warmup_steps == 0)
-
+        
+        # Reasoning / GRPO state (System 2)
+        self._reasoning_prompts = None
+        self._reasoning_prompt_idx = 0
+        self._tokenizer = None
+        self._last_grpo_metrics = None
+        # Track if user explicitly disabled reasoning (don't auto-enable)
+        self._reasoning_user_disabled = not config.reasoning_enabled
+        
         if config.resume_from:
             self._checkpoint_config = self._peek_checkpoint_config(config.resume_from)
             self._checkpoint_seq_len = self._checkpoint_config.get("max_seq_len", config.max_seq_len)
@@ -976,21 +966,13 @@ class Trainer:
         self.logger.info(f"\n{'='*70}")
         self.logger.info(f"RESUMING FROM CHECKPOINT: {checkpoint_path}")
         self.logger.info(f"{'='*70}")
-
+        
         # Load checkpoint to CPU first to avoid OOM from loading large optimizer states
         # Model weights will be moved to device during load_state_dict
         checkpoint = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
         model = self.model
         if hasattr(model, "_orig_mod"):
             model = model._orig_mod
-
-        # MEMORY FIX: reasoning_trainer.py used to save both "model" and "model_state_dict"
-        # which doubles checkpoint size. Delete the duplicate immediately to save RAM.
-        if "model" in checkpoint and "model_state_dict" in checkpoint:
-            del checkpoint["model_state_dict"]
-            self.logger.info("  Removed duplicate 'model_state_dict' key from checkpoint to save memory")
-            import gc
-            gc.collect()
 
         # RoPE caches are derived buffers whose shape depends on max_seq_len.
         # When resuming with a different --seq_len (or seq schedule), the checkpoint
@@ -1228,8 +1210,7 @@ class Trainer:
         self.logger.info(f"  Loaded step: {self._start_step}")
         self._prev_run_best_loss = float(ckpt_metrics.get("best_loss", float("inf")) or float("inf"))
         self.logger.info(f"  Previous best loss (from checkpoint): {self._prev_run_best_loss if math.isfinite(self._prev_run_best_loss) else 'N/A'}")
-        prev_tokens = ckpt_metrics.get('total_tokens')
-        self.logger.info(f"  Previous total tokens: {prev_tokens:,}" if prev_tokens else "  Previous total tokens: N/A")
+        self.logger.info(f"  Previous total tokens: {ckpt_metrics.get('total_tokens', 'N/A'):,}")
         self.logger.info(f"  Will continue to step: {self.config.max_steps}")
         self.logger.info(f"  Remaining steps: {self.config.max_steps - self._start_step:,}")
         if ckpt_metrics:
@@ -1559,7 +1540,52 @@ class Trainer:
                     elif not want_fused:
                         setattr(m, "use_fused_kernel", False)
 
+    # Data prefetch infrastructure: overlap H2D transfer with compute.
+    # A secondary CUDA stream handles the .to(device) copy while the main
+    # stream runs forward/backward. The prefetched batch is consumed on the
+    # next _get_batch() call after a stream synchronize.
+    _prefetch_stream: Optional[torch.cuda.Stream] = None
+    _prefetched_batch: Optional[tuple] = None
+
+    def _init_prefetch_stream(self) -> None:
+        """Create the prefetch stream (called once at train start)."""
+        if self.device == "cuda" or (isinstance(self.device, str) and self.device.startswith("cuda")):
+            self._prefetch_stream = torch.cuda.Stream()
+
+    def _prefetch_next_batch(self) -> None:
+        """Kick off async H2D copy of next batch on prefetch stream."""
+        if self._prefetch_stream is None:
+            return
+        batch = self.train_loader.get_batch()
+        try:
+            self._last_batch_source_name = batch.get("source_name")
+        except Exception:
+            self._last_batch_source_name = None
+
+        sn = self._last_batch_source_name
+        if isinstance(sn, str) and sn:
+            self._source_name_counts[sn] = self._source_name_counts.get(sn, 0) + 1
+            self._source_name_counts_total[sn] = self._source_name_counts_total.get(sn, 0) + 1
+
+        with torch.cuda.stream(self._prefetch_stream):
+            mask = batch.get("attention_mask")
+            if mask is not None:
+                mask = mask.to(self.device, non_blocking=True)
+            x = batch["input_ids"].to(self.device, non_blocking=True)
+            y = batch["labels"].to(self.device, non_blocking=True)
+            self._prefetched_batch = (x, y, mask)
+
     def _get_batch(self) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        if self._prefetched_batch is not None:
+            # Wait for prefetch stream to finish the H2D copy
+            self._prefetch_stream.synchronize()
+            result = self._prefetched_batch
+            self._prefetched_batch = None
+            # Immediately kick off next prefetch (overlaps with compute)
+            self._prefetch_next_batch()
+            return result
+
+        # Fallback: no prefetch available (first call or CPU device)
         batch = self.train_loader.get_batch()
         # Keep source metadata (if present) for MoE domain forcing/teacher.
         try:
@@ -1571,23 +1597,14 @@ class Trainer:
         if isinstance(sn, str) and sn:
             self._source_name_counts[sn] = self._source_name_counts.get(sn, 0) + 1
             self._source_name_counts_total[sn] = self._source_name_counts_total.get(sn, 0) + 1
-
-        input_ids = batch["input_ids"].to(self.device, non_blocking=True)
-        labels = batch["labels"].to(self.device, non_blocking=True)
         mask = batch.get("attention_mask")
         if mask is not None:
             mask = mask.to(self.device, non_blocking=True)
-
-        # Compile warmup: truncate to reduced seq_len to save memory during torch.compile
-        if not self._compile_warmup_complete and self._compile_warmup_steps > 0:
-            warmup_seq_len = self._compile_warmup_seq_len
-            if input_ids.size(1) > warmup_seq_len:
-                input_ids = input_ids[:, :warmup_seq_len]
-                labels = labels[:, :warmup_seq_len]
-                if mask is not None:
-                    mask = mask[:, :warmup_seq_len]
-
-        return (input_ids, labels, mask)
+        return (
+            batch["input_ids"].to(self.device, non_blocking=True),
+            batch["labels"].to(self.device, non_blocking=True),
+            mask,
+        )
 
     def train(self) -> TrainingMetrics:
         config = self.config
@@ -1608,6 +1625,11 @@ class Trainer:
         device = self.device
         param_groups = self._param_groups
         loss_scale = 1.0 / grad_accum
+
+        # Initialize data prefetch stream for async H2D overlap
+        self._init_prefetch_stream()
+        if self._prefetch_stream is not None:
+            self._prefetch_next_batch()  # prime the first batch
 
         # Dynamic gradient clipping state
         _use_dynamic_clip = bool(getattr(config, "grad_clip_dynamic", True))
@@ -1993,58 +2015,34 @@ class Trainer:
             except Exception as e:
                 self.logger.warning(f"SafeOptimizations pretest skipped: {e}")
 
-        # Compile warmup: apply conservative memory settings during torch.compile warmup
-        # This helps large models avoid OOM during the graph capture phase
-        _compile_warmup_end_step = start_step + self._compile_warmup_steps
-        if self._compile_warmup_steps > 0 and not self._compile_warmup_complete:
-            self.logger.info(f"\n{'='*60}")
-            self.logger.info("🔥 COMPILE WARMUP: Using conservative memory settings")
-            self.logger.info(f"{'='*60}")
-            self.logger.info(f"  Duration: {self._compile_warmup_steps} steps (until step {_compile_warmup_end_step})")
-            self.logger.info(f"  Batch size: {self._compile_warmup_batch_size} (target: {self._target_batch_size})")
-            self.logger.info(f"  Seq length: {self._compile_warmup_seq_len} (target: {self._target_seq_len})")
-            self.logger.info(f"  Checkpoint every: {self._compile_warmup_checkpoint_every} layers (target: {self._target_checkpoint_every})")
-            self.logger.info(f"{'='*60}\n")
-
-            # Apply conservative settings
-            grad_accum = self._compile_warmup_batch_size  # Override for warmup
-            self._current_seq_len = self._compile_warmup_seq_len
-
-            # Update gradient checkpointing to be more aggressive
-            base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-            if hasattr(base_model, "enable_gradient_checkpointing"):
-                base_model.enable_gradient_checkpointing(every_n=self._compile_warmup_checkpoint_every)
-
         while step < max_steps:
             step_start = time.time()
             self._current_step = step  # Track for emergency checkpoint on error
-
-            # Check if compile warmup is complete and transition to target settings
-            if not self._compile_warmup_complete and step >= _compile_warmup_end_step:
-                self._compile_warmup_complete = True
-                self.logger.info(f"\n{'='*60}")
-                self.logger.info("✅ COMPILE WARMUP COMPLETE: Transitioning to target settings")
-                self.logger.info(f"{'='*60}")
-                self.logger.info(f"  Batch size: {self._compile_warmup_batch_size} → {self._target_batch_size}")
-                self.logger.info(f"  Seq length: {self._compile_warmup_seq_len} → {self._target_seq_len}")
-                self.logger.info(f"  Checkpoint every: {self._compile_warmup_checkpoint_every} → {self._target_checkpoint_every}")
-                self.logger.info(f"{'='*60}\n")
-
-                # Restore target settings
-                grad_accum = self.config.grad_accum_steps
-                self._current_seq_len = self._target_seq_len
-
-                # Restore gradient checkpointing
-                base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-                if hasattr(base_model, "enable_gradient_checkpointing"):
-                    base_model.enable_gradient_checkpointing(every_n=self._target_checkpoint_every)
-
-                # Clear CUDA cache to release warmup allocations
-                if self.device == "cuda":
+            
+            # System 2 / Reasoning Phase: GRPO step REPLACES regular training step
+            # This runs as a complete standalone step (own optimizer cycle) to avoid
+            # graph conflicts with torch.compile. Step counter advances after completion.
+            reasoning_interval = int(getattr(self.config, "reasoning_interval", 100))
+            if getattr(self.config, "reasoning_enabled", False) and step % reasoning_interval == 0:
+                # CRITICAL: Clear CUDA memory before GRPO to maximize headroom
+                # Previous training step may have left ~20GB reserved from activations
+                gc.collect()
+                if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                    gc.collect()
-                    self.logger.info("  Cleared CUDA cache after warmup")
-
+                    # Note: empty_cache() already synchronizes internally; explicit sync removed
+                self.logger.info(f"🧠 System 2 Reasoning Active (Step {step})")
+                grpo_metrics = self._run_reasoning_step(step)
+                if grpo_metrics:
+                    self._last_grpo_metrics = grpo_metrics
+                    # Log GRPO step to diagnostics for DB persistence
+                    current_lr = get_lr(step, config)
+                    self._log_grpo_diagnostics(step, grpo_metrics, current_lr)
+                # Advance step and continue (skip regular training this step)
+                step += 1
+                if hasattr(self.train_loader, "set_step"):
+                    self.train_loader.set_step(step)
+                continue
+            
             optimizer.zero_grad(set_to_none=True)
             accum_loss = torch.zeros((), device=self.device)
             accum_ce = torch.zeros((), device=self.device)
@@ -2223,7 +2221,7 @@ class Trainer:
                     except Exception:
                         pass
                 if self._batch_filter is not None:
-                    should_skip, skip_reason = self._batch_filter.should_skip_batch(loss.item(), step)
+                    should_skip, skip_reason = self._batch_filter.should_skip_batch(loss.detach().float().item(), step)
                     if should_skip:
                         if micro_diag:
                             micro_diag[-1]["accum_enabled"] = False
@@ -2269,6 +2267,32 @@ class Trainer:
             # Resolve accumulated losses (sync points)
             accum_loss = accum_loss.item()
             accum_ce_f = float(accum_ce.item())
+
+            # Automatic System 2 / Reasoning Phase Transition
+            # (Must run after accum_loss is resolved)
+            # SKIP auto-enable if user explicitly disabled reasoning via --reasoning_enabled False
+            if not getattr(self.config, "reasoning_enabled", False) and not getattr(self, "_reasoning_user_disabled", False):
+                reasoning_start = getattr(self.config, "reasoning_start_step", 1_000_000)
+                reasoning_thr = getattr(self.config, "reasoning_loss_threshold", 0.0)
+                
+                # Update Stability Window (last 100 steps of Total Loss)
+                if not hasattr(self, "_loss_history"):
+                    self._loss_history = deque(maxlen=100)
+                self._loss_history.append(accum_loss)
+
+                # Check 1: Forced Step
+                if step >= reasoning_start:
+                    self.config.reasoning_enabled = True
+                    self.logger.info(f"🚀 REASONING PHASE ENABLED (Step {step} >= {reasoning_start})")
+                
+                # Check 2: Stability (Frequency of low loss)
+                # "Frequently below 2" -> If 50% of last 100 steps are below threshold
+                elif reasoning_thr > 0.0 and len(self._loss_history) >= 20:
+                    hits = sum(1 for lv in self._loss_history if lv < reasoning_thr)
+                    hit_rate = hits / len(self._loss_history)
+                    if hit_rate > 0.5:
+                        self.config.reasoning_enabled = True
+                        self.logger.info(f"🚀 REASONING PHASE ENABLED (Stability: {hits}/{len(self._loss_history)} steps < {reasoning_thr})")
 
             # Opt-in step diagnostics: Phase 1 (before unscale)
             _step_diag_ctx = _step_diag.StepDiagnostics(step=step, active=(step in _diag_steps))
@@ -2900,6 +2924,57 @@ class Trainer:
             except Exception:
                 pass
         return metrics
+
+    def _log_grpo_diagnostics(
+        self, step: int, grpo_metrics: Dict[str, float], lr: float
+    ) -> None:
+        """Log GRPO reasoning step to diagnostics for DB persistence.
+
+        Maps GRPO metrics to the standard step record format so they appear
+        in training.db alongside regular training steps.
+        """
+        if not grpo_metrics:
+            return
+
+        # Extract GRPO-specific values
+        grpo_loss = grpo_metrics.get("grpo/loss", 0.0)
+        grpo_grad_norm = grpo_metrics.get("grpo/grad_norm", 0.0)
+        grpo_advantage = grpo_metrics.get("grpo/advantage_mean", 0.0)
+        grpo_reward = grpo_metrics.get("grpo/reward_mean", 0.0)
+        grpo_reward_std = grpo_metrics.get("grpo/reward_std", 0.0)
+
+        record = {
+            "step": step,
+            "timestamp": datetime.now().isoformat(),
+            "losses": {
+                # Map GRPO loss to standard loss fields
+                "total": grpo_loss,
+                "ce": grpo_loss,  # GRPO policy loss is the main signal
+                "aux": 0.0,
+                "ponder": 0.0,
+                "advantage": grpo_advantage,  # GRPO advantage (different from MoR)
+            },
+            "lr": lr,
+            "grad_norm": grpo_grad_norm,
+            "grad_norm_pre_clip": grpo_grad_norm,
+            # GRPO-specific fields (stored but may not be in DB schema yet)
+            "grpo": {
+                "enabled": True,
+                "loss": grpo_loss,
+                "reward_mean": grpo_reward,
+                "reward_std": grpo_reward_std,
+                "advantage_mean": grpo_advantage,
+                "advantage_std": grpo_metrics.get("grpo/advantage_std", 0.0),
+                "kl_mean": grpo_metrics.get("grpo/kl_mean", 0.0),
+                "num_samples": grpo_metrics.get("grpo/num_samples", 0),
+                "skipped": grpo_metrics.get("grpo/skipped", 0.0),
+            },
+            # Empty routing stats (GRPO doesn't use MoD/MoR routing)
+            "mod_layers": [],
+            "mor_layers": [],
+        }
+
+        self._diagnostics_data.append(record)
 
     def _log_layer_diagnostics(
         self, step: int, loss: float, lr: float, grad_norm: float, *, ce_step: float

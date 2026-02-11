@@ -30,9 +30,8 @@ Usage:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any
+from typing import Tuple, Dict, Any
 
 import torch
 import torch.nn as nn
