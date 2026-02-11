@@ -98,11 +98,9 @@ def compute_token_losses_from_hidden(
     # [chunk, V] logits (~400MB for chunk=2048, V=50K in fp32) then immediately
     # computes per-token loss and frees the logits.
     losses = torch.zeros(N, device=hidden.device, dtype=torch.float32)
-    # Cast weight once (not per chunk)
-    w_f = weight.float()
     for t0 in range(0, N, token_chunk_size):
         t1 = min(N, t0 + token_chunk_size)
-        logits_chunk = h[t0:t1].float() @ w_f.t()  # [chunk, V]
+        logits_chunk = h[t0:t1] @ weight.t()  # [chunk, V] — bf16 matmul, CE returns fp32
         losses[t0:t1] = F.cross_entropy(
             logits_chunk, t[t0:t1], ignore_index=ignore_index, reduction="none"
         )

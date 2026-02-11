@@ -373,15 +373,12 @@ class MoRExecutor(nn.Module):
     - Masked accumulation of outputs
     - STE gradient path for discrete depth decisions
     """
-    
-    # Minimum fraction of inactive tokens to justify sparse packing overhead.
-    # Below this threshold, dense masked execution is cheaper.
-    _SPARSE_THRESHOLD: float = 0.1  # Pack when >=10% tokens are inactive
 
     # When True, always use dense masked execution (no sparse packing).
     # Set by the model when gradient checkpointing is active, because sparse
-    # packing creates variable-size tensors that break checkpoint recomputation
-    # (GPU float non-determinism can change n_active by ±1 on recompute).
+    # packing creates variable-size tensors that fail use_reentrant=False
+    # checkpoint shape validation (GPU float non-determinism changes n_active
+    # by ±1 on recompute).
     _force_dense: bool = False
 
     def __init__(self, config: MoRConfig) -> None:
@@ -467,16 +464,17 @@ class MoRExecutor(nn.Module):
         # Pre-compute recursion embeddings (all depths at once)
         all_rec_embeds = self.recursion_embed(self._recursion_indices)  # [R, D]
 
-        # Pre-compute sparse threshold as integer count (avoid per-depth division)
-        _sparse_count_threshold = int(total_tokens * (1.0 - MoRExecutor._SPARSE_THRESHOLD))
+        # _force_dense is set when gradient checkpointing is active (variable-size
+        # sparse tensors fail use_reentrant=False shape validation on recompute).
+        force_dense = self._force_dense
 
         for i in range(n_rec):
             # Flat active mask for this depth [B*L]
             active_flat = active_at_depth[i].view(-1)  # [B*L] bool
-            n_active_t = active_flat.sum()  # stays on GPU — no .item() sync
 
             # Diagnostics (tensor, no sync)
             if self.training:
+                n_active_t = active_flat.sum()  # stays on GPU
                 self._recursion_tokens_processed.append(n_active_t.detach())
 
             # Exit mask and STE weight
@@ -488,14 +486,23 @@ class MoRExecutor(nn.Module):
             rec_embed = all_rec_embeds[i]  # [D]
             rec_offset = rec_bias + rec_embed  # [D] - fused add
 
-            # Decide: sparse pack or dense masked execution
-            # Compare on GPU — avoids CPU-GPU sync that .item() would cause
-            # _force_dense disables sparse packing for gradient checkpoint compatibility
-            use_sparse = (not self._force_dense) and (i > 0) and bool(n_active_t < _sparse_count_threshold) and bool(n_active_t > 0)
+            if i == 0 or force_dense:
+                # === DENSE PATH: all tokens through MLP, mask inactive ===
+                h_with_rec = current + rec_offset
 
-            if use_sparse:
-                # === SPARSE PATH: pack active tokens, run MLP, scatter back ===
-                # Flatten [B, L, D] → [B*L, D] for packing
+                if norm is not None:
+                    h_with_rec = norm(h_with_rec)
+
+                mlp_delta = mlp(h_with_rec)
+
+                if i == 0:
+                    current = current + mlp_delta
+                else:
+                    active_mask = active_at_depth[i].unsqueeze(-1).to(dtype)
+                    current = current + mlp_delta * active_mask
+            else:
+                # === SPARSE PATH: depth 1+, pack only active tokens ===
+                # Only used when gradient checkpointing is disabled.
                 current_flat = current.view(-1, D)
 
                 # Pack only active tokens
@@ -516,21 +523,6 @@ class MoRExecutor(nn.Module):
                 delta_full = torch.zeros(B * L, D, device=current.device, dtype=packed_delta.dtype)
                 delta_full.index_add_(0, active_indices, packed_delta)
                 current = current + delta_full.view(B, L, D)
-            elif bool(n_active_t > 0):
-                # === DENSE PATH: all/most tokens active, skip pack overhead ===
-                h_with_rec = current + rec_offset
-
-                if norm is not None:
-                    h_with_rec = norm(h_with_rec)
-
-                mlp_delta = mlp(h_with_rec)
-
-                # For depth 0 all tokens are active, so active_mask is all 1s
-                if i == 0:
-                    current = current + mlp_delta
-                else:
-                    active_mask = active_at_depth[i].unsqueeze(-1).to(dtype)
-                    current = current + mlp_delta * active_mask
 
             # Accumulate output for exiting tokens with STE
             # STE: forward uses 1.0, backward flows through ste_weight

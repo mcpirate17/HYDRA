@@ -457,8 +457,8 @@ class HydraModel(nn.Module):
 	def enable_gradient_checkpointing(self, every_n: int = 1) -> None:
 		self._gradient_checkpointing = True
 		self._checkpoint_every_n = max(1, every_n)
-		# Disable MoR sparse packing — variable-size tensors break checkpoint
-		# recomputation (GPU float non-determinism changes n_active by ±1).
+		# Disable MoR sparse packing — variable-size tensors fail
+		# use_reentrant=False shape validation on recompute.
 		self._set_mor_force_dense(True)
 
 	def disable_gradient_checkpointing(self) -> None:
