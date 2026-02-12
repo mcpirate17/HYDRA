@@ -2264,9 +2264,10 @@ class Trainer(GRPOTrainerMixin):
             if use_mod_mor:
                 clear_mor_caches(model)
 
-            # Resolve accumulated losses (sync points)
-            accum_loss = accum_loss.item()
-            accum_ce_f = float(accum_ce.item())
+            # Resolve accumulated losses (single GPU→CPU sync for both)
+            _loss_pair = torch.stack([accum_loss, accum_ce]).cpu()
+            accum_loss = _loss_pair[0].item()
+            accum_ce_f = _loss_pair[1].item()
 
             # Automatic System 2 / Reasoning Phase Transition
             # (Must run after accum_loss is resolved)

@@ -376,7 +376,7 @@ class CCGQAAttention(nn.Module):
                     scale=None if self.use_qk_norm else self.scale,
                 )
 
-        out = out.transpose(1, 2).contiguous().view(B, S, self.latent_dim)
+        out = out.transpose(1, 2).reshape(B, S, self.latent_dim)
         out = self.o_proj(out) * self.output_scale
         return out, new_past_kv
 
@@ -531,7 +531,7 @@ class CCGQAAttention(nn.Module):
                     scale=None if self.use_qk_norm else self.scale,
                 )
 
-        out = out.transpose(1, 2).contiguous().view(B, S, self.latent_dim)
+        out = out.transpose(1, 2).reshape(B, S, self.latent_dim)
         out = self.o_proj(out) * self.output_scale
         return out
     

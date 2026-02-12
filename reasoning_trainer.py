@@ -889,18 +889,18 @@ def generate_completion(
                     )
                     # verify_logits is [1, n_draft+1, V] (includes logits for each position)
                     # Position i gives logits for position (current_len + i)
-                    # We accept draft[i] if argmax(logits[i]) == draft[i] (greedy verify)
-                    # For sampling: accept if draft token has reasonable probability
-                    accepted = 0
-                    for di in range(n_draft):
-                        token_logits = verify_logits[:, di, :]
-                        probs = F.softmax(token_logits / temperature, dim=-1)
-                        draft_prob = probs[0, draft[di]].item()
-                        # Accept if draft token has >= 10% probability
-                        if draft_prob >= 0.1:
-                            accepted += 1
-                        else:
-                            break
+                    # Vectorized verification: gather all draft probs in one shot
+                    draft_logits = verify_logits[0, :n_draft, :]  # [n_draft, V]
+                    draft_probs = F.softmax(draft_logits / temperature, dim=-1)
+                    # Gather probability of each draft token
+                    draft_token_probs = draft_probs[torch.arange(n_draft, device=device), draft].cpu()
+                    # Accept prefix of tokens with >= 10% probability
+                    accept_mask = draft_token_probs >= 0.1
+                    # Find first rejection (accepted = length of True prefix)
+                    if accept_mask.all():
+                        accepted = n_draft
+                    else:
+                        accepted = accept_mask.long().argmin().item()
 
                     if accepted > 0:
                         # Keep accepted draft tokens, update KV cache
@@ -919,12 +919,14 @@ def generate_completion(
                             trimmed_kv.append((k[:, :, :trim_to, :], v[:, :, :trim_to, :]))
                         past_key_values = trimmed_kv
 
-                        # Check EOS in accepted tokens
+                        # Check EOS in accepted tokens (vectorized)
                         if eos_token_id is not None:
-                            for ai in range(accepted):
-                                if generated[0, current_len - accepted + ai].item() == eos_token_id:
-                                    current_len = current_len - accepted + ai + 1
-                                    return generated[:, :current_len]
+                            accepted_tokens = generated[0, current_len - accepted:current_len]
+                            eos_positions = (accepted_tokens == eos_token_id).nonzero(as_tuple=True)[0]
+                            if eos_positions.numel() > 0:
+                                first_eos = eos_positions[0].item()
+                                current_len = current_len - accepted + first_eos + 1
+                                return generated[:, :current_len]
 
                         # Sample the next token after accepted draft (from last verify logits)
                         if tokens_generated < max_new_tokens:
@@ -1084,14 +1086,14 @@ def compute_sequence_logprobs(
         del target_embeds
 
         # Chunked logsumexp over vocab to avoid [B, T-1, V] materialization
-        # Process vocab in chunks of 8192 to limit peak memory to ~B*T*8192*4 bytes
+        # Matmul in bf16 (hardware-accelerated), cast result to float32 for logsumexp
         vocab_chunk = 8192
         N = B * (T - 1)
-        h_flat = shift_hidden.reshape(N, D).float()
+        h_flat = shift_hidden.reshape(N, D)  # stays in bf16
         lse = torch.full((N,), -float("inf"), device=hidden.device, dtype=torch.float32)
         for v0 in range(0, V, vocab_chunk):
             v1 = min(V, v0 + vocab_chunk)
-            logits_chunk = h_flat @ weight[v0:v1].float().t()  # [N, chunk]
+            logits_chunk = (h_flat @ weight[v0:v1].t()).float()  # bf16 matmul → float32
             lse = torch.logaddexp(lse, torch.logsumexp(logits_chunk, dim=1))
             del logits_chunk
         del h_flat
@@ -1460,10 +1462,11 @@ def run_grpo_step(
     if config.skip_moe and hasattr(base_model, "set_skip_moe"):
         base_model.set_skip_moe(False)
 
-    # Cleanup
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # Periodic cleanup (gc.collect + empty_cache are expensive; every 10 steps is sufficient)
+    if step % 10 == 0:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     avg_loss = total_loss / num_micro_batches
     metrics = {
